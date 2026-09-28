@@ -728,8 +728,20 @@ class BridgeConnectionManager
     }
 
     /**
-     * The user a turn belonged to when this process failed it because its bridge went away,
-     * or null. Forgets it: the bridge replays one ending per turn.
+     * Remember whose turn a request was that this process ended on its own because somebody
+     * stopped it (the abort flag). The bridge's own `cancelled` follows once its CLI has
+     * stopped, naming the mid-turn messages the CLI never read, and by then the request is
+     * gone here: this is what lets that list still be recorded (see takeDroppedRequestOwner()).
+     */
+    public function rememberStoppedRequest(string $requestId, int|string $userId): void
+    {
+        $this->rememberDroppedRequest($requestId, (string) $userId);
+    }
+
+    /**
+     * The user a turn belonged to when this process ended it without the bridge's own ending
+     * (its bridge went away, or it was stopped), or null. Forgets it: the bridge sends one
+     * ending per turn.
      */
     public function takeDroppedRequestOwner(string $requestId): ?string
     {

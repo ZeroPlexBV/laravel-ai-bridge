@@ -252,3 +252,47 @@ it('does not let another user\'s bridge write the unread list of a dropped turn'
     expect($store->status('req-1')['metadata']['pending_inputs'] ?? null)->toBeNull();
     Event::assertNotDispatched(TurnInputsReturned::class);
 });
+
+it('records the unread messages a bridge names when it answers a stop this side already ended', function () {
+    // Stopping a turn ends it here the moment the abort flag is seen; the bridge's own
+    // `cancelled` arrives once its CLI has stopped, naming what the CLI never read.
+    $rig = helloRig();
+    $store = new ArrayStreamStore();
+    app()->instance(StreamStoreContract::class, $store);
+    $rig->manager->setSendCallback(fn () => true);
+    $rig->manager->addConnection('user-1', 'conn-1');
+    pendingTurn($rig->manager, 'req-1', 'user-1');
+    $store->start('req-1', ['conversation_id' => '5']);
+    $store->setAbort('req-1');
+
+    // The heartbeat notices the stop and ends the turn here.
+    $rig->handler->handleMessage('conn-1', null, json_encode(['type' => MessageTypes::PING, 'timestamp' => 1]));
+    expect($rig->manager->getPendingRequest('req-1'))->toBeNull();
+
+    $rig->handler->handleMessage('conn-1', null, json_encode([
+        'type' => MessageTypes::CANCELLED, 'request_id' => 'req-1', 'pending_inputs' => ['m-7'],
+    ]));
+
+    expect($store->status('req-1')['metadata']['pending_inputs'] ?? null)->toBe(['m-7']);
+    Event::assertDispatched(TurnInputsReturned::class, fn ($e) => $e->requestId === 'req-1' && $e->pendingInputs === ['m-7'] && (string) $e->userId === 'user-1');
+});
+
+it('does not let another user\'s bridge write the unread list of a stopped turn', function () {
+    $rig = helloRig();
+    $store = new ArrayStreamStore();
+    app()->instance(StreamStoreContract::class, $store);
+    $rig->manager->setSendCallback(fn () => true);
+    $rig->manager->addConnection('user-1', 'conn-1');
+    $rig->manager->addConnection('user-2', 'conn-x');
+    pendingTurn($rig->manager, 'req-1', 'user-1');
+    $store->start('req-1', []);
+    $store->setAbort('req-1');
+    $rig->handler->handleMessage('conn-1', null, json_encode(['type' => MessageTypes::PING, 'timestamp' => 1]));
+
+    $rig->handler->handleMessage('conn-x', null, json_encode([
+        'type' => MessageTypes::CANCELLED, 'request_id' => 'req-1', 'pending_inputs' => ['m-7'],
+    ]));
+
+    expect($store->status('req-1')['metadata']['pending_inputs'] ?? null)->toBeNull();
+    Event::assertNotDispatched(TurnInputsReturned::class);
+});
