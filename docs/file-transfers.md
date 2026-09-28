@@ -156,3 +156,11 @@ streaming (no temp files on the proxies, no size cap from the proxy):
 - a TLS proxy in front (proxy-nginx) buffers request bodies and caps them at its
   `client_max_body_size` (`--max-body-size`, 256 MB by default): raise it to the largest
   file you want to move in either direction.
+- proxy-nginx answers `502`/`503` from upstream with its maintenance page
+  (`proxy_intercept_errors on`). A browser-facing controller should therefore not pass
+  `TransferRefused::$status` through when it is 502: answer 409 or 504 with the message
+  in JSON, or the composer gets an HTML page instead of a sentence;
+- proxy-nginx also buffers responses (`proxy_buffering` defaults to on), so a large
+  download may be spooled to its temp directory on the way out. Send
+  `X-Accel-Buffering: no` (the download response does) and, where the proxy config can
+  be changed, leave buffering to that header.
