@@ -1067,6 +1067,13 @@ class MessageHandler
         $handler->dispatchCancelled('Cancelled by user.');
         $this->connectionManager->removePendingRequest($requestId);
         $this->forgetRecovery($requestId);
+
+        // The bridge answers the cancel once its CLI has stopped, with the mid-turn messages
+        // the CLI never read. The turn is over here by then, so whose it was is remembered
+        // for that answer (handleCancelled() -> recordLatePendingInputs()).
+        if ($userId !== null) {
+            $this->connectionManager->rememberStoppedRequest($requestId, $userId);
+        }
     }
 
     /**
@@ -1687,6 +1694,17 @@ class MessageHandler
         // owner ('' or '0') reads as absent, and this would then say a live
         // turn had "already been cleaned up".
         if ($this->connectionManager->getPendingRequest($requestId) === null) {
+            // A stop ended the turn here first; the bridge's answer still names the messages
+            // the CLI never read, and those go back to the person like any other unread ones
+            // (stream metadata `pending_inputs` and TurnInputsReturned). Only for the user whose
+            // turn it was, which recordLatePendingInputs() checks.
+            $pending = self::pendingInputsOf($message);
+            if ($pending !== null && $pending !== []) {
+                $this->recordLatePendingInputs($connectionId, $requestId, $pending);
+
+                return null;
+            }
+
             Log::info('AI Bridge: cancelled for a turn that has already been cleaned up', [
                 'connection_id' => $connectionId,
                 'request_id' => $requestId,
