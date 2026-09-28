@@ -71,6 +71,9 @@ class AiBridgeManager
      *   - 'user_id': User ID for bridge mode (server-side only, stripped from HTTP input by StreamController).
      *   - 'accepts_input': true to keep a bridge turn's input open, so a message can reach it
      *     while it runs via sendTurnInput() (bridge mode, server-side only; see inputOpen()).
+     *   - 'bridge_prompt': ['mode' => 'default'|'off'|'append'|'replace', 'text' => ?string],
+     *     how the bridge's own session-lifecycle addendum is appended after the system prompt
+     *     (bridge mode, server-side only; see AiRequestPayload::normaliseBridgePrompt()).
      * @return StreamHandler
      */
     public function stream(string $conversationId, string $message, array $options = []): StreamHandler
@@ -184,7 +187,10 @@ class AiBridgeManager
      *
      * @param  string  $messageId  The application's own id for the message; echoed back in
      *                             `user_input` and in a cancelled turn's `pending_inputs`.
-     * @param  string|array<int, mixed>  $content  Text, or a list of content blocks.
+     * @param  string|array<int, mixed>  $content  Text, or a list of content blocks, of which
+     *                                            only the text blocks are sent: the bridge
+     *                                            takes text only. A file already on the
+     *                                            machine goes in as text naming its path.
      * @param  int|string|null  $userId  Whose bridge runs the turn. Defaults to the user the
      *                                   turn was routed to: the conversation's connection, else
      *                                   the authenticated user — as streamConversation() did.

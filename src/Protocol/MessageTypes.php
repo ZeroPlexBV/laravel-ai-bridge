@@ -113,6 +113,10 @@ final class MessageTypes
      * `parent_tool_use_id` on the helper's own blocks and results. A helper is
      * finished only when a `finished` phase says so — never when its spawning
      * call's tool_result arrives, which for a background helper is at once.
+     *
+     * `finished` is NOT promised: the request's terminal frame (done, error,
+     * cancelled) ends every task of that request, and a turn cut short sends
+     * no `finished` for what was open. A consumer closes the rest itself.
      */
     public const TASK = 'task';
 

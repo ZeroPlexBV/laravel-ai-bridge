@@ -53,6 +53,11 @@ class ConnectionController extends Controller
             // bridge operator would have to change.
             $data['posture'] = $status['posture'] ?? [];
             if ($connection->isBridge()) {
+                // The ai-bridge release the machine runs, so the UI can say it
+                // is behind; its attachment caps; the optional frames it knows.
+                $data['bridge_version'] = $status['bridge_version'] ?? null;
+                $data['attachment_limits'] = $status['attachment_limits'] ?? null;
+                $data['capabilities'] = $status['capabilities'] ?? [];
                 $data['connected'] = $status['connected'];
             }
 

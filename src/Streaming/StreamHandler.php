@@ -312,6 +312,9 @@ class StreamHandler
      * through whole, so fields a newer bridge adds arrive too. Informational
      * and non-terminal. A helper is finished only when a `finished` phase says
      * so; a background helper keeps reporting after the main assistant's reply.
+     * But `finished` is not promised: the turn's terminal event (done, error,
+     * cancelled) ends every task still open, with no `finished` of its own —
+     * close those yourself there.
      */
     public function onTask(Closure $callback): static
     {
@@ -663,9 +666,16 @@ class StreamHandler
      *
      * Also dispatches the StreamCompleted Laravel event (with success=false).
      *
+     * $meta carries what the bridge said beside the error — currently
+     * `pending_inputs` on a `bridge_disconnected` error for a turn that ran
+     * with its input open: the `message_id`s of messages delivered mid-turn
+     * that the CLI never read. Error callbacks receive it as a third argument.
+     *
+     * @param  array<string, mixed>  $meta
+     *
      * @internal Called by StreamableProvider implementations.
      */
-    public function dispatchError(string $code, string $message): void
+    public function dispatchError(string $code, string $message, array $meta = []): void
     {
         if ($this->terminated) {
             return;
@@ -677,7 +687,7 @@ class StreamHandler
 
         $this->terminated = true;
 
-        $this->dispatchCallbacks($this->errorCallbacks, [$code, $message], 'error');
+        $this->dispatchCallbacks($this->errorCallbacks, [$code, $message, $meta], 'error');
 
         $this->dispatchStreamCompleted(false, null, "{$code}: {$message}", TerminatedBy::Error);
 

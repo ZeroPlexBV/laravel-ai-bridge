@@ -82,6 +82,19 @@ class BridgeConnectionManager
     private array $pendingTurnInputs = [];
 
     /**
+     * Turns failed because their user's bridge went away, by request id => user id.
+     *
+     * Kept briefly (the newest DROPPED_MEMORY entries) so the account a bridge replays after
+     * it reconnects — a `bridge_disconnected` error naming the mid-turn messages its CLI
+     * never read — can be matched to the user it belongs to after the turn itself is gone.
+     *
+     * @var array<string, string>
+     */
+    private array $droppedRequests = [];
+
+    private const DROPPED_MEMORY = 500;
+
+    /**
      * Callback for sending messages over the WebSocket connection.
      * Set by the consuming app's WebSocket server integration.
      *
@@ -268,6 +281,42 @@ class BridgeConnectionManager
     public function getWorkspaces(int|string $userId): array
     {
         return $this->connections[(string) $userId]['workspaces'] ?? [];
+    }
+
+    /**
+     * Store what the bridge said about itself at `hello`: its release and what it supports.
+     *
+     * @param  int|string  $userId  The user ID.
+     * @param  array<string, mixed>  $info  See MessageHandler::bridgeInfoFromHello().
+     */
+    public function setBridgeInfo(int|string $userId, array $info): void
+    {
+        $userId = (string) $userId;
+
+        if (isset($this->connections[$userId])) {
+            $this->connections[$userId]['bridge'] = $info;
+        }
+    }
+
+    /**
+     * What this user's bridge said about itself at `hello`.
+     *
+     * @return array<string, mixed>  Empty when not connected. Keys: `bridge_version`
+     *                               (?string), `protocol_version` (?string),
+     *                               `attachment_limits` (?array), `capabilities` (string[]).
+     */
+    public function getBridgeInfo(int|string $userId): array
+    {
+        return $this->connections[(string) $userId]['bridge'] ?? [];
+    }
+
+    /**
+     * Whether this user's connected bridge announced a capability at `hello`
+     * (`turn_input`, `file_uploads`, `file_downloads`, `app_backends`).
+     */
+    public function bridgeSupports(int|string $userId, string $capability): bool
+    {
+        return in_array($capability, $this->getBridgeInfo($userId)['capabilities'] ?? [], true);
     }
 
     /**
@@ -650,6 +699,29 @@ class BridgeConnectionManager
         ));
     }
 
+    /** Remember whose turn a dropped request was, for the bridge's replay (see takeDroppedRequestOwner()). */
+    private function rememberDroppedRequest(string $requestId, string $userId): void
+    {
+        unset($this->droppedRequests[$requestId]);
+        $this->droppedRequests[$requestId] = $userId;
+
+        while (count($this->droppedRequests) > self::DROPPED_MEMORY) {
+            unset($this->droppedRequests[array_key_first($this->droppedRequests)]);
+        }
+    }
+
+    /**
+     * The user a turn belonged to when this process failed it because its bridge went away,
+     * or null. Forgets it: the bridge replays one ending per turn.
+     */
+    public function takeDroppedRequestOwner(string $requestId): ?string
+    {
+        $owner = $this->droppedRequests[$requestId] ?? null;
+        unset($this->droppedRequests[$requestId]);
+
+        return $owner;
+    }
+
     /**
      * Get all active connection user IDs.
      *
@@ -689,6 +761,7 @@ class BridgeConnectionManager
             if ($handler['user_id'] === $userId) {
                 $handler['stream_handler']->dispatchError($errorCode, $errorMessage);
                 unset($this->pendingRequests[$requestId]);
+                $this->rememberDroppedRequest((string) $requestId, $userId);
             }
         }
 

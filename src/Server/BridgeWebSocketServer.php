@@ -563,7 +563,8 @@ class BridgeWebSocketServer
      * content blocks. Answers `{status: 'accepted'|'rejected', reason?}` once the bridge's
      * `turn_input_ack` arrives, and waits no longer than `turn_input_timeout` for it.
      *
-     * Rejections the bridge gives are passed on (`turn_not_running`, `input_not_open`).
+     * Rejections the bridge gives are passed on (`turn_not_running`, `turn_ending`,
+     * `input_not_open`).
      * The ones decided here:
      *  - `turn_not_running` — this process has no running turn under that id, so there is
      *    nothing to send it to (the turn ended, or never started). The caller then starts a
@@ -605,6 +606,21 @@ class BridgeWebSocketServer
             $this->httpResponse($tcpConnection, 400, [
                 'error' => 'invalid_request',
                 'message' => 'Body must be JSON with string "request_id" and "message_id", and "content" as a non-empty string or list of content blocks.',
+            ]);
+
+            return;
+        }
+
+        // The bridge takes text and nothing else: a frame whose content is not a non-empty
+        // string is dropped there WITHOUT an ack, which this side would then report as
+        // `no_answer` ("it may have taken it") five seconds later. So a list of content
+        // blocks is reduced to its text here, and one with no text is refused now.
+        $text = self::turnInputText($content);
+
+        if ($text === '') {
+            $this->httpResponse($tcpConnection, 400, [
+                'error' => 'invalid_request',
+                'message' => 'Turn input carries text only, and this content has none.',
             ]);
 
             return;
@@ -668,7 +684,7 @@ class BridgeWebSocketServer
             'type' => MessageTypes::TURN_INPUT,
             'request_id' => $requestId,
             'message_id' => $messageId,
-            'content' => $content,
+            'content' => $text,
         ]);
 
         if (! $sent) {
@@ -710,6 +726,28 @@ class BridgeWebSocketServer
     }
 
     /**
+     * The text of a turn input: the string itself, or the `text` of each text block of a
+     * list, joined by blank lines. Anything that is not text is left out.
+     */
+    private static function turnInputText(mixed $content): string
+    {
+        if (is_string($content)) {
+            return $content;
+        }
+
+        $parts = [];
+        foreach (is_array($content) ? $content : [] as $block) {
+            if (is_string($block)) {
+                $parts[] = $block;
+            } elseif (is_array($block) && ($block['type'] ?? 'text') === 'text' && is_string($block['text'] ?? null)) {
+                $parts[] = $block['text'];
+            }
+        }
+
+        return trim(implode("\n\n", array_filter($parts, static fn (string $p): bool => $p !== '')));
+    }
+
+    /**
      * GET /api/status — Return connection status for the authenticated user only.
      *
      * SEC: Only shows the requesting user's own connection data, not all users.
@@ -746,6 +784,9 @@ class BridgeWebSocketServer
             // What the bridge is actually running as, which only this process
             // knows and which a PHP-FPM worker otherwise cannot see.
             $response['posture'] = $this->connectionManager->getPosture($userId);
+            // What the bridge said about itself at hello: its release, its
+            // attachment caps, and which optional frames it understands.
+            $response['bridge'] = $this->connectionManager->getBridgeInfo($userId);
         }
 
         $this->httpResponse($tcpConnection, 200, $response);
@@ -914,7 +955,10 @@ class BridgeWebSocketServer
         // stream events from the bridge can be verified and buffered for the
         // browser's SSE tail. Register BEFORE sending so a fast bridge reply
         // cannot race ahead of the registration.
-        $this->messageHandler->registerRelayedRequest($requestId, $userId, (string) $conversationId);
+        $this->messageHandler->registerRelayedRequest($requestId, $userId, (string) $conversationId, array_filter([
+            'bridge_prompt' => $payload['bridge_prompt'] ?? null,
+            'accepts_input' => ($payload['options']['accepts_input'] ?? null) === true ? true : null,
+        ], static fn ($v) => $v !== null));
 
         $sent = $this->connectionManager->sendToUser($userId, $payload);
 

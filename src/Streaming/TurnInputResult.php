@@ -16,11 +16,18 @@ namespace Tetrix\AiBridge\Streaming;
  * A rejection's `reason`:
  *  - `turn_not_running` — no turn is running under that id any more. The message was not
  *    delivered, and the one thing to do with it is start a new turn.
- *  - `input_not_open` — the turn runs, but was not started with its input open.
+ *  - `turn_ending` — the turn is still running but will take nothing more (it is being
+ *    stopped, or its input was closed), and its CLI may still be writing the session. Hold
+ *    the message until this request's terminal frame (done / error / cancelled), then start
+ *    a new turn with it; starting one sooner would run two CLIs on one session. Bridge 0.21+.
+ *  - `input_not_open` — the turn runs, but was not started with its input open (or its CLI
+ *    has not started yet).
  *  - `no_answer` — the bridge did not answer in time, or went away. It may have taken the
  *    message; do not resend it as a new turn.
  *  - `not_owner` — the turn belongs to another user.
  *  - `duplicate` — the same message id is still waiting on its answer.
+ *  - `invalid_request` — the content had no text in it (turn input is text only; a list of
+ *    content blocks is reduced to its text blocks).
  *  - `send_failed` / `unreachable` — the frame could not be put to the bridge, or the serve
  *    process could not be reached at all.
  *  - null — the bridge refused without a reason this package knows.
