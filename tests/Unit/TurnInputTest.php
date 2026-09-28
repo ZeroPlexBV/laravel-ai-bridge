@@ -145,7 +145,7 @@ it('passes a bridge refusal on with its reason', function (string $reason) {
 
     expect(postInput($rig, INPUT_BODY)->responses)
         ->toBe([['status' => 200, 'body' => ['status' => 'rejected', 'reason' => $reason]]]);
-})->with(['turn_not_running', 'input_not_open']);
+})->with(['turn_not_running', 'turn_ending', 'input_not_open']);
 
 it('answers an ack that arrives later, once, and not again when the timer fires', function () {
     $rig = turnInputRig(0.2);
@@ -232,14 +232,27 @@ it('says send_failed when the frame cannot be written to the bridge', function (
         ->and($rig->manager->hasPendingTurnInput('req-1', 'msg-1'))->toBeFalse();
 });
 
-it('passes a list of content blocks through untouched', function () {
+it('reduces a list of content blocks to its text, because the bridge takes text only', function () {
     $rig = turnInputRig();
     $rig->answer = fn () => ackFrom($rig, 'conn-1', ['status' => 'accepted']);
-    $blocks = [['type' => 'text', 'text' => 'also check the tests']];
+    $blocks = [
+        ['type' => 'text', 'text' => 'also check the tests'],
+        ['type' => 'image', 'source' => ['data' => 'xx']],
+        ['type' => 'text', 'text' => 'and the docs'],
+    ];
 
     postInput($rig, ['content' => $blocks] + INPUT_BODY);
 
-    expect($rig->sent[0]['content'])->toBe($blocks);
+    expect($rig->sent[0]['content'])->toBe("also check the tests\n\nand the docs");
+});
+
+it('refuses content blocks with no text in them, rather than let the bridge drop the frame unanswered', function () {
+    $rig = turnInputRig();
+
+    $out = postInput($rig, ['content' => [['type' => 'image', 'source' => []]]] + INPUT_BODY);
+
+    expect($out->responses[0]['status'])->toBe(400)
+        ->and($rig->sent)->toBe([]);
 });
 
 it('rejects a malformed body with 400 rather than throwing past the loop', function (array|string $body) {

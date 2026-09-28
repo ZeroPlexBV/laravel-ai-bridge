@@ -163,6 +163,9 @@ class BridgeStream implements StreamableProvider
             // refuses a resume that names somewhere else.
             'working_dir' => $this->options['working_dir'] ?? null,
             'attachments' => $this->options['attachments'] ?? null,
+            // How the bridge's own prompt addendum is handled (default, off,
+            // append, replace). See AiRequestPayload::normaliseBridgePrompt().
+            'bridge_prompt' => $this->options['bridge_prompt'] ?? null,
         ]);
     }
 
@@ -324,6 +327,10 @@ class BridgeStream implements StreamableProvider
 
             if (isset($payload['attachments'])) {
                 $relayBody['attachments'] = $payload['attachments'];
+            }
+
+            if (isset($payload['bridge_prompt'])) {
+                $relayBody['bridge_prompt'] = $payload['bridge_prompt'];
             }
 
             BridgeLog::verbose('relay request payload', [

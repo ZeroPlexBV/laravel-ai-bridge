@@ -177,6 +177,19 @@ Each provider entry may include a `models` array listing available models (popul
 
 If a CLI is not installed, `available` is `false` and the server won't route requests to it.
 
+**What else `hello` says about the bridge**, all optional and all recorded by this package (`ConnectionStatus::for()` → `bridge_version`, `attachment_limits`, `capabilities`; cached on the connection as `last_bridge`):
+
+| Field | Since | Meaning |
+|---|---|---|
+| `bridge_version` | always | The ai-bridge release the machine runs, e.g. `0.21.0`. Not the protocol `version` (`0.1`). Compare it with the release you pin to tell a person their machine is behind. |
+| `attachment_limits` | 0.16 | `{max_file_bytes, max_total_bytes, max_count}`, bytes. The caps the bridge enforces, so a server can refuse before the upload. |
+| `turn_input` | 0.19 | `true`: understands `options.accepts_input` and `turn_input` (each turn still confirms with `input_open`). |
+| `file_uploads` | 0.18 | `true`: accepts `upload_offer`. See [Streamed uploads](#streamed-uploads-and-downloads). |
+| `file_downloads` | 0.18 | `true`: answers `file_read`. |
+| `app_backends` | 0.21 | `true`: understands `app_call` (Engram app backends; not used by this package). |
+
+Absent means the bridge predates the field: test the capability, not the version.
+
 **`supports_tools`** indicates whether the provider can invoke server-defined bridge tools. All three currently supported providers (Codex, Claude, Gemini) report `true`. Even CLIs without native tool calling can use bridge tools: the bridge injects them as Bash wrapper scripts on the CLI's `PATH` that route calls back through the WebSocket. For Codex this additionally requires running `codex exec` with a workspace-write sandbox and network access so the wrapper scripts' loopback callback succeeds — the bridge handles this automatically. Per-provider capability values are reported dynamically in the `hello` handshake; this spec documents the format, not fixed values. See [Tool Calls](#tool-calls).
 
 **`supports_session_resume`** indicates whether the provider supports resuming conversations by session ID. All three currently supported providers support this.
@@ -778,6 +791,8 @@ A key the bridge does not allow is **dropped and named in the ack**, not refused
 | `append` | Bridge addendum, then the project's text. The expected way to add project-specific rules. |
 | `replace` | The project's text instead of the bridge addendum. |
 
+From Laravel, pass it as the `bridge_prompt` option of `AiBridge::stream()` / `streamConversation()` (server-side only; the HTTP stream endpoint never accepts it from a browser). `AiRequestPayload` applies the same validation as the bridge and throws `InvalidArgumentException` before anything is sent; `default` is sent as absent. For Claude, `system_prompt` goes on `--system-prompt` (replacing the CLI's own default prompt) and the resolved addendum on `--append-system-prompt`, re-sent every turn.
+
 Validation is strict, and a contradictory spec is refused with `bridge_prompt_invalid` rather than guessed at — a chat whose instructions are not what either side believes is worse than a refused turn:
 
 | Mode | Text | Result |
@@ -897,7 +912,7 @@ A message for a turn that is still running. Only for a turn whose `ai_request_ac
 
 **`message_id`**: The server's own id for the message, echoed on the ack, on `user_input` and in `pending_inputs`.
 
-**`content`**: What the person wrote. Text.
+**`content`**: What the person wrote. A non-empty string; nothing else is accepted.
 
 ### Bridge → Server: `turn_input_ack`
 
@@ -910,8 +925,13 @@ The bridge answers every `turn_input` straight away.
 
 - **`accepted`**: the message was written to the running CLI and is queued there. The assistant reads it at its next step; `user_input` says when.
 - **`rejected`**: nothing was written. `reason` is present only on a rejection:
-  - `turn_not_running` — there is no turn any more to deliver it to (it ended, or is ending). The server starts a normal new turn with the message.
+  - `turn_not_running` — no turn by that id is running (it never existed, or it ended and its terminal frame went out ahead of this ack). The server starts a normal new turn with the message.
+  - `turn_ending` (bridge 0.21+) — the turn is still running but will take nothing more: its input was closed, or it is being stopped (a cancel, a bound, a dropped connection). Its CLI may still be writing the session, so the server **holds** the message until this request's terminal frame and only then starts a new turn with it. Starting one sooner runs a second `--resume` of the session while the first still writes it. (Before 0.21 this case was reported as `turn_not_running`.)
   - `input_not_open` — the turn is running but cannot take it (it was not started with `accepts_input`, or the CLI has not started yet). The server holds it until the turn is over.
+
+**Every accepted message ends in exactly one state**: read (a `user_input` names it), returned (a `pending_inputs` list names it: on `cancelled`, on `done` after a timeout or crash, and on the `bridge_disconnected` error the bridge replays after a dropped connection), or unknown (an ending with no list). This package passes `pending_inputs` through on all three; for a turn it had already failed when the socket closed, the replayed list lands in the turn's stream metadata (`pending_inputs`) and fires `TurnInputsReturned`.
+
+**`content` is text only.** The bridge drops a frame whose `content` is not a non-empty string without answering it. This package reduces a list of content blocks to its text before sending, and refuses one with no text.
 
 A bridge that predates turn input never answers — but it also never confirms `input_open`, so a server that waits for that confirmation never sends it a `turn_input` at all.
 
@@ -1362,6 +1382,7 @@ The life of a **helper** the CLI runs for the main assistant: a sub-agent, or a 
 - **`tool_use_id` is the key to group by.** It is the `tool_call_id` of the block that spawned the helper, and the `parent_tool_use_id` on the helper's own blocks. The CLI omits it on some phases; the bridge fills it in from the task's `started`. `task_id` is the CLI's own id and is present on every phase.
 - **Every task a consumer sees was introduced by a `started`** in the same turn. On a resumed session the CLI first reports on work an *earlier* turn left running; those reports are not forwarded, because they are not helpers of this turn.
 - **A helper is finished only when `finished` says so.** Not when its spawning call's `tool_result` arrives, and not when the main assistant's reply ends: a background helper's spawning call returns at once ("launched"), and the helper keeps working — and keeps sending `task` events and blocks — after the main assistant has written its whole answer. `done` still comes last.
+- **The end of the request ends every task.** `done`, a stream `error`, a top-level `error`, or `cancelled` for this `request_id` ends every task of that request, whatever phase it last reported. `finished` is sent only for a helper that actually finished: a stop, a silence or request timeout, a crashed CLI, a dropped connection, or a `result` while a background shell was still running send no `finished` for what was still open. A consumer that waits for `finished` alone keeps a helper spinning forever under a stopped answer. **Close them all yourself on the terminal frame**, keep the last `status` each reported, and show them as ended with the request, not as `completed`. This package does not synthesise `finished` events.
 - **`is_backgrounded`** says whether the main assistant waits. `false`: it is blocked inside the spawning call until the helper finishes, and `heartbeat`s arrive meanwhile. `true`: it is free to reply while the helper works; the CLI sends no heartbeat for such a helper, so `progress` and the helper's own blocks are its only signs of life.
 - **`task_type`** is the CLI's word for what the task is: `local_agent` for a helper, `local_bash` for a shell command run as a task — including one a helper runs for itself, whose `tool_use_id` is then the helper's call, not the main assistant's. Show `local_agent` tasks as helpers; do not assume the list is closed.
 - **`elapsed_seconds`** comes from the CLI's own clock, counted from the spawning call. Two buffers can sit between the bridge and a browser, and neither preserves timing, so compute nothing from arrival times.

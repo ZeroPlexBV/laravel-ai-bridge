@@ -166,8 +166,8 @@ final class BufferingSink
             self::completeQuietly($store, $rid, 'completed');
         });
 
-        $handler->onError(function (string $code, string $errorMessage) use ($append, $store, $rid): void {
-            $append(MessageTypes::ERROR, ['code' => $code, 'message' => $errorMessage]);
+        $handler->onError(function (string $code, string $errorMessage, array $meta = []) use ($append, $store, $rid): void {
+            $append(MessageTypes::ERROR, ['code' => $code, 'message' => $errorMessage] + self::publicCancelledMeta($meta));
             self::completeQuietly($store, $rid, 'failed');
         });
 
