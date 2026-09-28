@@ -13,6 +13,7 @@ Specification for the WebSocket protocol between `@tetrixdev/ai-bridge` (npm, cl
 - [Subscription Usage](#subscription-usage)
 - [AI Requests](#ai-requests)
 - [Turn Input](#turn-input)
+- [Streamed uploads and downloads](#streamed-uploads-and-downloads)
 - [Conversation Continuity](#conversation-continuity)
 - [Streaming Events](#streaming-events)
 - [Tool Calls](#tool-calls)
@@ -985,6 +986,40 @@ The bridge's silence and wall-clock bounds are unchanged; accepted inputs and `m
 
 ---
 
+## Streamed uploads and downloads
+
+Bridge **0.18+** (`hello.file_uploads`, `hello.file_downloads`). A file a person picks in a chat goes straight to the machine, and a file the machine holds comes straight back, **without the server keeping a copy** and **without the bytes on the WebSocket** (frames are capped far below a file). The socket carries small control frames; the bytes travel over one HTTP request from the machine to a **one-time URL on the origin it connected to** (the bridge refuses any other origin, and plain `http://` off loopback), authenticated with its own connection token.
+
+In this package the one-time URL is the public WebSocket URL plus `?transfer=<id>`, answered by the serve process, which pipes the bytes to and from the PHP-FPM worker holding the browser's request. Application API: [`docs/file-transfers.md`](docs/file-transfers.md).
+
+### Upload
+
+```json
+{ "type": "upload_offer", "id": "u1", "url": "https://studio.example/api/ai-bridge/ws?transfer=u1",
+  "working_dir": "/home/dev/repo", "name": "report.pdf", "mime_type": "application/pdf", "size": 48213 }
+```
+
+1. `upload_offer` (server → bridge). `working_dir` is checked like a turn's `working_dir` (inside an `--allow-dir` root); `size` is exact and at most the bridge's `max_file_bytes`.
+2. The bridge **GETs** `url`. The server streams exactly `size` bytes as they arrive from the browser, counting and hashing them.
+3. `upload_sent` (server → bridge) once every byte has passed: `{ "type": "upload_sent", "id": "u1", "size": 48213, "sha256": "…" }`. The bridge compares with what it received.
+4. `upload_done` (bridge → server), exactly once per offer, possibly before the bytes (a refusal):
+   - `{ "type": "upload_done", "id": "u1", "ok": true, "path": "/home/dev/repo/file-uploads/report.pdf", "name": "report.pdf", "size": 48213, "sha256": "…", "file_id": "…" }`
+   - `{ "type": "upload_done", "id": "u1", "ok": false, "code": "working_dir_not_allowed" | "upload_refused" | "upload_too_large" | "upload_failed" | "upload_cancelled" | …, "error": "…" }`
+5. `upload_abort` (server → bridge) `{ "type": "upload_abort", "id": "u1", "reason": "…" }` when the server gives up (browser gone, stall, mismatch), so the partial file goes at once.
+
+The file is written as a hidden `.part` and named only after the digests agree, in `<working_dir>/file-uploads/` (created with a `.gitignore` of `*`), `-2`, `-3` appended on collision. `file_id` is what the file is asked for by later.
+
+### Download
+
+1. `file_read` (server → bridge) `{ "type": "file_read", "id": "d1", "file_id": "…", "url": "…?transfer=d1", "range": "bytes=0-1023", "head": true }` (`range` and `head` optional). The bridge serves **only files it recorded itself** (received uploads; files the assistant handed back in `device` mode), by the id it minted, never by path.
+2. `file_read_result` (bridge → server): `{ "ok": true, "size": 48213, "status": 200 | 206 | 416, "start": 0, "end": 1023 }` or `{ "ok": false, "code": "file_unknown" | "file_gone" | "file_changed" | "file_refused" | "file_failed", "error": "…" }`.
+3. Unless it was a HEAD, a 416 or an empty range, the bridge **POSTs** the bytes (`application/octet-stream`, streamed) to `url`.
+4. `file_read_cancel` (server → bridge) `{ "type": "file_read_cancel", "id": "d1" }` when the reader goes away.
+
+`attachment_read` (a download by path) is refused by bridges from 0.18 and is not used by this package.
+
+---
+
 ## Conversation Continuity
 
 ### The Problem
@@ -1797,6 +1832,9 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `tool_call` | CLI invoked a server-side tool (via callback) |
 | `cancelled` | A turn stopped because the server asked |
 | `local_result` | Answering a `local_call`, run or refused |
+| `turn_input_ack` | Answering a `turn_input` |
+| `upload_done` | The one answer to an `upload_offer` |
+| `file_read_result` | Answering a `file_read` |
 | `error` | Request-level error (non-streaming) |
 
 ### Server → Bridge
@@ -1810,6 +1848,9 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `tool_resolve` | Returning tool execution result |
 | `tool_error` | Tool execution failed |
 | `local_call` | Asking the bridge to run one tool on this machine |
+| `turn_input` | A message for a turn that is still running |
+| `upload_offer` / `upload_sent` / `upload_abort` | A person's file on its way to the machine |
+| `file_read` / `file_read_cancel` | Asking for a file the machine recorded |
 
 ---
 

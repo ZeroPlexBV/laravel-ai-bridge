@@ -23,6 +23,7 @@ use Tetrix\AiBridge\Auth\TokenManager;
 use Tetrix\AiBridge\Protocol\AiRequestPayload;
 use Tetrix\AiBridge\Support\BridgeLog;
 use Tetrix\AiBridge\Protocol\MessageTypes;
+use Tetrix\AiBridge\Transfers\TransferHub;
 use Tetrix\AiBridge\WebSocket\BridgeConnectionManager;
 use Tetrix\AiBridge\WebSocket\MessageHandler;
 
@@ -62,6 +63,9 @@ class BridgeWebSocketServer
      */
     private ?ServerNegotiator $negotiator = null;
 
+    /** Where streamed uploads and downloads meet the machine (bridge 0.18+). */
+    private ?TransferHub $transfers = null;
+
     public function __construct(
         private readonly BridgeConnectionManager $connectionManager,
         private readonly MessageHandler $messageHandler,
@@ -94,6 +98,8 @@ class BridgeWebSocketServer
 
         $this->socket = new SocketServer("{$this->host}:{$this->port}", [], $this->loop);
 
+        $this->useTransferHub(new TransferHub($this->connectionManager, $this->tokenManager, $this->loop));
+
         $this->socket->on('connection', function (ConnectionInterface $tcpConnection) use ($handler) {
             $this->handleTcpConnection($tcpConnection, $handler);
         });
@@ -113,6 +119,17 @@ class BridgeWebSocketServer
         }
 
         $this->loop->run();
+    }
+
+    /**
+     * Wire the transfer hub in: the message handler hands it `upload_done` and
+     * `file_read_result`, and a machine that goes away ends its transfers at once.
+     */
+    public function useTransferHub(TransferHub $hub): void
+    {
+        $this->transfers = $hub;
+        $this->messageHandler->setTransferHub($hub);
+        $this->connectionManager->onUserGone(static fn (string $userId) => $hub->userGone($userId));
     }
 
     /**
@@ -159,6 +176,17 @@ class BridgeWebSocketServer
 
                 $headersComplete = true;
                 $headerLength = $headerEnd + 4;
+
+                // A file on its way through (an upload from a worker, or a machine
+                // collecting or delivering one) is streamed, never buffered: it can be
+                // far larger than any body limit here, and holding it is the one thing
+                // this path exists not to do. Decided on the headers alone.
+                if ($this->maybeStreamTransfer($tcpConnection, substr($httpBuffer, 0, $headerEnd), (string) substr($httpBuffer, $headerLength), $httpListener)) {
+                    $upgraded = true;
+                    $httpBuffer = '';
+
+                    return;
+                }
 
                 // Extract Content-Length from headers to know how much body to expect
                 $headerSection = substr($httpBuffer, 0, $headerEnd);
@@ -386,9 +414,104 @@ class BridgeWebSocketServer
     //   POST /api/request    — Send an ai_request to a user's bridge
     //   POST /api/request/input — Send a message into a user's running turn
     //   POST /api/disconnect — Forcibly drop a user's bridge connection
+    //   POST /api/upload     — Stream a browser's file to the user's machine (TransferHub)
+    //   POST /api/file-read  — Stream a file from the user's machine (TransferHub)
     //   GET  /api/status     — Check connected users
     //   GET  /api/health     — Health check
     // -------------------------------------------------------------------------
+
+    /**
+     * Hand a request to the transfer hub if it is one of the streamed ones.
+     *
+     *  - `POST /api/upload` from a worker (internal relay token): a browser's file.
+     *  - `GET|POST <any path>?transfer=<id>` from a machine (its own token): collecting
+     *    an upload, or delivering a download. Reached through the public WebSocket
+     *    location, whose path is matched exactly and whose query is free.
+     *
+     * @return bool  True when the request was taken over (the caller stops buffering).
+     */
+    private function maybeStreamTransfer(ConnectionInterface $tcp, string $head, string $early, ?callable $httpListener): bool
+    {
+        if ($this->transfers === null) {
+            return false;
+        }
+
+        $lines = explode("\r\n", $head);
+        $parts = explode(' ', (string) array_shift($lines));
+        if (count($parts) < 2) {
+            return false;
+        }
+        [$method, $target] = [strtoupper($parts[0]), $parts[1]];
+        $path = (string) parse_url($target, PHP_URL_PATH);
+        parse_str((string) parse_url($target, PHP_URL_QUERY), $query);
+
+        $isUpload = $method === 'POST' && $path === '/api/upload';
+        $transferId = is_string($query['transfer'] ?? null) ? $query['transfer'] : null;
+        $isMachine = ! $isUpload && $transferId !== null && in_array($method, ['GET', 'POST'], true)
+            && ! str_starts_with($path, '/api/status') && ! str_starts_with($path, '/api/request');
+
+        if (! $isUpload && ! $isMachine) {
+            return false;
+        }
+
+        $headers = [];
+        foreach ($lines as $line) {
+            $colon = strpos($line, ':');
+            if ($colon !== false) {
+                $headers[strtolower(trim(substr($line, 0, $colon)))] = trim(substr($line, $colon + 1));
+            }
+        }
+
+        if ($httpListener !== null) {
+            $tcp->removeListener('data', $httpListener);
+        }
+
+        if ($isMachine) {
+            $this->transfers->machineRequest($tcp, $method, (string) $transferId, $headers, $early);
+
+            return true;
+        }
+
+        $auth = $headers['authorization'] ?? '';
+        try {
+            if (! str_starts_with($auth, 'Bearer ')) {
+                throw new \RuntimeException('missing token');
+            }
+            $decoded = $this->tokenManager->validate(substr($auth, 7), TokenManager::INTERNAL_RELAY_SCOPE);
+            $userId = (string) ($decoded->sub ?? '');
+            if ($userId === '') {
+                throw new \RuntimeException('missing subject');
+            }
+        } catch (\Throwable) {
+            TransferHub::answer($tcp, 401, ['ok' => false, 'code' => 'invalid_token', 'error' => 'A relay token is required.'], drain: true);
+
+            return true;
+        }
+
+        $this->transfers->startUpload($tcp, $userId, $headers, $early);
+
+        return true;
+    }
+
+    /**
+     * POST /api/file-read — stream a file the machine recorded back to the worker.
+     *
+     * Body `{file_id, range?, head?}`. Answered by the transfer hub: headers as soon as
+     * the machine says whether it has the file, then the bytes as the machine sends them.
+     */
+    private function apiFileRead(ConnectionInterface $tcpConnection, RequestInterface $request, object $decoded): void
+    {
+        $userId = (string) ($decoded->sub ?? '');
+        $body = json_decode((string) $request->getBody(), true);
+
+        if ($userId === '' || ! is_array($body) || $this->transfers === null) {
+            $this->httpResponse($tcpConnection, 400, ['ok' => false, 'code' => 'invalid_request', 'error' => 'Body must be JSON with "file_id".']);
+
+            return;
+        }
+
+        $this->transfers->startDownload($tcpConnection, $userId, $body);
+    }
 
     /**
      * Check whether the HTTP request is a WebSocket upgrade.
@@ -454,6 +577,7 @@ class BridgeWebSocketServer
             $method === 'POST' && $path === '/api/request/input' => $this->apiRequestInput($tcpConnection, $request, $decoded),
             $method === 'GET' && $path === '/api/usage' => $this->apiUsage($tcpConnection, $request, $decoded),
             $method === 'POST' && $path === '/api/disconnect' => $this->apiDisconnect($tcpConnection, $decoded),
+            $method === 'POST' && $path === '/api/file-read' => $this->apiFileRead($tcpConnection, $request, $decoded),
             default => $this->httpResponse($tcpConnection, 404, [
                 'error' => 'not_found',
                 'message' => "Unknown endpoint: {$method} {$path}",

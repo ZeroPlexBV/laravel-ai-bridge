@@ -164,6 +164,30 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Streamed file transfers (bridge 0.18+)
+    |--------------------------------------------------------------------------
+    |
+    | A browser's upload is piped through the serve process to the machine, and a
+    | machine-held file is piped back the same way; nothing is stored here. The
+    | machine fetches / delivers the bytes at a one-time URL that must be on the
+    | origin it connected to. By default that URL is the public WebSocket URL
+    | (public_url, ws→http) with `?transfer=<id>`: the location that already
+    | routes to the serve process. Set this only when a dedicated location exists
+    | (for example one with proxy_request_buffering off). See docs/file-transfers.md.
+    |
+    */
+
+    'transfers' => [
+        'url' => env('AI_BRIDGE_TRANSFER_URL'),
+
+        // Where a file the assistant hands back goes: 'server' (uploaded to the app's
+        // attachment store, the default) or 'device' (kept on the machine; the
+        // `attachment` event carries `file_id` for MachineFiles::download()).
+        'handed_back' => env('AI_BRIDGE_HANDED_BACK', 'server'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Stream Event Buffer
     |--------------------------------------------------------------------------
     |

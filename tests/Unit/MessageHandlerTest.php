@@ -796,7 +796,9 @@ test('MessageTypes::all() contains all expected message type constants (EFF-006)
     expect($all)->toContain(MessageTypes::TURN_INPUT_ACK);
     expect($all)->toContain(MessageTypes::USER_INPUT);
     expect($all)->toContain(MessageTypes::MAIN_STATE);
-    expect($all)->toHaveCount(32);
+    expect($all)->toContain(MessageTypes::UPLOAD_OFFER);
+    expect($all)->toContain(MessageTypes::FILE_READ_RESULT);
+    expect($all)->toHaveCount(39);
 });
 
 test('turn_input is the server\'s to send and turn_input_ack the bridge\'s', function () {

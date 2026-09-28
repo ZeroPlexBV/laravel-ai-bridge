@@ -223,6 +223,34 @@ final class MessageTypes
     public const TURN_INPUT_ACK = 'turn_input_ack';
 
     /** Stream event: the entire AI response is complete. */
+    /*
+     * Streamed uploads and downloads (bridge 0.18+). The bytes never ride the
+     * socket: the bridge GETs an upload from, and POSTs a download to, a
+     * one-time URL on the connected origin that the serve process answers.
+     * See PROTOCOL.md "Streamed uploads and downloads" and Transfers\TransferHub.
+     */
+
+    /** Server → bridge: a person's file is on its way; GET it from `url`. */
+    public const UPLOAD_OFFER = 'upload_offer';
+
+    /** Server → bridge: every byte has passed; this is what was counted and hashed. */
+    public const UPLOAD_SENT = 'upload_sent';
+
+    /** Server → bridge: stop receiving that upload and remove what arrived. */
+    public const UPLOAD_ABORT = 'upload_abort';
+
+    /** Bridge → server: the one answer to an offer, with where the file landed and its file_id. */
+    public const UPLOAD_DONE = 'upload_done';
+
+    /** Server → bridge: POST the file recorded under `file_id` (optionally a Range) to `url`. */
+    public const FILE_READ = 'file_read';
+
+    /** Server → bridge: the reader went away; stop sending. */
+    public const FILE_READ_CANCEL = 'file_read_cancel';
+
+    /** Bridge → server: whether it has the file, its size, and the range it will send. */
+    public const FILE_READ_RESULT = 'file_read_result';
+
     public const DONE = 'done';
 
     /** Sent by bridge: an error occurred during AI processing. */
@@ -279,6 +307,13 @@ final class MessageTypes
             self::TOOL_ERROR,
             self::TURN_INPUT,
             self::TURN_INPUT_ACK,
+            self::UPLOAD_OFFER,
+            self::UPLOAD_SENT,
+            self::UPLOAD_ABORT,
+            self::UPLOAD_DONE,
+            self::FILE_READ,
+            self::FILE_READ_CANCEL,
+            self::FILE_READ_RESULT,
             self::DONE,
             self::ERROR,
             self::CANCEL,
@@ -319,6 +354,8 @@ final class MessageTypes
             self::PING,
             self::AI_REQUEST_ACK,
             self::TURN_INPUT_ACK,
+            self::UPLOAD_DONE,
+            self::FILE_READ_RESULT,
             self::STREAM,
             self::TOOL_CALL,
             self::ERROR,
@@ -354,6 +391,11 @@ final class MessageTypes
             self::TOOL_ERROR,
             self::USAGE_REQUEST,
             self::TURN_INPUT,
+            self::UPLOAD_OFFER,
+            self::UPLOAD_SENT,
+            self::UPLOAD_ABORT,
+            self::FILE_READ,
+            self::FILE_READ_CANCEL,
             self::CANCEL,
         ];
     }
