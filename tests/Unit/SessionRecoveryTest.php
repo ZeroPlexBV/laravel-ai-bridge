@@ -310,3 +310,34 @@ test('session_lost recovery carries the conversation working directory', functio
         ->and($sent[0]['working_dir'])->toBe('/repos/studio')
         ->and($sent[0]['cli_session_id'])->toBeNull();
 });
+
+test('session_lost re-issue keeps the relayed turn\'s bridge_prompt and open input', function () {
+    $conversation = Conversation::create([
+        'mode' => 'bridge', 'provider' => 'claude', 'cli_session_id' => 'dead-sess',
+    ]);
+    $conversation->appendMessage(Message::ROLE_USER, 'I enter the cave');
+
+    $sent = [];
+    $manager = new BridgeConnectionManager();
+    $manager->setSendCallback(function ($connection, $payload) use (&$sent) {
+        $sent[] = $payload;
+
+        return true;
+    });
+    $manager->addConnection('user-1', 'conn-1');
+
+    $messages = recoveryMessageHandler($manager);
+    $messages->registerRelayedRequest('req-1', 'user-1', (string) $conversation->id, [
+        'bridge_prompt' => ['mode' => 'append', 'text' => 'Be brief.'],
+        'accepts_input' => true,
+    ]);
+
+    $messages->handleMessage('conn-1', null, streamMessage(
+        MessageTypes::ERROR,
+        ['code' => 'session_lost', 'message' => 'cannot resume'],
+    ));
+
+    expect($sent)->toHaveCount(1)
+        ->and($sent[0]['bridge_prompt'])->toBe(['mode' => 'append', 'text' => 'Be brief.'])
+        ->and($sent[0]['options']['accepts_input'])->toBeTrue();
+});
