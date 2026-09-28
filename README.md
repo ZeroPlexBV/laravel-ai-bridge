@@ -1296,6 +1296,10 @@ Browser <--SSE--> Laravel App <--WebSocket--> Bridge (local) --> CLI tools
 3. Each event is written to the per-turn buffer (and the assistant message is persisted at terminal).
 4. Browser tails the buffer over SSE, same as BYOK/Managed — uniform shape across modes.
 
+## Files on the machine
+
+Bridge 0.18+ receives files a person picks in a chat and hands back files it holds, streamed through the serve process and never stored on the server: `MachineFiles::upload()` / `MachineFiles::download()`. See [docs/file-transfers.md](docs/file-transfers.md).
+
 ## Protocol
 
 The WebSocket protocol between the server and CLI bridge is documented in [PROTOCOL.md](PROTOCOL.md).

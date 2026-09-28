@@ -94,6 +94,15 @@ class BridgeConnectionManager
 
     private const DROPPED_MEMORY = 500;
 
+    /** @var list<\Closure(string): void> Called with the user id when a user's bridge goes away. */
+    private array $userGoneListeners = [];
+
+    /** Be told when a user's bridge goes away (after their pending requests are failed). */
+    public function onUserGone(\Closure $listener): void
+    {
+        $this->userGoneListeners[] = $listener;
+    }
+
     /**
      * Callback for sending messages over the WebSocket connection.
      * Set by the consuming app's WebSocket server integration.
@@ -171,6 +180,14 @@ class BridgeConnectionManager
 
         unset($this->connections[$userId]);
         unset($this->connectionIdIndex[$connectionId]);
+
+        foreach ($this->userGoneListeners as $listener) {
+            try {
+                $listener($userId);
+            } catch (\Throwable) {
+                // A listener must not stop the connection being removed.
+            }
+        }
 
         Event::dispatch(new BridgeDisconnected($userId, $connectionId, $reason));
     }

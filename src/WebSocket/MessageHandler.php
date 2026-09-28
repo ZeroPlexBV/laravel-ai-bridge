@@ -80,6 +80,37 @@ class MessageHandler
         private readonly ToolRegistry $toolRegistry,
     ) {}
 
+    /** Where `upload_done` and `file_read_result` go. Set by the serve process. */
+    private ?\Tetrix\AiBridge\Transfers\TransferHub $transferHub = null;
+
+    public function setTransferHub(\Tetrix\AiBridge\Transfers\TransferHub $hub): void
+    {
+        $this->transferHub = $hub;
+    }
+
+    /**
+     * A machine answering about a file transfer. Handed to the hub with the sender's user,
+     * which the hub matches against the transfer's own before acting on it.
+     *
+     * @param  array<string, mixed>  $message
+     */
+    private function handleTransferAnswer(string $connectionId, string $type, array $message): ?array
+    {
+        $userId = $this->connectionManager->getUserIdByConnectionId($connectionId);
+
+        if ($userId === null || $this->transferHub === null) {
+            return null;
+        }
+
+        if ($type === MessageTypes::UPLOAD_DONE) {
+            $this->transferHub->onUploadDone($userId, $message);
+        } else {
+            $this->transferHub->onFileReadResult($userId, $message);
+        }
+
+        return null;
+    }
+
     /**
      * Register a relayed (PHP-FPM) request as pending in the serve process.
      *
@@ -162,6 +193,7 @@ class MessageHandler
             MessageTypes::POSTURE => $this->handlePosture($connectionId, $message),
             MessageTypes::USAGE_RESULT => $this->handleUsageResult($connectionId, $message),
             MessageTypes::TURN_INPUT_ACK => $this->handleTurnInputAck($connectionId, $message),
+            MessageTypes::UPLOAD_DONE, MessageTypes::FILE_READ_RESULT => $this->handleTransferAnswer($connectionId, $type, $message),
             MessageTypes::STREAM => $this->handleStreamEnvelope($connectionId, $message),
             MessageTypes::TOOL_CALL => $this->handleToolCall($connectionId, $message),
             MessageTypes::ERROR => $this->handleError($connectionId, $message),
@@ -587,7 +619,7 @@ class MessageHandler
                 // field ignores it and keeps its own behaviour, so this can
                 // ship without the two moving in step.
                 'silence_timeout' => (int) config('ai-bridge.websocket.silence_timeout', 900),
-            ],
+            ] + self::handedBackConfig(),
             // How much the local CLI environment is allowed to influence
             // behaviour. The bridge translates this into a different per-
             // provider flag set: `isolated` means MCP-only tools, no
@@ -609,6 +641,22 @@ class MessageHandler
         }
 
         return $welcome;
+    }
+
+    /**
+     * Where a file the assistant hands back goes (bridge 0.18+ `config.attachments`).
+     *
+     * `server` (absent, the default): the bridge uploads it to POST /ai-bridge/attachments
+     * and the app's attachment store keeps it. `device`: it stays on the machine and the
+     * `attachment` event carries `path` and `file_id` instead of an id, to be fetched with
+     * MachineFiles::download() when someone opens it. Only sent when set to `device`, so
+     * nothing changes for an application that does not ask.
+     *
+     * @return array<string, string>
+     */
+    private static function handedBackConfig(): array
+    {
+        return config('ai-bridge.transfers.handed_back') === 'device' ? ['attachments' => 'device'] : [];
     }
 
     /**
