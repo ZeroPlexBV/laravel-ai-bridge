@@ -18,7 +18,7 @@ final class StreamEvent
     public function __construct(
         /** Unique identifier for the AI request that produced this event. */
         public readonly string $requestId,
-        /** Event type: block_start, block_delta, block_stop, done, error, tool_call. */
+        /** Event type: block_start, block_delta, block_stop, tool_call, tool_result, task, done, error, … */
         public readonly string $event,
         /** Event-specific payload data. */
         public readonly array $data,
@@ -31,6 +31,12 @@ final class StreamEvent
      * because a provider may not report them, but when the bridge sends them —
      * and it does, for every provider — dropping them here left a chat able to
      * say only "4 tool calls", never "3 commands, 1 file read".
+     *
+     * $parentToolUseId marks a block a helper (sub-agent) produced: it is the
+     * `tool_call_id` of the call that spawned the helper. Null means the main
+     * assistant and is left out of `data` entirely — absent is what every
+     * block meant before the field existed, so a consumer that ignores it sees
+     * exactly the stream it always did.
      */
     public static function blockStart(
         string $requestId,
@@ -38,12 +44,14 @@ final class StreamEvent
         int $blockIndex,
         ?string $toolName = null,
         ?string $toolCallId = null,
+        ?string $parentToolUseId = null,
     ): self {
         return new self($requestId, MessageTypes::BLOCK_START, array_filter([
             'block_type' => $blockType->value,
             'block_index' => $blockIndex,
             'tool_name' => $toolName,
             'tool_call_id' => $toolCallId,
+            'parent_tool_use_id' => $parentToolUseId,
         ], static fn ($value) => $value !== null));
     }
 
@@ -93,9 +101,17 @@ final class StreamEvent
      * $isError is the authoritative failure signal. It cannot be read back out
      * of $result: a tool that legitimately prints "Error: no matches" looks
      * exactly like one that failed.
+     *
+     * $parentToolUseId is set when the call was a helper's, exactly as on the
+     * call's block_start, and left out of `data` when null.
      */
-    public static function toolResult(string $requestId, string $toolCallId, mixed $result, ?bool $isError = null): self
-    {
+    public static function toolResult(
+        string $requestId,
+        string $toolCallId,
+        mixed $result,
+        ?bool $isError = null,
+        ?string $parentToolUseId = null,
+    ): self {
         // Only is_error is conditional. Filtering `result` too would erase a
         // null result — which a failing tool commonly has — and a consumer
         // waiting for `result` to appear would show the call as still running
@@ -104,8 +120,27 @@ final class StreamEvent
         if ($isError !== null) {
             $data['is_error'] = $isError;
         }
+        if ($parentToolUseId !== null) {
+            $data['parent_tool_use_id'] = $parentToolUseId;
+        }
 
         return new self($requestId, MessageTypes::TOOL_RESULT, $data);
+    }
+
+    /**
+     * Create a task event — the life of a helper (sub-agent, or background
+     * command) the CLI runs for the main assistant. Informational, non-terminal.
+     *
+     * $data is the bridge's payload as it stands: `phase`, `task_id`,
+     * `tool_use_id` and whatever else that phase carries. Passed through whole
+     * rather than rebuilt from known keys, so a field a newer bridge adds
+     * reaches the consumer instead of dying here.
+     *
+     * @param  array<string, mixed>  $data
+     */
+    public static function task(string $requestId, array $data): self
+    {
+        return new self($requestId, MessageTypes::TASK, $data);
     }
 
     /**

@@ -456,3 +456,244 @@ test('dispatchCancelled sets terminated flag', function () {
 
     expect($doneFired)->toBeFalse();
 });
+
+/*
+|--------------------------------------------------------------------------
+| Helper (sub-agent) activity
+|--------------------------------------------------------------------------
+|
+| `parent_tool_use_id` on block_start and tool_result says which helper a
+| block or result belongs to — absent for the main assistant. The `task`
+| event reports each helper's life. Both are additive: a consumer that ignores
+| them sees the stream it always did.
+|
+*/
+
+function helperWire(string $event, array $data): StreamEvent
+{
+    return StreamEvent::fromArray([
+        'type' => MessageTypes::STREAM,
+        'request_id' => 'req-helper',
+        'event' => $event,
+        'data' => $data,
+    ]);
+}
+
+test('block_start carries the helper a block belongs to', function () {
+    $handler = createStreamHandler();
+    $seen = [];
+    $handler->onBlockStart(function (StreamEvent $event) use (&$seen) {
+        $seen[] = $event->data;
+    });
+
+    $handler->dispatchEvent(helperWire(MessageTypes::BLOCK_START, [
+        'block_index' => 2, 'block_type' => 'tool_call', 'tool_name' => 'Bash',
+        'tool_call_id' => 'toolu_child', 'parent_tool_use_id' => 'toolu_agent',
+    ]));
+    $handler->dispatchEvent(helperWire(MessageTypes::BLOCK_START, [
+        'block_index' => 3, 'block_type' => 'text', 'parent_tool_use_id' => 'toolu_agent',
+    ]));
+
+    expect($seen[0]['parent_tool_use_id'])->toBe('toolu_agent')
+        ->and($seen[0]['tool_call_id'])->toBe('toolu_child')
+        ->and($seen[1]['parent_tool_use_id'])->toBe('toolu_agent');
+});
+
+test('a main-assistant block has no parent key at all, never null or empty', function () {
+    $handler = createStreamHandler();
+    $seen = [];
+    $handler->onBlockStart(function (StreamEvent $event) use (&$seen) {
+        $seen[] = $event->data;
+    });
+
+    $handler->dispatchEvent(helperWire(MessageTypes::BLOCK_START, ['block_index' => 0, 'block_type' => 'text']));
+    // A stray empty string or null must not turn the main assistant's block
+    // into a helper's with an id that matches nothing.
+    $handler->dispatchEvent(helperWire(MessageTypes::BLOCK_START, ['block_index' => 1, 'block_type' => 'text', 'parent_tool_use_id' => '']));
+    $handler->dispatchEvent(helperWire(MessageTypes::BLOCK_START, ['block_index' => 2, 'block_type' => 'text', 'parent_tool_use_id' => null]));
+    $handler->dispatchBlockStart(BlockType::Text, 3);
+
+    foreach ($seen as $data) {
+        expect($data)->not->toHaveKey('parent_tool_use_id');
+    }
+});
+
+test('a tool result tells its callback which helper made the call', function () {
+    $handler = createStreamHandler();
+    $seen = [];
+    $handler->onToolResult(function (string $id, mixed $result, ?bool $isError, ?string $parent) use (&$seen) {
+        $seen[$id] = $parent;
+    });
+
+    $handler->dispatchEvent(helperWire(MessageTypes::TOOL_RESULT, [
+        'tool_call_id' => 'toolu_child', 'result' => 'helper-done', 'is_error' => false,
+        'parent_tool_use_id' => 'toolu_agent',
+    ]));
+    $handler->dispatchEvent(helperWire(MessageTypes::TOOL_RESULT, [
+        'tool_call_id' => 'toolu_main', 'result' => 'launched',
+    ]));
+
+    expect($seen)->toBe(['toolu_child' => 'toolu_agent', 'toolu_main' => null]);
+});
+
+test('a three-argument tool result callback keeps working', function () {
+    $handler = createStreamHandler();
+    $seen = null;
+    $handler->onToolResult(function (string $id, mixed $result, ?bool $isError) use (&$seen) {
+        $seen = [$id, $result, $isError];
+    });
+
+    $handler->dispatchEvent(helperWire(MessageTypes::TOOL_RESULT, [
+        'tool_call_id' => 'toolu_child', 'result' => 'ok', 'is_error' => false,
+        'parent_tool_use_id' => 'toolu_agent',
+    ]));
+
+    expect($seen)->toBe(['toolu_child', 'ok', false]);
+});
+
+test('a chunked helper result keeps its parent through reassembly', function () {
+    $handler = createStreamHandler();
+    $seen = [];
+    $handler->onToolResult(function (string $id, mixed $result, ?bool $isError, ?string $parent) use (&$seen) {
+        $seen[] = [$id, $result, $parent];
+    });
+
+    foreach (['al', 'ph', 'a'] as $i => $piece) {
+        $handler->dispatchEvent(helperWire(MessageTypes::TOOL_RESULT, [
+            'tool_call_id' => 'toolu_child', 'result' => $piece, 'chunk_index' => $i,
+            'final' => $i === 2, 'parent_tool_use_id' => 'toolu_agent',
+        ]));
+    }
+
+    expect($seen)->toBe([['toolu_child', 'alpha', 'toolu_agent']]);
+});
+
+test('a helper result cut short by the terminal still says whose it was', function () {
+    $handler = createStreamHandler();
+    $seen = [];
+    $handler->onToolResult(function (string $id, mixed $result, ?bool $isError, ?string $parent) use (&$seen) {
+        $seen[] = [$id, $parent];
+    });
+
+    $handler->dispatchEvent(helperWire(MessageTypes::TOOL_RESULT, [
+        'tool_call_id' => 'toolu_child', 'result' => 'half', 'chunk_index' => 0,
+        'final' => false, 'parent_tool_use_id' => 'toolu_agent',
+    ]));
+    $handler->dispatchEvent(helperWire(MessageTypes::DONE, ['usage' => null]));
+
+    expect($seen)->toBe([['toolu_child', 'toolu_agent']]);
+});
+
+test('a task event reaches onTask whole, future fields included', function () {
+    $handler = createStreamHandler();
+    $seen = [];
+    $handler->onTask(function (array $task) use (&$seen) {
+        $seen[] = $task;
+    });
+
+    $finished = [
+        'phase' => 'finished',
+        'task_id' => 'af2e05936428f6e8e',
+        'tool_use_id' => 'toolu_agent',
+        'status' => 'completed',
+        'summary' => 'The dry-run lists 3 pending migrations…',
+        'usage' => ['total_tokens' => 24742, 'tool_uses' => 1, 'duration_ms' => 45887],
+        // Not in the protocol today. Nothing here may whitelist task fields.
+        'some_future_field' => ['nested' => true],
+    ];
+    $handler->dispatchEvent(helperWire(MessageTypes::TASK, $finished));
+
+    expect($seen)->toBe([$finished]);
+});
+
+test('a task event is not terminal: the turn goes on and done still fires', function () {
+    $handler = createStreamHandler();
+    $order = [];
+    $handler->onTask(function (array $task) use (&$order) {
+        $order[] = 'task:'.$task['phase'];
+    });
+    $handler->onBlockStart(function () use (&$order) {
+        $order[] = 'block';
+    });
+    $handler->onDone(function () use (&$order) {
+        $order[] = 'done';
+    });
+
+    $handler->dispatchEvent(helperWire(MessageTypes::TASK, ['phase' => 'heartbeat', 'task_id' => 't1', 'tool_use_id' => 'toolu_agent', 'elapsed_seconds' => 30]));
+    $handler->dispatchEvent(helperWire(MessageTypes::BLOCK_START, ['block_index' => 0, 'block_type' => 'text']));
+    $handler->dispatchEvent(helperWire(MessageTypes::TASK, ['phase' => 'finished', 'task_id' => 't1', 'tool_use_id' => 'toolu_agent', 'status' => 'completed']));
+    $handler->dispatchEvent(helperWire(MessageTypes::DONE, ['usage' => null]));
+
+    expect($order)->toBe(['task:heartbeat', 'block', 'task:finished', 'done']);
+});
+
+test('a task event after the terminal or a cancel is dropped', function () {
+    $handler = createStreamHandler();
+    $fired = 0;
+    $handler->onTask(function () use (&$fired) {
+        $fired++;
+    });
+
+    $handler->dispatchDone(null);
+    $handler->dispatchTask(['phase' => 'progress', 'task_id' => 't1']);
+
+    $cancelled = createStreamHandler();
+    $cancelled->onTask(function () use (&$fired) {
+        $fired++;
+    });
+    $cancelled->cancel();
+    $cancelled->dispatchTask(['phase' => 'progress', 'task_id' => 't1']);
+
+    expect($fired)->toBe(0);
+});
+
+test('done hands subagent_stats through in its metadata', function () {
+    $handler = createStreamHandler();
+    $meta = null;
+    $handler->onDone(function (?array $usage, array $m) use (&$meta) {
+        $meta = $m;
+    });
+
+    $stats = ['spawned' => 1, 'completed' => 1, 'by_type' => ['general-purpose' => 1]];
+    $handler->dispatchEvent(helperWire(MessageTypes::DONE, ['usage' => null, 'subagent_stats' => $stats]));
+
+    expect($meta['subagent_stats'])->toBe($stats)
+        ->and($handler->lastDoneMeta()['subagent_stats'])->toBe($stats);
+});
+
+test('an event this package does not know is ignored and logged at debug', function () {
+    \Illuminate\Support\Facades\Log::spy();
+
+    $handler = createStreamHandler();
+    $done = false;
+    $handler->onDone(function () use (&$done) {
+        $done = true;
+    });
+
+    $handler->dispatchEvent(helperWire('some_future_event', ['x' => 1]));
+    $handler->dispatchEvent(helperWire(MessageTypes::DONE, ['usage' => null]));
+
+    expect($done)->toBeTrue();
+    \Illuminate\Support\Facades\Log::shouldHaveReceived('debug')
+        ->withArgs(fn (string $message, array $context = []) => $message === 'AI Bridge: ignoring unknown stream event'
+            && ($context['event'] ?? null) === 'some_future_event')
+        ->once();
+});
+
+test('StreamEvent factories leave the parent out for the main assistant', function () {
+    $main = StreamEvent::blockStart('r', BlockType::ToolCall, 0, 'Bash', 'toolu_1');
+    $helper = StreamEvent::blockStart('r', BlockType::ToolCall, 1, 'Bash', 'toolu_2', 'toolu_agent');
+    $mainResult = StreamEvent::toolResult('r', 'toolu_1', 'ok', false);
+    $helperResult = StreamEvent::toolResult('r', 'toolu_2', 'ok', null, 'toolu_agent');
+    $task = StreamEvent::task('r', ['phase' => 'started', 'task_id' => 't1', 'is_backgrounded' => true]);
+
+    expect($main->data)->not->toHaveKey('parent_tool_use_id')
+        ->and($helper->data['parent_tool_use_id'])->toBe('toolu_agent')
+        ->and($mainResult->data)->not->toHaveKey('parent_tool_use_id')
+        ->and($helperResult->data)->toBe(['tool_call_id' => 'toolu_2', 'result' => 'ok', 'parent_tool_use_id' => 'toolu_agent'])
+        ->and($task->event)->toBe(MessageTypes::TASK)
+        ->and($task->toArray())->toBe([
+            'type' => 'stream', 'request_id' => 'r', 'event' => 'task',
+            'data' => ['phase' => 'started', 'task_id' => 't1', 'is_backgrounded' => true],
+        ]);
+});

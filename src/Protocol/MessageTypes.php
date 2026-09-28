@@ -105,6 +105,18 @@ final class MessageTypes
     public const RATE_LIMIT = 'rate_limit';
 
     /**
+     * Stream event: a helper (sub-agent, or a background shell command) the
+     * CLI runs for the main assistant started, progressed, is still alive, or
+     * ended. Informational and non-terminal, like rate_limit.
+     *
+     * Its `tool_use_id` is the `tool_call_id` of the spawning call and the
+     * `parent_tool_use_id` on the helper's own blocks and results. A helper is
+     * finished only when a `finished` phase says so — never when its spawning
+     * call's tool_result arrives, which for a background helper is at once.
+     */
+    public const TASK = 'task';
+
+    /**
      * A file the assistant produced and chose to hand back.
      *
      * Emitted by the bridge after it has uploaded the file to
@@ -213,6 +225,7 @@ final class MessageTypes
             self::TOOL_CALL,
             self::TOOL_RESULT,
             self::RATE_LIMIT,
+            self::TASK,
             self::ATTACHMENT,
             self::POSTURE,
             self::USAGE_REQUEST,

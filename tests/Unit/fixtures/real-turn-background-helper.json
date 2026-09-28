@@ -1,0 +1,318 @@
+[
+  {
+    "event": "block_start",
+    "data": {
+      "block_index": 0,
+      "block_type": "tool_call",
+      "tool_name": "Agent",
+      "tool_call_id": "toolu_018UGfE8HLBqgFmXMDrzDgD5"
+    }
+  },
+  {
+    "event": "block_delta",
+    "data": {
+      "block_index": 0,
+      "content": "{\"description\":\"Run sleep command in foreground\",\"prompt\":\"Run exactly this Bash command in the FOREGROUND (do not use run_in_background, do not use Monitor): `python3 -c \\\"import time; time.sleep(40); print(\\\\\\\"helper-done\\\\\\\")\\\"`. Wait for it to complete, then report its stdout output.\",\"subagent_type\":\"general-purpose\",\"run_in_background\":\"true\"}"
+    }
+  },
+  {
+    "event": "block_stop",
+    "data": {
+      "block_index": 0
+    }
+  },
+  {
+    "event": "task",
+    "data": {
+      "phase": "started",
+      "task_id": "af2e05936428f6e8e",
+      "tool_use_id": "toolu_018UGfE8HLBqgFmXMDrzDgD5",
+      "subagent_type": "general-purpose",
+      "description": "Run sleep command in foreground",
+      "task_type": "local_agent",
+      "spawn_depth": 1,
+      "is_backgrounded": true
+    }
+  },
+  {
+    "event": "tool_result",
+    "data": {
+      "tool_call_id": "toolu_018UGfE8HLBqgFmXMDrzDgD5",
+      "result": "Async agent launched successfully. (This tool result is internal metadata — never quote or paste any part of it, including the agentId below, into a user-facing reply.)\nagentId: af2e05936428f6e8e (internal ID - do not mention to user. Use SendMessage with to: 'af2e05936428f6e8e', summary: '<5-10 word recap>' to continue this agent.)\nThe agent is working in the background. You will be notified automatically when it completes. You know nothing about its results until that notification arrives — do not report, assume, or predict them; continue other work or respond to the user in the meantime.\nDo not duplicate this agent's work — avoid working with the same files or topics it is using.\noutput_file: /tmp/claude-1000/-home-admin-zp-studio-tmp-tmp-bl0riUDovM-fix-bg-work/fc66ddfa-c316-49c5-94fb-6b31677ddb2e/tasks/af2e05936428f6e8e.output\nDo NOT Read or tail this file via the shell tool — it is the full subagent JSONL transcript and reading it will overflow your context. If the user asks for progress, say the agent is still running; you'll get a completion notification."
+    }
+  },
+  {
+    "event": "rate_limit",
+    "data": {
+      "provider": "claude",
+      "info": {
+        "status": "allowed",
+        "resetsAt": 1790353200,
+        "rateLimitType": "five_hour",
+        "overageStatus": "rejected",
+        "overageDisabledReason": "org_level_disabled",
+        "isUsingOverage": false,
+        "unifiedWindows": {
+          "five_hour": {
+            "utilization": 0.26,
+            "resetsAt": 1790353200
+          },
+          "seven_day": {
+            "utilization": 0.29,
+            "resetsAt": 1790812800
+          }
+        }
+      }
+    }
+  },
+  {
+    "event": "block_start",
+    "data": {
+      "block_index": 1,
+      "block_type": "text"
+    }
+  },
+  {
+    "event": "block_delta",
+    "data": {
+      "block_index": 1,
+      "content": "Helper started"
+    }
+  },
+  {
+    "event": "block_delta",
+    "data": {
+      "block_index": 1,
+      "content": " in the"
+    }
+  },
+  {
+    "event": "block_delta",
+    "data": {
+      "block_index": 1,
+      "content": " background."
+    }
+  },
+  {
+    "event": "block_stop",
+    "data": {
+      "block_index": 1
+    }
+  },
+  {
+    "event": "block_start",
+    "data": {
+      "block_index": 2,
+      "block_type": "tool_call",
+      "tool_name": "Bash",
+      "tool_call_id": "toolu_016KmGfEStPRwJ83BxFMXfw9",
+      "parent_tool_use_id": "toolu_018UGfE8HLBqgFmXMDrzDgD5"
+    }
+  },
+  {
+    "event": "block_delta",
+    "data": {
+      "block_index": 2,
+      "content": "{\"command\":\"python3 -c \\\"import time; time.sleep(40); print(\\\\\\\"helper-done\\\\\\\")\\\"\",\"timeout\":60000}"
+    }
+  },
+  {
+    "event": "block_stop",
+    "data": {
+      "block_index": 2
+    }
+  },
+  {
+    "event": "task",
+    "data": {
+      "phase": "progress",
+      "task_id": "af2e05936428f6e8e",
+      "tool_use_id": "toolu_018UGfE8HLBqgFmXMDrzDgD5",
+      "subagent_type": "general-purpose",
+      "description": "Running python3 -c \"import time; time.sleep(40); print(\\\"…",
+      "last_tool_name": "Bash",
+      "usage": {
+        "total_tokens": 23921,
+        "tool_uses": 1,
+        "duration_ms": 2976
+      }
+    }
+  },
+  {
+    "event": "task",
+    "data": {
+      "phase": "started",
+      "task_id": "b70wo65bp",
+      "tool_use_id": "toolu_016KmGfEStPRwJ83BxFMXfw9",
+      "description": "python3 -c \"import time; time.sleep(40); print(\\\"helper-done\\\")\"",
+      "task_type": "local_bash",
+      "is_backgrounded": false
+    }
+  },
+  {
+    "event": "task",
+    "data": {
+      "phase": "finished",
+      "task_id": "b70wo65bp",
+      "tool_use_id": "toolu_016KmGfEStPRwJ83BxFMXfw9",
+      "status": "completed",
+      "summary": "python3 -c \"import time; time.sleep(40); print(\\\"helper-done\\\")\""
+    }
+  },
+  {
+    "event": "tool_result",
+    "data": {
+      "tool_call_id": "toolu_016KmGfEStPRwJ83BxFMXfw9",
+      "result": "helper-done",
+      "is_error": false,
+      "parent_tool_use_id": "toolu_018UGfE8HLBqgFmXMDrzDgD5"
+    }
+  },
+  {
+    "event": "block_start",
+    "data": {
+      "block_index": 3,
+      "block_type": "text",
+      "parent_tool_use_id": "toolu_018UGfE8HLBqgFmXMDrzDgD5"
+    }
+  },
+  {
+    "event": "block_delta",
+    "data": {
+      "block_index": 3,
+      "content": "The command completed after ~40 seconds. Its stdout output was:\n\n```\nhelper-done\n```"
+    }
+  },
+  {
+    "event": "block_stop",
+    "data": {
+      "block_index": 3
+    }
+  },
+  {
+    "event": "task",
+    "data": {
+      "phase": "updated",
+      "task_id": "af2e05936428f6e8e",
+      "tool_use_id": "toolu_018UGfE8HLBqgFmXMDrzDgD5",
+      "status": "completed"
+    }
+  },
+  {
+    "event": "task",
+    "data": {
+      "phase": "finished",
+      "task_id": "af2e05936428f6e8e",
+      "tool_use_id": "toolu_018UGfE8HLBqgFmXMDrzDgD5",
+      "status": "completed",
+      "summary": "The command completed after ~40 seconds. Its stdout output was:\n\n```\nhelper-done\n```",
+      "usage": {
+        "total_tokens": 24742,
+        "tool_uses": 1,
+        "duration_ms": 45887
+      }
+    }
+  },
+  {
+    "event": "block_start",
+    "data": {
+      "block_index": 4,
+      "block_type": "text"
+    }
+  },
+  {
+    "event": "block_delta",
+    "data": {
+      "block_index": 4,
+      "content": "The"
+    }
+  },
+  {
+    "event": "block_delta",
+    "data": {
+      "block_index": 4,
+      "content": " background"
+    }
+  },
+  {
+    "event": "block_delta",
+    "data": {
+      "block_index": 4,
+      "content": " helper fin"
+    }
+  },
+  {
+    "event": "block_delta",
+    "data": {
+      "block_index": 4,
+      "content": "ished and print"
+    }
+  },
+  {
+    "event": "block_delta",
+    "data": {
+      "block_index": 4,
+      "content": "ed \""
+    }
+  },
+  {
+    "event": "block_delta",
+    "data": {
+      "block_index": 4,
+      "content": "helper-done\"."
+    }
+  },
+  {
+    "event": "block_stop",
+    "data": {
+      "block_index": 4
+    }
+  },
+  {
+    "event": "done",
+    "data": {
+      "usage": {
+        "input_tokens": 4,
+        "output_tokens": 227,
+        "cache_creation_input_tokens": 14126,
+        "cache_read_input_tokens": 53496
+      },
+      "model": "claude-sonnet-5",
+      "provider_version": "2.1.280",
+      "stop_reason": "end_turn",
+      "subtype": "success",
+      "cost_usd": 0.1206508,
+      "duration_ms": 6157,
+      "duration_api_ms": 14291,
+      "num_turns": 2,
+      "permission_denials": [],
+      "subagent_stats": {
+        "spawned": 1,
+        "requested": {
+          "background": 0,
+          "foreground": 0,
+          "unset": 1
+        },
+        "started_in_background": 1,
+        "max_depth": 1,
+        "spawned_by_subagents": 0,
+        "completed": 1,
+        "failed": 0,
+        "killed": {
+          "parent": 0,
+          "user": 0,
+          "system": 0
+        },
+        "refused": {
+          "depth_limit": 0,
+          "concurrency_limit": 0,
+          "budget": 0
+        },
+        "by_type": {
+          "general-purpose": 1
+        }
+      },
+      "cli_session_id": "fc66ddfa-c316-49c5-94fb-6b31677ddb2e"
+    }
+  }
+]

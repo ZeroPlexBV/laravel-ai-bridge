@@ -161,6 +161,85 @@ test('stream block_delta from correct user is dispatched (SEC-004)', function ()
     expect($receivedContent)->toBe('hello');
 });
 
+test('a helper task event from the owning bridge reaches onTask whole', function () {
+    $handler = makeHandler($this->manager);
+
+    $seen = [];
+    $handler->onTask(function (array $task) use (&$seen) {
+        $seen[] = $task;
+    });
+
+    $this->manager->addConnection('user-1', 'conn-1');
+    $this->manager->registerPendingRequest('req-1', $handler, 'user-1');
+
+    $data = [
+        'phase' => 'progress', 'task_id' => 'af2e05936428f6e8e', 'tool_use_id' => 'toolu_agent',
+        'subagent_type' => 'general-purpose', 'description' => 'Running php artisan migrate --pretend',
+        'last_tool_name' => 'Bash', 'usage' => ['total_tokens' => 23921, 'tool_uses' => 1, 'duration_ms' => 2976],
+        'some_future_field' => 'kept',
+    ];
+    $response = $this->messageHandler->handleMessage('conn-1', null, json_encode([
+        'type' => MessageTypes::STREAM,
+        'request_id' => 'req-1',
+        'event' => MessageTypes::TASK,
+        'data' => $data,
+    ]));
+
+    expect($response)->toBeNull()
+        ->and($seen)->toBe([$data]);
+});
+
+test('a helper task event from another user is discarded (SEC-004)', function () {
+    $handler = makeHandler($this->manager);
+
+    $fired = false;
+    $handler->onTask(function () use (&$fired) {
+        $fired = true;
+    });
+
+    $this->manager->addConnection('user-1', 'conn-1');
+    $this->manager->addConnection('user-2', 'conn-2');
+    $this->manager->registerPendingRequest('req-1', $handler, 'user-1');
+
+    $this->messageHandler->handleMessage('conn-2', null, json_encode([
+        'type' => MessageTypes::STREAM,
+        'request_id' => 'req-1',
+        'event' => MessageTypes::TASK,
+        'data' => ['phase' => 'heartbeat', 'task_id' => 't1', 'tool_use_id' => 'toolu_agent', 'elapsed_seconds' => 30],
+    ]));
+
+    expect($fired)->toBeFalse();
+});
+
+test('a helper block and its result arrive over the wire with their parent', function () {
+    $handler = makeHandler($this->manager);
+
+    $blockParent = null;
+    $resultParent = 'unset';
+    $handler->onBlockStart(function (StreamEvent $event) use (&$blockParent) {
+        $blockParent = $event->data['parent_tool_use_id'] ?? null;
+    });
+    $handler->onToolResult(function (string $id, mixed $result, ?bool $isError, ?string $parent) use (&$resultParent) {
+        $resultParent = $parent;
+    });
+
+    $this->manager->addConnection('user-1', 'conn-1');
+    $this->manager->registerPendingRequest('req-1', $handler, 'user-1');
+
+    foreach ([
+        [MessageTypes::BLOCK_START, ['block_index' => 2, 'block_type' => 'tool_call', 'tool_name' => 'Bash', 'tool_call_id' => 'toolu_child', 'parent_tool_use_id' => 'toolu_agent']],
+        [MessageTypes::BLOCK_STOP, ['block_index' => 2]],
+        [MessageTypes::TOOL_RESULT, ['tool_call_id' => 'toolu_child', 'result' => 'helper-done', 'is_error' => false, 'parent_tool_use_id' => 'toolu_agent']],
+    ] as [$event, $data]) {
+        $this->messageHandler->handleMessage('conn-1', null, json_encode([
+            'type' => MessageTypes::STREAM, 'request_id' => 'req-1', 'event' => $event, 'data' => $data,
+        ]));
+    }
+
+    expect($blockParent)->toBe('toolu_agent')
+        ->and($resultParent)->toBe('toolu_agent');
+});
+
 test('stream block_delta from wrong user is discarded (SEC-004)', function () {
     $handler = makeHandler($this->manager);
 
@@ -712,7 +791,8 @@ test('MessageTypes::all() contains all expected message type constants (EFF-006)
     expect($all)->toContain(MessageTypes::RATE_LIMIT);
     expect($all)->toContain(MessageTypes::USAGE_REQUEST);
     expect($all)->toContain(MessageTypes::USAGE_RESULT);
-    expect($all)->toHaveCount(27);
+    expect($all)->toContain(MessageTypes::TASK);
+    expect($all)->toHaveCount(28);
 });
 
 test('MessageTypes::isValid() accepts known types and rejects unknown (EFF-006)', function () {

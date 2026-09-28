@@ -603,3 +603,50 @@ test('a run of local tools is recorded so it can be counted, not lumped', functi
     expect(collect($blocks)->where('type', 'tool_call')->pluck('tool_name')->all())
         ->toBe(['Bash', 'Bash', 'Read']);
 });
+
+test('a helper\'s own prose and thinking are not stored as the main assistant\'s', function () {
+    // The stored content is what a fresh session sends back as history, so a
+    // helper's words kept there are put in the main assistant's mouth. Its
+    // tool calls stay, under their parent, so a reload can still nest them.
+    $conversation = Conversation::create(['mode' => 'bridge', 'provider' => 'claude']);
+    $handler = recordingHandler();
+    $handler->setConversationId((string) $conversation->id);
+    ConversationRecorder::attach($handler, $conversation);
+
+    $block = function (int $i, array $start, string $content) use ($handler) {
+        $handler->dispatchEvent(wire(MessageTypes::BLOCK_START, ['block_index' => $i] + $start));
+        $handler->dispatchEvent(wire(MessageTypes::BLOCK_DELTA, ['block_index' => $i, 'content' => $content]));
+        $handler->dispatchEvent(wire(MessageTypes::BLOCK_STOP, ['block_index' => $i]));
+    };
+
+    $block(0, ['block_type' => 'text'], 'Handing it to a helper. ');
+    $block(1, ['block_type' => 'tool_call', 'tool_name' => 'Agent', 'tool_call_id' => 'toolu_agent'], '{"prompt":"go"}');
+    $block(2, ['block_type' => 'thinking', 'parent_tool_use_id' => 'toolu_agent'], 'helper thinks');
+    $block(3, ['block_type' => 'tool_call', 'tool_name' => 'Bash', 'tool_call_id' => 'toolu_child', 'parent_tool_use_id' => 'toolu_agent'], '{"command":"ls"}');
+    $block(4, ['block_type' => 'text', 'parent_tool_use_id' => 'toolu_agent'], 'helper prose');
+    $block(5, ['block_type' => 'text'], 'The helper is done.');
+    $handler->dispatchEvent(wire(MessageTypes::DONE, ['usage' => null]));
+
+    $message = $conversation->messages()->where('role', 'assistant')->latest('id')->first();
+    $blocks = collect($message->blocks);
+
+    expect($message->content)->toBe('Handing it to a helper. The helper is done.')
+        ->and($blocks->pluck('type')->all())->toBe(['text', 'tool_call', 'tool_call', 'text'])
+        ->and($blocks->pluck('text')->filter()->implode('|'))->not->toContain('helper thinks')->not->toContain('helper prose')
+        ->and($blocks->firstWhere('tool_name', 'Bash')['parent_tool_use_id'])->toBe('toolu_agent')
+        ->and($blocks->firstWhere('tool_name', 'Agent'))->not->toHaveKey('parent_tool_use_id');
+});
+
+test('a helper\'s prose block left open does not swallow the main reply after it', function () {
+    $blocks = recordTurn(function (StreamHandler $h) {
+        $h->dispatchEvent(wire(MessageTypes::BLOCK_START, ['block_index' => 0, 'block_type' => 'text', 'parent_tool_use_id' => 'toolu_agent']));
+        $h->dispatchEvent(wire(MessageTypes::BLOCK_DELTA, ['block_index' => 0, 'content' => 'helper prose']));
+        $h->dispatchEvent(wire(MessageTypes::BLOCK_START, ['block_index' => 1, 'block_type' => 'text']));
+        $h->dispatchEvent(wire(MessageTypes::BLOCK_DELTA, ['block_index' => 1, 'content' => 'main reply']));
+        $h->dispatchEvent(wire(MessageTypes::BLOCK_STOP, ['block_index' => 1]));
+        $h->dispatchEvent(wire(MessageTypes::DONE, ['usage' => null]));
+    });
+
+    expect($blocks)->toHaveCount(1)
+        ->and($blocks[0])->toMatchArray(['type' => 'text', 'text' => 'main reply']);
+});

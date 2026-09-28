@@ -449,10 +449,11 @@ class AiBridgeManager
     }
 
     /**
-     * Wire all eight stream callbacks to a sink callable.
+     * Wire the stream callbacks to a sink callable.
      *
      * Callbacks: onBlockStart, onBlockDelta, onBlockStop, onToolCall,
-     * onAttachment, onDone, onError, onCancelled.
+     * onToolResult, onRateLimit, onAttachment, onTask, onDone, onError,
+     * onCancelled.
      * The $sink receives a normalized payload array with 'event' and 'data' keys.
      * The optional $onTerminal callback is called after done/error/cancelled events (e.g. for SSE [DONE] flush).
      */
@@ -518,10 +519,13 @@ class AiBridgeManager
         // machine this is the only account of it there will ever be — and this
         // sink powers the documented streamToResponse() API, so leaving it
         // unwired meant half the fix reached one consumer and not the other.
-        $stream->onToolResult(function (string $toolCallId, mixed $result, ?bool $isError = null) use ($sink) {
+        $stream->onToolResult(function (string $toolCallId, mixed $result, ?bool $isError = null, ?string $parentToolUseId = null) use ($sink) {
             $data = ['tool_call_id' => $toolCallId, 'result' => $result];
             if ($isError !== null) {
                 $data['is_error'] = $isError;
+            }
+            if ($parentToolUseId !== null) {
+                $data['parent_tool_use_id'] = $parentToolUseId;
             }
             $sink(['event' => MessageTypes::TOOL_RESULT, 'data' => $data]);
         });
@@ -536,6 +540,11 @@ class AiBridgeManager
         // app's attachment store.
         $stream->onAttachment(function (array $attachment) use ($sink) {
             $sink(['event' => MessageTypes::ATTACHMENT, 'data' => $attachment]);
+        });
+
+        // A helper's life, forwarded whole, as BufferingSink buffers it.
+        $stream->onTask(function (array $task) use ($sink) {
+            $sink(['event' => MessageTypes::TASK, 'data' => $task]);
         });
 
         $stream->onDone(function (?array $usage, array $meta = []) use ($sink, $onTerminal) {

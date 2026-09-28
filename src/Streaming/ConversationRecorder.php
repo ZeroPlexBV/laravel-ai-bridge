@@ -182,7 +182,8 @@ final class ConversationRecorder
         $blocks = [];
         /** @var array<string, mixed>|null $current */
         $current = null;
-        // True while accumulating block_delta for a stream-event tool_call block.
+        // True while inside a block being dropped: a nameless stream-event
+        // tool_call block, or a helper's own text/thinking block.
         // See onBlockStart for why these blocks are dropped. Reset defensively
         // on terminal events so a tool_call without a matching block_stop
         // (truncated stream) can't make us swallow subsequent block_deltas.
@@ -231,9 +232,33 @@ final class ConversationRecorder
                 if (isset($event->data['tool_call_id']) && is_string($event->data['tool_call_id'])) {
                     $current['tool_call_id'] = $event->data['tool_call_id'];
                 }
+                // Which helper made the call, so a reload can still nest it
+                // under that helper instead of showing it as the main
+                // assistant's. Only when present: absent means the main
+                // assistant, and every turn recorded before this reads so.
+                $parent = $event->data['parent_tool_use_id'] ?? null;
+                if (is_string($parent) && $parent !== '') {
+                    $current['parent_tool_use_id'] = $parent;
+                }
 
                 return;
             }
+            // A helper's own prose and thinking are not the main assistant's
+            // reply. Stored here they would join the assistant message's
+            // content, which a fresh session sends back to the model as
+            // history — putting the helper's words in the main assistant's
+            // mouth. The helper's closing summary already reaches the record
+            // as its spawning call's result, and its tool calls above are kept
+            // with their parent, so only this is skipped: dropped the same way
+            // a nameless tool block is, deltas and block_stop included.
+            $parent = $event->data['parent_tool_use_id'] ?? null;
+            if (is_string($parent) && $parent !== '') {
+                $inStreamToolCall = true;
+                $current = null;
+
+                return;
+            }
+
             // Reset here too. A nameless tool block sets this and is dropped;
             // without clearing it, the next block's deltas were swallowed and
             // its block discarded by onBlockStop's early return — so the

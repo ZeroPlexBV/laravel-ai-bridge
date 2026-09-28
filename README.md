@@ -1053,6 +1053,44 @@ A result too large for one WebSocket frame arrives in chunks and is reassembled
 before this callback runs, so you always receive it whole. See `PROTOCOL.md`
 for the size bounds that apply on the way in and on the way to the database.
 
+### Helpers (sub-agents)
+
+When the assistant hands work to a helper — Claude's `Agent` tool — the
+helper's blocks and results arrive in the same stream as the main assistant's.
+`parent_tool_use_id` says which is which: it is on a helper's `block_start`
+data and is the fourth argument of `onToolResult`, holding the `tool_call_id`
+of the call that spawned the helper. Absent (null) means the main assistant,
+so a consumer that ignores it sees what it always saw. The recorder stores it
+on each helper `tool_call` block, so a reload can still nest the call.
+
+`onTask` reports each helper's life, with the bridge's data passed through
+whole — `phase` (`started`, `progress`, `heartbeat`, `updated`, `finished`),
+`task_id`, `tool_use_id` (the key to group by) and whatever that phase carries:
+
+```php
+$stream->onToolResult(function (string $callId, mixed $result, ?bool $isError, ?string $parentToolUseId) {
+    // $parentToolUseId: null for the main assistant's own calls.
+});
+
+$stream->onTask(function (array $task) {
+    // A background helper (`is_backgrounded: true` at `started`) keeps
+    // reporting after the main assistant has finished its reply. It is done
+    // only when a `finished` phase says so — never when its spawning call's
+    // tool_result arrives, which for a background helper is at once.
+    if ($task['phase'] === 'finished') {
+        Log::info('helper finished', [
+            'helper' => $task['tool_use_id'] ?? null,
+            'status' => $task['status'] ?? null,
+            'tokens' => $task['usage']['total_tokens'] ?? null,
+        ]);
+    }
+});
+```
+
+The turn's helper totals arrive on `done` as `$meta['subagent_stats']`, in the
+CLI's own shape. Both reach a browser through the buffered SSE stream. See
+`PROTOCOL.md` for every field.
+
 ### What the turn cost
 
 `onDone` receives a second argument with everything the provider reported

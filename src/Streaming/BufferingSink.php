@@ -42,6 +42,10 @@ final class BufferingSink
         // null on several of those paths, so without it the only thing a chat
         // can say about an empty answer is nothing.
         'subtype',
+        // What the turn spent on helpers, in the CLI's own shape. Counts only
+        // — spawned, completed, failed, by type — nothing a browser should not
+        // see, and the only place a chat can state a turn's helper totals.
+        'subagent_stats',
     ];
 
     /**
@@ -108,13 +112,17 @@ final class BufferingSink
         // Without this the browser could never see a tool result at all: the
         // bridge sends them, StreamHandler dispatches them, and the SSE buffer
         // simply had no handler, so they stopped here.
-        $handler->onToolResult(function (string $toolCallId, mixed $result, ?bool $isError = null) use ($append): void {
+        $handler->onToolResult(function (string $toolCallId, mixed $result, ?bool $isError = null, ?string $parentToolUseId = null) use ($append): void {
             // `result` is sent even when null — dropping the key leaves the
             // browser waiting for a result that has already arrived, and the
             // call renders as still running for ever.
             $data = ['tool_call_id' => $toolCallId, 'result' => $result];
             if ($isError !== null) {
                 $data['is_error'] = $isError;
+            }
+            // Absent for the main assistant, as on the wire.
+            if ($parentToolUseId !== null) {
+                $data['parent_tool_use_id'] = $parentToolUseId;
             }
             $append(MessageTypes::TOOL_RESULT, $data);
         });
@@ -125,6 +133,14 @@ final class BufferingSink
 
         $handler->onAttachment(function (array $attachment) use ($append): void {
             $append(MessageTypes::ATTACHMENT, $attachment);
+        });
+
+        // A helper's life: started, progress, heartbeat, updated, finished.
+        // Buffered whole, so a browser that reconnects mid-turn replays every
+        // helper's state — including one still running after the main
+        // assistant's reply has ended.
+        $handler->onTask(function (array $task) use ($append): void {
+            $append(MessageTypes::TASK, $task);
         });
 
         // Terminal events both write the event AND flip the buffer status, so
