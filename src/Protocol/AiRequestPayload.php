@@ -68,6 +68,13 @@ final class AiRequestPayload
             is_array($input['options'] ?? null) ? $input['options'] : [],
             static fn ($value) => $value !== null,
         );
+        // Opt-in, and only ever `true` on the wire. It switches the turn into
+        // a mode where the CLI's input stays open and background tasks are on,
+        // so a stray truthy value ("1", "yes") from a relay body must not be
+        // what turns it on, and `false` means the same as absent.
+        if (array_key_exists('accepts_input', $options) && $options['accepts_input'] !== true) {
+            unset($options['accepts_input']);
+        }
         if (! empty($options)) {
             $payload['options'] = $options;
         }

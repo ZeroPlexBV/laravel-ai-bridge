@@ -12,6 +12,7 @@ Specification for the WebSocket protocol between `@tetrixdev/ai-bridge` (npm, cl
 - [Local Calls](#local-calls)
 - [Subscription Usage](#subscription-usage)
 - [AI Requests](#ai-requests)
+- [Turn Input](#turn-input)
 - [Conversation Continuity](#conversation-continuity)
 - [Streaming Events](#streaming-events)
 - [Tool Calls](#tool-calls)
@@ -670,6 +671,8 @@ When the server needs an AI response (triggered by a user message in the browser
 
 **`options`**: Provider-agnostic generation options. The bridge maps these to CLI-specific flags where supported.
 
+**`options.accepts_input`**: `true` to keep the CLI's input open for the whole turn, so a message can reach the assistant while the turn runs. Opt-in, per turn; Claude only. See [Turn Input](#turn-input). Only `true` means yes; absent, `null` and `false` all mean the turn runs as every turn did before.
+
 #### Additive field: `working_dir`
 
 Where the CLI should be spawned. Optional; **absent means today's behaviour exactly** — a freshly made empty directory under `~/.cache/ai-bridge/`.
@@ -813,6 +816,8 @@ The bridge acknowledges receipt before starting the CLI process, echoing the ses
 
 A bridge that predates this field omits it entirely, so a server must treat absence as *unknown* — never as *defaults applied*.
 
+**`input_open`**: Present, and `true`, when this turn runs with its input open — the server asked with `options.accepts_input` and the bridge will take [`turn_input`](#server--bridge-turn_input) for it while it runs. Absent otherwise, and absent from any bridge that predates the field. A server must read absence as "input is not open" and hold a message typed mid-turn as it always did; that is what makes the option safe to send to every bridge.
+
 ### Server → Bridge: `cancel`
 
 Stop a turn that is running, and leave a session that can be resumed.
@@ -848,6 +853,115 @@ The turn named by a `cancel` has stopped.
 **Sent after the turn's own events, not on receipt of the cancel.** The CLI is asked to stop rather than shot, so it commonly writes a little more on the way out; a server treats `cancelled` as terminal, so a reply that went out first would cut off the partial answer that stopping cleanly exists to keep.
 
 Sent only in response to a `cancel`. A turn ended by one of the bridge's own bounds reports a timeout on the `error` event and ends with `done`, like any other turn.
+
+**`pending_inputs`**: On a turn that ran with its input open, the `message_id` of every [`turn_input`](#server--bridge-turn_input) the bridge accepted and the assistant never read (no `user_input` came for it), oldest first. They are dropped with the turn. Always present on such a turn, empty when nothing was pending; absent on every other turn.
+
+```json
+{
+  "type": "cancelled",
+  "request_id": "req_abc123",
+  "pending_inputs": ["msg_42"]
+}
+```
+
+---
+
+## Turn Input
+
+A message a person types while a turn is still running reaches the assistant **in that turn**, instead of waiting for everything to finish. That matters most after the main assistant has answered while helpers or background commands it started are still working — exactly when someone is likely to ask something else.
+
+The whole mode is opt-in, per turn: the server asks with `options.accepts_input: true`, and the bridge confirms with `input_open: true` on the `ai_request_ack`. Without that confirmation nothing about the turn differs from one that did not ask, and a server holds the message until the turn ends, as before. That is also the way back if the mode misbehaves: stop asking.
+
+What changes for a turn with its input open (Claude only):
+
+- **The CLI's input stays open** for the whole turn, and the opening message is written to it as the first frame.
+- **Background tasks are on.** Every other turn keeps them off. Background work may occasionally die with the turn; the main assistant stays reachable, is told when a task failed or stopped, can read its output and can run it again.
+- **The turn ends when everything it started has ended**, not at the first result: see [The ending rule](#the-ending-rule). It is not a long-lived process per conversation.
+- **Stopping a turn stops everything it started**, background commands included.
+- The bridge reports whether the main assistant is working or free ([`main_state`](#main_state)) and when it took each message in ([`user_input`](#user_input)).
+
+**Nothing promises the assistant changes course.** A message is read at the assistant's next step; what it does with it is up to it.
+
+### Server → Bridge: `turn_input`
+
+A message for a turn that is still running. Only for a turn whose `ai_request_ack` said `input_open: true`.
+
+```json
+{
+  "type": "turn_input",
+  "request_id": "req_abc123",
+  "message_id": "msg_42",
+  "content": "Also check the tests while you are at it."
+}
+```
+
+**`message_id`**: The server's own id for the message, echoed on the ack, on `user_input` and in `pending_inputs`.
+
+**`content`**: What the person wrote. Text.
+
+### Bridge → Server: `turn_input_ack`
+
+The bridge answers every `turn_input` straight away.
+
+```json
+{ "type": "turn_input_ack", "request_id": "req_abc123", "message_id": "msg_42", "status": "accepted" }
+{ "type": "turn_input_ack", "request_id": "req_abc123", "message_id": "msg_43", "status": "rejected", "reason": "turn_not_running" }
+```
+
+- **`accepted`**: the message was written to the running CLI and is queued there. The assistant reads it at its next step; `user_input` says when.
+- **`rejected`**: nothing was written. `reason` is present only on a rejection:
+  - `turn_not_running` — there is no turn any more to deliver it to (it ended, or is ending). The server starts a normal new turn with the message.
+  - `input_not_open` — the turn is running but cannot take it (it was not started with `accepts_input`, or the CLI has not started yet). The server holds it until the turn is over.
+
+A bridge that predates turn input never answers — but it also never confirms `input_open`, so a server that waits for that confirmation never sends it a `turn_input` at all.
+
+#### `user_input`
+
+Stream event: the assistant has just taken in a message the bridge accepted as `turn_input`.
+
+```json
+{
+  "type": "stream",
+  "request_id": "req_abc123",
+  "event": "user_input",
+  "data": { "message_id": "msg_42" }
+}
+```
+
+Emitted when the CLI echoes the message back, which it does at the moment it dequeues it, so **everything after this event in the stream is the assistant's response to it** (or later). Messages are read in the order they were accepted. Place the message in the conversation here, not where it was sent.
+
+#### `main_state`
+
+Stream event, on turns that run with their input open: whether the **main** assistant (not a helper) is working or free.
+
+```json
+{
+  "type": "stream",
+  "request_id": "req_abc123",
+  "event": "main_state",
+  "data": { "state": "idle" }
+}
+```
+
+- `working` right after the turn starts (once, right after the ack) and whenever the main assistant writes again after having been free.
+- `idle` when its message ends while the turn goes on — a helper or a background command is still running.
+- Never sent twice in a row with the same state.
+
+A message sent while it is `idle` is read straight away; one sent while it is `working` is read after its current step. Informational and non-terminal: `idle` does not mean the turn is over, `done` does.
+
+### The ending rule
+
+A turn with its input open ends — the bridge closes the CLI's input and sends `done` — only when **all three** hold:
+
+1. the main assistant is idle,
+2. **no** task it spawned is still running — a helper, a background command, or any other `task_type` (tracked from the [`task`](#task) events), and
+3. every accepted `turn_input` has been read.
+
+A CLI `result` before that is **not** the end of the turn: the bridge emits `main_state {state:'idle'}` and keeps reading. In particular, with the input open the CLI reports an early result, unstamped, as soon as the main message ends while a background command runs; that is not the answer. Writes and the close decision run on one event loop, so an accepted message can never be lost to a close in between.
+
+`done` then carries the last result, with `usage` and `num_turns` summed over the turn. If the turn ends with accepted messages the assistant never read (a timeout, a crash), `done` lists them in `pending_inputs`; a stopped turn lists them on `cancelled`.
+
+The bridge's silence and wall-clock bounds are unchanged; accepted inputs and `main_state` count as activity. The silence bound is the backstop for a background command that never ends: the turn dies, the next turn is told, and the command's output stays on disk.
 
 ---
 
@@ -1259,6 +1373,8 @@ The life of a **helper** the CLI runs for the main assistant: a sub-agent, or a 
 
 Carried by the Claude adapter; Codex and Gemini never send it. A consumer that does not know the event ignores it.
 
+On a turn with its input open, two more stream events can appear: [`user_input`](#user_input) and [`main_state`](#main_state), described under [Turn Input](#turn-input).
+
 #### `attachment`
 
 A file the assistant produced and chose to hand back. Emitted when the model calls the bridge-owned `bridge__attach_file` tool and the upload succeeded.
@@ -1331,6 +1447,7 @@ Everything beside `usage` is likewise provider-reported and optional. **Absent m
 | `subtype` | How the CLI itself classified the end of the turn — `success`, `error_during_execution`, `error_max_turns`. Worth showing when a turn arrives with no text at all: `stop_reason` is null on several of those paths, so this is the only thing that says what happened. |
 | `permission_denials` | Tool calls the CLI's own permission system refused. In `isolated` this is the record of what the posture actually stopped — an empty answer with three denials reads very differently from an empty answer with none. |
 | `subagent_stats` | What the turn spent on helpers, in the CLI's own shape: `spawned`, `completed`, `failed`, `started_in_background`, `max_depth`, `by_type{}`, `killed{}`, `refused{}` and so on. Passed through unchanged. Tokens per helper come from the [`task`](#task) events. |
+| `pending_inputs` | On a turn that ran with its input open and ended with accepted [`turn_input`](#turn-input) messages the assistant never read (a timeout, a crash): their `message_id`s, oldest first. Absent when there were none, which is every turn that ended normally. |
 
 `cli_session_id` is the CLI session this turn ran under — the id created on a fresh start, or the id resumed. The server persists it on the conversation so the next turn can resume. Absent/`null` when no session id was produced.
 

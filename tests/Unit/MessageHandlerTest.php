@@ -792,7 +792,21 @@ test('MessageTypes::all() contains all expected message type constants (EFF-006)
     expect($all)->toContain(MessageTypes::USAGE_REQUEST);
     expect($all)->toContain(MessageTypes::USAGE_RESULT);
     expect($all)->toContain(MessageTypes::TASK);
-    expect($all)->toHaveCount(28);
+    expect($all)->toContain(MessageTypes::TURN_INPUT);
+    expect($all)->toContain(MessageTypes::TURN_INPUT_ACK);
+    expect($all)->toContain(MessageTypes::USER_INPUT);
+    expect($all)->toContain(MessageTypes::MAIN_STATE);
+    expect($all)->toHaveCount(32);
+});
+
+test('turn_input is the server\'s to send and turn_input_ack the bridge\'s', function () {
+    expect(MessageTypes::serverOrigin())->toContain(MessageTypes::TURN_INPUT)
+        ->not->toContain(MessageTypes::TURN_INPUT_ACK)
+        ->and(MessageTypes::bridgeOrigin())->toContain(MessageTypes::TURN_INPUT_ACK)
+        ->not->toContain(MessageTypes::TURN_INPUT)
+        // Stream events travel inside the `stream` envelope, like task.
+        ->not->toContain(MessageTypes::USER_INPUT)
+        ->not->toContain(MessageTypes::MAIN_STATE);
 });
 
 test('MessageTypes::isValid() accepts known types and rejects unknown (EFF-006)', function () {
@@ -1267,3 +1281,254 @@ test('an older bridge omitting the field is not treated as a bridge that applied
     expect($response)->toBeNull();
     Log::shouldNotHaveReceived('warning');
 });
+
+// --- Turn input: input_open on the ack, turn_input_ack, user_input, pending_inputs ---
+
+/** A running turn owned by user-1, its stream buffer started as the web process starts it. */
+function turnWithInput(BridgeConnectionManager $manager, ArrayStreamStore $store, string $rid = 'req-in'): StreamHandler
+{
+    app()->instance(StreamStoreContract::class, $store);
+    $manager->addConnection('user-1', 'conn-1');
+    $manager->addConnection('user-2', 'conn-2');
+
+    $handler = makeHandler($manager);
+    $manager->registerPendingRequest($rid, $handler, 'user-1');
+    $store->start($rid, ['conversation_id' => 'conv-1']);
+
+    return $handler;
+}
+
+test('an ack confirming input_open is recorded in the turn stream metadata', function () {
+    $store = new ArrayStreamStore();
+    turnWithInput($this->manager, $store);
+
+    $this->messageHandler->handleMessage('conn-1', null, json_encode([
+        'type' => MessageTypes::AI_REQUEST_ACK,
+        'request_id' => 'req-in',
+        'cli_session_id' => null,
+        'input_open' => true,
+    ]));
+
+    // Kept beside what the web process wrote, not in place of it.
+    expect($store->status('req-in')['metadata'])->toBe(['conversation_id' => 'conv-1', 'input_open' => true])
+        ->and(app(\Tetrix\AiBridge\AiBridgeManager::class)->inputOpen('req-in'))->toBeTrue();
+});
+
+test('an ack without input_open leaves the turn closed to input', function (array $extra) {
+    $store = new ArrayStreamStore();
+    turnWithInput($this->manager, $store);
+
+    $this->messageHandler->handleMessage('conn-1', null, json_encode([
+        'type' => MessageTypes::AI_REQUEST_ACK,
+        'request_id' => 'req-in',
+        'cli_session_id' => null,
+    ] + $extra));
+
+    expect($store->status('req-in')['metadata'])->not->toHaveKey('input_open')
+        ->and(app(\Tetrix\AiBridge\AiBridgeManager::class)->inputOpen('req-in'))->toBeFalse();
+})->with([
+    'an older bridge' => [[]],
+    'false' => [['input_open' => false]],
+    'a truthy string' => [['input_open' => 'yes']],
+]);
+
+test('another user\'s bridge cannot open a turn to input', function () {
+    $store = new ArrayStreamStore();
+    turnWithInput($this->manager, $store);
+
+    $this->messageHandler->handleMessage('conn-2', null, json_encode([
+        'type' => MessageTypes::AI_REQUEST_ACK,
+        'request_id' => 'req-in',
+        'input_open' => true,
+    ]));
+
+    expect($store->status('req-in')['metadata'])->not->toHaveKey('input_open');
+});
+
+test('a non-string request_id on an ack is ignored rather than thrown past the loop', function () {
+    $store = new ArrayStreamStore();
+    turnWithInput($this->manager, $store);
+
+    $response = $this->messageHandler->handleMessage('conn-1', null, json_encode([
+        'type' => MessageTypes::AI_REQUEST_ACK,
+        'request_id' => ['req-in'],
+        'input_open' => true,
+    ]));
+
+    expect($response)->toBeNull()
+        ->and($store->status('req-in')['metadata'])->not->toHaveKey('input_open');
+});
+
+test('a stream store that cannot merge metadata reports the input closed, and nothing breaks', function () {
+    $inner = new ArrayStreamStore();
+    // A driver written against StreamStoreContract alone, as an app's own might be.
+    $store = new class($inner) implements StreamStoreContract {
+        public function __construct(private ArrayStreamStore $inner) {}
+        public function start(string $r, array $m = []): void { $this->inner->start($r, $m); }
+        public function appendEvent(string $r, string $e, array $d): int { return $this->inner->appendEvent($r, $e, $d); }
+        public function range(string $r, int $f = -1): array { return $this->inner->range($r, $f); }
+        public function status(string $r): array { return $this->inner->status($r); }
+        public function setAbort(string $r): void { $this->inner->setAbort($r); }
+        public function isAborted(string $r): bool { return $this->inner->isAborted($r); }
+        public function complete(string $r, string $s): void { $this->inner->complete($r, $s); }
+        public function cleanup(string $r): void { $this->inner->cleanup($r); }
+    };
+    app()->instance(StreamStoreContract::class, $store);
+    $this->manager->addConnection('user-1', 'conn-1');
+    $this->manager->registerPendingRequest('req-in', makeHandler($this->manager), 'user-1');
+    $store->start('req-in');
+
+    $this->messageHandler->handleMessage('conn-1', null, json_encode([
+        'type' => MessageTypes::AI_REQUEST_ACK, 'request_id' => 'req-in', 'input_open' => true,
+    ]));
+
+    expect(app(\Tetrix\AiBridge\AiBridgeManager::class)->inputOpen('req-in'))->toBeFalse();
+});
+
+test('a turn is no longer open to input once it has ended', function () {
+    $store = new ArrayStreamStore();
+    turnWithInput($this->manager, $store);
+    $store->mergeMetadata('req-in', ['input_open' => true]);
+
+    $store->complete('req-in', 'completed');
+
+    expect(app(\Tetrix\AiBridge\AiBridgeManager::class)->inputOpen('req-in'))->toBeFalse()
+        ->and(app(\Tetrix\AiBridge\AiBridgeManager::class)->inputOpen('req-unknown'))->toBeFalse();
+});
+
+test('merging metadata into a turn nobody started stores nothing', function () {
+    $store = new ArrayStreamStore();
+    $store->mergeMetadata('req-ghost', ['input_open' => true]);
+
+    expect($store->status('req-ghost')['status'])->toBe('not_found');
+});
+
+/** Deliver a turn_input_ack from a connection and return what the waiter was handed. */
+function deliverTurnInputAck(MessageHandler $mh, BridgeConnectionManager $manager, array $frame, string $from = 'conn-1'): ?array
+{
+    $answer = null;
+    $manager->registerPendingTurnInput('req-in', 'msg-1', 'user-1', function (array $a) use (&$answer) {
+        $answer = $a;
+    });
+
+    $mh->handleMessage($from, null, json_encode($frame + [
+        'type' => MessageTypes::TURN_INPUT_ACK,
+        'request_id' => 'req-in',
+        'message_id' => 'msg-1',
+    ]));
+
+    return $answer;
+}
+
+test('turn_input_ack hands the bridge answer to whoever is waiting', function (array $frame, array $expected) {
+    $this->manager->addConnection('user-1', 'conn-1');
+
+    expect(deliverTurnInputAck($this->messageHandler, $this->manager, $frame))->toBe($expected)
+        ->and($this->manager->hasPendingTurnInput('req-in', 'msg-1'))->toBeFalse();
+})->with([
+    'accepted' => [['status' => 'accepted'], ['status' => 'accepted']],
+    'turn not running' => [['status' => 'rejected', 'reason' => 'turn_not_running'], ['status' => 'rejected', 'reason' => 'turn_not_running']],
+    'input not open' => [['status' => 'rejected', 'reason' => 'input_not_open'], ['status' => 'rejected', 'reason' => 'input_not_open']],
+    // Never passed on: the application branches on the reason, and
+    // turn_not_running is the one that makes it start a turn.
+    'a reason nobody documented' => [['status' => 'rejected', 'reason' => 'lunar'], ['status' => 'rejected']],
+    // Only `accepted` is acceptance; a confused frame is a refusal.
+    'no status' => [[], ['status' => 'rejected']],
+    'an accepted with a stray reason' => [['status' => 'accepted', 'reason' => 'turn_not_running'], ['status' => 'accepted']],
+]);
+
+test('turn_input_ack from another user\'s bridge is refused, and the message keeps waiting', function () {
+    $this->manager->addConnection('user-1', 'conn-1');
+    $this->manager->addConnection('user-2', 'conn-2');
+
+    expect(deliverTurnInputAck($this->messageHandler, $this->manager, ['status' => 'rejected', 'reason' => 'turn_not_running'], 'conn-2'))->toBeNull()
+        ->and($this->manager->hasPendingTurnInput('req-in', 'msg-1'))->toBeTrue();
+});
+
+test('turn_input_ack from a connection that never completed the handshake is ignored', function () {
+    expect(deliverTurnInputAck($this->messageHandler, $this->manager, ['status' => 'accepted'], 'conn-nobody'))->toBeNull();
+});
+
+test('a malformed turn_input_ack is dropped rather than thrown past the loop', function () {
+    $this->manager->addConnection('user-1', 'conn-1');
+
+    foreach ([['request_id' => 7], ['message_id' => ['x']], ['request_id' => ''], ['status' => ['accepted']], ['reason' => 5]] as $bad) {
+        $this->messageHandler->handleMessage('conn-1', null, json_encode($bad + [
+            'type' => MessageTypes::TURN_INPUT_ACK, 'request_id' => 'req-in', 'message_id' => 'msg-1', 'status' => 'rejected',
+        ]));
+    }
+
+    expect(true)->toBeTrue();
+});
+
+test('a message waiting on its ack is answered no_answer when the bridge disconnects', function () {
+    $this->manager->addConnection('user-1', 'conn-1');
+    $answer = null;
+    $this->manager->registerPendingTurnInput('req-in', 'msg-1', 'user-1', function (array $a) use (&$answer) {
+        $answer = $a;
+    });
+
+    $this->manager->removeConnection('user-1', 'bridge_closed');
+
+    expect($answer)->toBe(['status' => 'rejected', 'reason' => 'no_answer']);
+});
+
+test('user_input and main_state reach the turn over the wire, only from its owner', function () {
+    $store = new ArrayStreamStore();
+    $handler = turnWithInput($this->manager, $store);
+
+    $seen = [];
+    $handler->onUserInput(function (array $data) use (&$seen) {
+        $seen[] = ['user_input', $data];
+    });
+    $handler->onMainState(function (array $data) use (&$seen) {
+        $seen[] = ['main_state', $data];
+    });
+
+    foreach (['conn-2', 'conn-1'] as $conn) {
+        $this->messageHandler->handleMessage($conn, null, json_encode([
+            'type' => MessageTypes::STREAM, 'request_id' => 'req-in', 'event' => MessageTypes::MAIN_STATE, 'data' => ['state' => 'idle'],
+        ]));
+        $this->messageHandler->handleMessage($conn, null, json_encode([
+            'type' => MessageTypes::STREAM, 'request_id' => 'req-in', 'event' => MessageTypes::USER_INPUT, 'data' => ['message_id' => 'msg-1'],
+        ]));
+    }
+
+    expect($seen)->toBe([['main_state', ['state' => 'idle']], ['user_input', ['message_id' => 'msg-1']]]);
+});
+
+test('a cancelled turn passes on which delivered messages were never read', function () {
+    $store = new ArrayStreamStore();
+    $handler = turnWithInput($this->manager, $store);
+
+    $meta = null;
+    $handler->onCancelled(function (string $reason, array $m = []) use (&$meta) {
+        $meta = $m;
+    });
+
+    $this->messageHandler->handleMessage('conn-1', null, json_encode([
+        'type' => MessageTypes::CANCELLED,
+        'request_id' => 'req-in',
+        'pending_inputs' => ['msg-2', 7, '', 'msg-3'],
+    ]));
+
+    expect($meta)->toBe(['pending_inputs' => ['msg-2', 'msg-3']]);
+});
+
+test('a cancelled turn without pending inputs, or with a malformed list, passes nothing on', function (mixed $pending) {
+    $store = new ArrayStreamStore();
+    $handler = turnWithInput($this->manager, $store);
+
+    $meta = 'unset';
+    $handler->onCancelled(function (string $reason, array $m = []) use (&$meta) {
+        $meta = $m;
+    });
+
+    $frame = ['type' => MessageTypes::CANCELLED, 'request_id' => 'req-in'];
+    if ($pending !== 'absent') {
+        $frame['pending_inputs'] = $pending;
+    }
+    $this->messageHandler->handleMessage('conn-1', null, json_encode($frame));
+
+    expect($meta)->toBe([]);
+})->with(['absent', [[]], 'a string', [['a' => 'msg-1']]]);

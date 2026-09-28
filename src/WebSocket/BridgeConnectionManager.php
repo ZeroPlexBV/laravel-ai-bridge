@@ -70,6 +70,18 @@ class BridgeConnectionManager
     private array $pendingUsage = [];
 
     /**
+     * Mid-turn messages waiting on the bridge's turn_input_ack, keyed by
+     * request id and message id together (see turnInputKey()).
+     *
+     * The same shape and the same authorization rule as `pendingUsage`: the
+     * user id is who the message was sent on behalf of, and only that user's
+     * bridge may answer for it.
+     *
+     * @var array<string, array{user_id: string, on_answer: callable(array<string, mixed>): void}>
+     */
+    private array $pendingTurnInputs = [];
+
+    /**
      * Callback for sending messages over the WebSocket connection.
      * Set by the consuming app's WebSocket server integration.
      *
@@ -501,6 +513,98 @@ class BridgeConnectionManager
     }
 
     /**
+     * Note that a mid-turn message is out, and how to finish when its ack comes back.
+     *
+     * @param  string  $userId  The user the message was sent on behalf of. Only that user's
+     *                          bridge may acknowledge it.
+     * @param  callable(array<string, mixed>): void  $onAnswer  Receives `{status, reason?}`.
+     */
+    public function registerPendingTurnInput(string $requestId, string $messageId, string $userId, callable $onAnswer): void
+    {
+        $this->pendingTurnInputs[self::turnInputKey($requestId, $messageId)] = [
+            'user_id' => $userId,
+            'on_answer' => $onAnswer,
+        ];
+    }
+
+    /** Whether a message is already waiting on its ack. */
+    public function hasPendingTurnInput(string $requestId, string $messageId): bool
+    {
+        return isset($this->pendingTurnInputs[self::turnInputKey($requestId, $messageId)]);
+    }
+
+    /**
+     * Hand a turn_input_ack to whoever is waiting for it, and forget the message.
+     *
+     * At most once, and only from the user the message was sent for — the same two rules as
+     * resolvePendingUsage(), for the same reasons.
+     *
+     * @param  array<string, mixed>  $answer
+     */
+    public function resolvePendingTurnInput(string $requestId, string $messageId, string $userId, array $answer): bool
+    {
+        $key = self::turnInputKey($requestId, $messageId);
+        $pending = $this->pendingTurnInputs[$key] ?? null;
+
+        if ($pending === null) {
+            return false;
+        }
+
+        if ($pending['user_id'] !== $userId) {
+            Log::warning('AI Bridge: turn_input_ack for another user\'s message — refused', [
+                'request_id' => $requestId,
+                'message_id' => $messageId,
+                'answering_user' => $userId,
+            ]);
+
+            return false;
+        }
+
+        unset($this->pendingTurnInputs[$key]);
+
+        ($pending['on_answer'])($answer);
+
+        return true;
+    }
+
+    /** Give up on a mid-turn message (the bridge never answered). */
+    public function forgetPendingTurnInput(string $requestId, string $messageId): void
+    {
+        unset($this->pendingTurnInputs[self::turnInputKey($requestId, $messageId)]);
+    }
+
+    /**
+     * Answer every mid-turn message outstanding for a user whose bridge has gone.
+     *
+     * `no_answer`, not `turn_not_running`: the bridge never said whether it took the message,
+     * and the one answer that must never be given without its word is one that makes the
+     * caller send it again as a new turn.
+     */
+    private function failPendingTurnInputsForUser(string $userId): void
+    {
+        foreach ($this->pendingTurnInputs as $key => $pending) {
+            if ($pending['user_id'] !== $userId) {
+                continue;
+            }
+
+            unset($this->pendingTurnInputs[$key]);
+
+            ($pending['on_answer'])(['status' => 'rejected', 'reason' => 'no_answer']);
+        }
+    }
+
+    /**
+     * One key for a request id and message id, unambiguous whatever either contains.
+     *
+     * Length-prefixed rather than JSON-encoded: both ids arrive from outside, and an encoder
+     * that throws on invalid UTF-8 has no business inside the serve process's event loop.
+     */
+    private static function turnInputKey(string $requestId, string $messageId): string
+    {
+        return strlen($requestId).':'.$requestId.$messageId;
+    }
+
+    /**
      * Get the StreamHandler for a pending request.
      */
     public function getPendingRequest(string $requestId): ?StreamHandler
@@ -591,5 +695,6 @@ class BridgeConnectionManager
         // A usage question is an in-flight exchange for this user too, and it is held open
         // by an HTTP response rather than a stream handler — so it needs its own sweep.
         $this->failPendingUsageForUser($userId);
+        $this->failPendingTurnInputsForUser($userId);
     }
 }

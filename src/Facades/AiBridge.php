@@ -12,6 +12,7 @@ use Tetrix\AiBridge\Contracts\ToolHandler;
 use Tetrix\AiBridge\Enums\ProviderMode;
 use Tetrix\AiBridge\Models\Conversation;
 use Tetrix\AiBridge\Streaming\StreamHandler;
+use Tetrix\AiBridge\Streaming\TurnInputResult;
 use Tetrix\AiBridge\Tools\ToolRegistry;
 use Tetrix\AiBridge\WebSocket\BridgeConnectionManager;
 
@@ -28,6 +29,8 @@ use Tetrix\AiBridge\WebSocket\BridgeConnectionManager;
  * @method static ToolRegistry tools()
  * @method static BridgeConnectionManager connections()
  * @method static bool hasBridge(int|string $userId)
+ * @method static TurnInputResult sendTurnInput(string $requestId, string $messageId, string|array $content, int|string|null $userId = null)
+ * @method static bool inputOpen(string $requestId)
  * @method static ProviderMode mode()
  * @method static AiBridgeManager resolveConversationsUsing(Closure $resolver)
  * @method static AiBridgeManager resolveConnectionsUsing(Closure $resolver)

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tetrix\AiBridge\Streaming\Drivers;
 
+use Tetrix\AiBridge\Contracts\MergesStreamMetadata;
 use Tetrix\AiBridge\Contracts\StreamStoreContract;
 
 /**
@@ -12,7 +13,7 @@ use Tetrix\AiBridge\Contracts\StreamStoreContract;
  * Not suitable for production: state lives in the PHP process only, so the
  * web process cannot see what the serve process wrote (and vice versa).
  */
-final class ArrayStreamStore implements StreamStoreContract
+final class ArrayStreamStore implements StreamStoreContract, MergesStreamMetadata
 {
     /** @var array<string, array{status: string, metadata: array<string, mixed>, events: list<array{index: int, event: string, data: array<string, mixed>}>, aborted: bool}> */
     private array $turns = [];
@@ -29,6 +30,15 @@ final class ArrayStreamStore implements StreamStoreContract
             'events' => [],
             'aborted' => false,
         ];
+    }
+
+    public function mergeMetadata(string $requestId, array $metadata): void
+    {
+        if (! isset($this->turns[$requestId])) {
+            return;
+        }
+
+        $this->turns[$requestId]['metadata'] = array_merge($this->turns[$requestId]['metadata'], $metadata);
     }
 
     public function appendEvent(string $requestId, string $eventName, array $data): int

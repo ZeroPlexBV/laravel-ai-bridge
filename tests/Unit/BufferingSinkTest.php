@@ -323,3 +323,122 @@ test('the direct SSE path carries helper activity exactly as the buffer does', f
         ->and($sent[1]['data']['parent_tool_use_id'])->toBe('toolu_agent')
         ->and($sent[2]['data']['subagent_stats'])->toBe($stats);
 });
+
+// --- Turn input: user_input, main_state, pending_inputs ---
+
+/** A stream event as the bridge sends it. */
+function turnInputWire(string $rid, string $event, array $data): StreamEvent
+{
+    return StreamEvent::fromArray(['type' => 'stream', 'request_id' => $rid, 'event' => $event, 'data' => $data]);
+}
+
+test('user_input and main_state are buffered in place and replay by index', function () {
+    $store = new ArrayStreamStore();
+    $handler = new StreamHandler(fakeBufferProvider(), 'rid-input');
+    BufferingSink::attach($handler, $store);
+
+    $handler->dispatchEvent(turnInputWire('rid-input', 'main_state', ['state' => 'working']));
+    $handler->dispatchBlockStart(BlockType::Text, 0);
+    $handler->dispatchBlockDelta(BlockType::Text, 0, 'Started a helper.');
+    $handler->dispatchBlockStop(BlockType::Text, 0);
+    $handler->dispatchEvent(turnInputWire('rid-input', 'main_state', ['state' => 'idle']));
+    $handler->dispatchEvent(turnInputWire('rid-input', 'user_input', ['message_id' => 'msg-7']));
+    $handler->dispatchEvent(turnInputWire('rid-input', 'main_state', ['state' => 'working']));
+    $handler->dispatchBlockStart(BlockType::Text, 1);
+
+    $events = $store->range('rid-input');
+    expect(array_column($events, 'event'))->toBe([
+        'main_state', 'block_start', 'block_delta', 'block_stop', 'main_state', 'user_input', 'main_state', 'block_start',
+    ])
+        ->and($events[5]['data'])->toBe(['message_id' => 'msg-7'])
+        ->and($events[4]['data'])->toBe(['state' => 'idle']);
+
+    // A browser that had everything up to the idle state resumes with the
+    // message being read, and then the assistant working on it.
+    $resumed = $store->range('rid-input', 4);
+    expect(array_column($resumed, 'event'))->toBe(['user_input', 'main_state', 'block_start'])
+        ->and($resumed[0]['index'])->toBe(5);
+
+    expect($store->status('rid-input')['status'])->toBe('streaming');
+});
+
+test('user_input and main_state are passed through whole, fields a newer bridge adds included', function () {
+    $store = new ArrayStreamStore();
+    $handler = new StreamHandler(fakeBufferProvider(), 'rid-whole');
+    BufferingSink::attach($handler, $store);
+
+    $handler->dispatchEvent(turnInputWire('rid-whole', 'user_input', ['message_id' => 'm1', 'future' => true]));
+    $handler->dispatchEvent(turnInputWire('rid-whole', 'main_state', ['state' => 'idle', 'future' => 2]));
+
+    expect(array_column($store->range('rid-whole'), 'data'))
+        ->toBe([['message_id' => 'm1', 'future' => true], ['state' => 'idle', 'future' => 2]]);
+});
+
+test('nothing is buffered after the turn has ended', function () {
+    $store = new ArrayStreamStore();
+    $handler = new StreamHandler(fakeBufferProvider(), 'rid-late');
+    BufferingSink::attach($handler, $store);
+
+    $handler->dispatchDone(null);
+    $handler->dispatchEvent(turnInputWire('rid-late', 'user_input', ['message_id' => 'm1']));
+    $handler->dispatchEvent(turnInputWire('rid-late', 'main_state', ['state' => 'idle']));
+
+    expect(array_column($store->range('rid-late'), 'event'))->toBe(['done']);
+});
+
+test('a cancelled turn tells the browser which delivered messages were never read', function () {
+    $store = new ArrayStreamStore();
+    $handler = new StreamHandler(fakeBufferProvider(), 'rid-cancel');
+    BufferingSink::attach($handler, $store);
+
+    $handler->dispatchCancelled('Request was cancelled.', ['pending_inputs' => ['m2', 'm3'], 'internal' => 'x']);
+
+    $cancelled = collect($store->range('rid-cancel'))->firstWhere('event', 'cancelled');
+    expect($cancelled['data'])->toBe(['reason' => 'Request was cancelled.', 'pending_inputs' => ['m2', 'm3']])
+        ->and($store->status('rid-cancel')['status'])->toBe('cancelled');
+});
+
+test('a cancelled turn with nothing pending looks as it always did', function () {
+    $store = new ArrayStreamStore();
+    $handler = new StreamHandler(fakeBufferProvider(), 'rid-cancel-0');
+    BufferingSink::attach($handler, $store);
+
+    $handler->dispatchCancelled('Request was cancelled.', ['pending_inputs' => []]);
+
+    expect($store->range('rid-cancel-0')[0]['data'])->toBe(['reason' => 'Request was cancelled.']);
+});
+
+test('a turn that ended with unread messages says so on done', function () {
+    $store = new ArrayStreamStore();
+    $handler = new StreamHandler(fakeBufferProvider(), 'rid-done-pending');
+    BufferingSink::attach($handler, $store);
+
+    $handler->dispatchDone(null, ['pending_inputs' => ['m4'], 'cli_session_id' => 'sess-secret']);
+
+    $done = collect($store->range('rid-done-pending'))->firstWhere('event', 'done');
+    expect($done['data']['pending_inputs'])->toBe(['m4'])
+        ->and($done['data'])->not->toHaveKey('cli_session_id');
+});
+
+test('the direct SSE path carries turn input events exactly as the buffer does', function () {
+    $store = new ArrayStreamStore();
+    $handler = new StreamHandler(fakeBufferProvider(), 'rid-sse-input');
+    BufferingSink::attach($handler, $store);
+
+    $sent = [];
+    $wire = new ReflectionMethod(\Tetrix\AiBridge\AiBridgeManager::class, 'wireCallbacks');
+    $wire->invoke(app(\Tetrix\AiBridge\AiBridgeManager::class), $handler, function (array $payload) use (&$sent) {
+        $sent[] = $payload;
+    });
+
+    $handler->dispatchEvent(turnInputWire('rid-sse-input', 'main_state', ['state' => 'idle']));
+    $handler->dispatchEvent(turnInputWire('rid-sse-input', 'user_input', ['message_id' => 'msg-1']));
+    $handler->dispatchCancelled('Request was cancelled.', ['pending_inputs' => ['msg-2']]);
+
+    $buffered = array_map(fn (array $e) => ['event' => $e['event'], 'data' => $e['data']], $store->range('rid-sse-input'));
+
+    expect($sent)->toBe($buffered)
+        ->and($sent[0])->toBe(['event' => 'main_state', 'data' => ['state' => 'idle']])
+        ->and($sent[1])->toBe(['event' => 'user_input', 'data' => ['message_id' => 'msg-1']])
+        ->and($sent[2]['data']['pending_inputs'])->toBe(['msg-2']);
+});

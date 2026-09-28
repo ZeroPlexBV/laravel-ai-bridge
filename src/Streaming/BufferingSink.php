@@ -46,6 +46,10 @@ final class BufferingSink
         // — spawned, completed, failed, by type — nothing a browser should not
         // see, and the only place a chat can state a turn's helper totals.
         'subagent_stats',
+        // Messages delivered mid-turn that the assistant never read, on a turn
+        // that ended without reading them (a timeout, a crash). Ids only, the
+        // application's own, so a chat can offer them again.
+        'pending_inputs',
     ];
 
     /**
@@ -143,6 +147,18 @@ final class BufferingSink
             $append(MessageTypes::TASK, $task);
         });
 
+        // A message delivered mid-turn was read, and whether the main
+        // assistant is working or free. Buffered in order among the blocks, so
+        // a browser replaying by index places the message where the CLI read
+        // it and knows, on reconnect, whether a new one would be read at once.
+        $handler->onUserInput(function (array $data) use ($append): void {
+            $append(MessageTypes::USER_INPUT, $data);
+        });
+
+        $handler->onMainState(function (array $data) use ($append): void {
+            $append(MessageTypes::MAIN_STATE, $data);
+        });
+
         // Terminal events both write the event AND flip the buffer status, so
         // the SSE tail and the status endpoint can tell the turn is finished.
         $handler->onDone(function (?array $usage, array $meta = []) use ($append, $store, $rid): void {
@@ -155,8 +171,8 @@ final class BufferingSink
             self::completeQuietly($store, $rid, 'failed');
         });
 
-        $handler->onCancelled(function (string $reason) use ($append, $store, $rid): void {
-            $append(MessageTypes::CANCELLED, ['reason' => $reason]);
+        $handler->onCancelled(function (string $reason, array $meta = []) use ($append, $store, $rid): void {
+            $append(MessageTypes::CANCELLED, ['reason' => $reason] + self::publicCancelledMeta($meta));
             self::completeQuietly($store, $rid, 'cancelled');
         });
     }
@@ -180,11 +196,24 @@ final class BufferingSink
         }
     }
     /**
-     * Reduce the provider's turn metadata to the fields a browser may see.
+     * What a browser is told beside a cancellation.
+     *
+     * Only `pending_inputs`: the ids of messages delivered mid-turn that the
+     * CLI never read, so a chat can offer them again instead of showing them
+     * as answered. Absent when there were none to report.
+     *
+     * Public for the same reason as publicDoneMeta().
      *
      * @param  array<string, mixed>  $meta
      * @return array<string, mixed>
      */
+    public static function publicCancelledMeta(array $meta): array
+    {
+        $pending = $meta['pending_inputs'] ?? null;
+
+        return is_array($pending) && $pending !== [] ? ['pending_inputs' => $pending] : [];
+    }
+
     /**
      * Reduce the provider's turn metadata to the fields a browser may see.
      *

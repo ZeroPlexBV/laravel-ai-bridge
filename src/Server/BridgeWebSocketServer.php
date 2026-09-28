@@ -384,6 +384,7 @@ class BridgeWebSocketServer
     //
     // Endpoints:
     //   POST /api/request    — Send an ai_request to a user's bridge
+    //   POST /api/request/input — Send a message into a user's running turn
     //   POST /api/disconnect — Forcibly drop a user's bridge connection
     //   GET  /api/status     — Check connected users
     //   GET  /api/health     — Health check
@@ -450,6 +451,7 @@ class BridgeWebSocketServer
         match (true) {
             $method === 'GET' && $path === '/api/status' => $this->apiStatus($tcpConnection, $decoded),
             $method === 'POST' && $path === '/api/request' => $this->apiRequest($tcpConnection, $request, $decoded),
+            $method === 'POST' && $path === '/api/request/input' => $this->apiRequestInput($tcpConnection, $request, $decoded),
             $method === 'GET' && $path === '/api/usage' => $this->apiUsage($tcpConnection, $request, $decoded),
             $method === 'POST' && $path === '/api/disconnect' => $this->apiDisconnect($tcpConnection, $decoded),
             default => $this->httpResponse($tcpConnection, 404, [
@@ -550,6 +552,159 @@ class BridgeWebSocketServer
             $this->httpResponse($tcpConnection, 504, [
                 'error' => 'bridge_did_not_answer',
                 'message' => 'The bridge did not answer in time. It may be an older version that does not know the question.',
+            ]);
+        });
+    }
+
+    /**
+     * POST /api/request/input — Send a message into a turn that is still running.
+     *
+     * Body: `{request_id, message_id, content}`, `content` being a string or a list of
+     * content blocks. Answers `{status: 'accepted'|'rejected', reason?}` once the bridge's
+     * `turn_input_ack` arrives, and waits no longer than `turn_input_timeout` for it.
+     *
+     * Rejections the bridge gives are passed on (`turn_not_running`, `input_not_open`).
+     * The ones decided here:
+     *  - `turn_not_running` — this process has no running turn under that id, so there is
+     *    nothing to send it to (the turn ended, or never started). The caller then starts a
+     *    new turn with the message, which is what that reason means.
+     *  - `no_answer` — the bridge did not answer in time, or disconnected first. It may or
+     *    may not have taken the message, so this must never read as `turn_not_running`.
+     *  - `duplicate` — the same message is already waiting on its answer; sending it again
+     *    would write it to the CLI twice.
+     *  - `send_failed` — the frame could not be written to the bridge's socket.
+     *
+     * **The requesting user must own the turn**, checked exactly as apiRequest() checks a
+     * caller-supplied request_id: the user is the token's subject, never the body, and a
+     * turn registered to anyone else is refused with 403. Otherwise any relay token could
+     * write into any running conversation whose request id it had learned.
+     */
+    private function apiRequestInput(ConnectionInterface $tcpConnection, RequestInterface $request, object $decoded): void
+    {
+        $body = json_decode((string) $request->getBody(), true);
+        $userId = (string) ($decoded->sub ?? '');
+
+        if ($userId === '') {
+            $this->httpResponse($tcpConnection, 400, [
+                'error' => 'missing_subject',
+                'message' => 'Token is missing the "sub" claim.',
+            ]);
+
+            return;
+        }
+
+        // Shape-checked before anything touches it, for the reason apiRequest() gives: a
+        // TypeError here is raised inside a ReactPHP callback and exits the serve process.
+        $requestId = is_array($body) ? ($body['request_id'] ?? null) : null;
+        $messageId = is_array($body) ? ($body['message_id'] ?? null) : null;
+        $content = is_array($body) ? ($body['content'] ?? null) : null;
+
+        if (! is_string($requestId) || $requestId === ''
+            || ! is_string($messageId) || $messageId === ''
+            || ! ((is_string($content) && $content !== '') || (is_array($content) && $content !== [] && array_is_list($content)))) {
+            $this->httpResponse($tcpConnection, 400, [
+                'error' => 'invalid_request',
+                'message' => 'Body must be JSON with string "request_id" and "message_id", and "content" as a non-empty string or list of content blocks.',
+            ]);
+
+            return;
+        }
+
+        // Asked with getPendingRequest() rather than by owner: a request registered with a
+        // falsy owner reads as absent through getPendingRequestUserId(), and must not be
+        // mistaken for "not running" — it is someone's, just not provably this caller's.
+        if ($this->connectionManager->getPendingRequest($requestId) === null) {
+            $this->httpResponse($tcpConnection, 200, [
+                'status' => 'rejected',
+                'reason' => 'turn_not_running',
+            ]);
+
+            return;
+        }
+
+        if ($this->connectionManager->getPendingRequestUserId($requestId) !== $userId) {
+            Log::warning('AI Bridge: turn input for a request owned by a different user — refused', [
+                'request_id' => $requestId,
+                'caller_user_id' => $userId,
+            ]);
+
+            // SEC: not the owner's id, and not whether it is running — only a refusal.
+            $this->httpResponse($tcpConnection, 403, [
+                'status' => 'rejected',
+                'reason' => 'not_owner',
+            ]);
+
+            return;
+        }
+
+        if ($this->connectionManager->hasPendingTurnInput($requestId, $messageId)) {
+            $this->httpResponse($tcpConnection, 200, [
+                'status' => 'rejected',
+                'reason' => 'duplicate',
+            ]);
+
+            return;
+        }
+
+        $answered = false;
+
+        // Registered BEFORE sending, as apiRequest() registers its turn: a bridge on the same
+        // host can acknowledge before sendToUser() has even returned.
+        $this->connectionManager->registerPendingTurnInput(
+            $requestId,
+            $messageId,
+            $userId,
+            function (array $answer) use (&$answered, $tcpConnection): void {
+                if ($answered) {
+                    return;
+                }
+
+                $answered = true;
+                $this->httpResponse($tcpConnection, 200, $answer);
+            }
+        );
+
+        $sent = $this->connectionManager->sendToUser($userId, [
+            'type' => MessageTypes::TURN_INPUT,
+            'request_id' => $requestId,
+            'message_id' => $messageId,
+            'content' => $content,
+        ]);
+
+        if (! $sent) {
+            $this->connectionManager->forgetPendingTurnInput($requestId, $messageId);
+
+            if (! $answered) {
+                $answered = true;
+                $this->httpResponse($tcpConnection, 200, [
+                    'status' => 'rejected',
+                    'reason' => 'send_failed',
+                ]);
+            }
+
+            return;
+        }
+
+        if ($answered) {
+            return;
+        }
+
+        // A bridge too old to know turn_input never answers. It also never confirms
+        // `input_open`, so a well-behaved caller does not get here with one — but a caller
+        // that does must not be held open for ever.
+        $timeout = (float) config('ai-bridge.server.turn_input_timeout', 5);
+
+        $this->loop->addTimer($timeout, function () use ($requestId, $messageId, &$answered, $tcpConnection): void {
+            $this->connectionManager->forgetPendingTurnInput($requestId, $messageId);
+
+            if ($answered) {
+                return;
+            }
+
+            $answered = true;
+            $this->httpResponse($tcpConnection, 200, [
+                'status' => 'rejected',
+                'reason' => 'no_answer',
             ]);
         });
     }
@@ -789,7 +944,7 @@ class BridgeWebSocketServer
     {
         // 413 is included so the buffer-overflow guard in handleTcpConnection()
         // can use httpResponse() consistently.
-        $statusTexts = [200 => 'OK', 400 => 'Bad Request', 401 => 'Unauthorized', 404 => 'Not Found', 413 => 'Payload Too Large', 500 => 'Internal Server Error', 504 => 'Gateway Timeout'];
+        $statusTexts = [200 => 'OK', 400 => 'Bad Request', 401 => 'Unauthorized', 403 => 'Forbidden', 404 => 'Not Found', 413 => 'Payload Too Large', 500 => 'Internal Server Error', 504 => 'Gateway Timeout'];
         $statusText = $statusTexts[$statusCode] ?? 'Unknown';
 
         $json = json_encode($data, JSON_UNESCAPED_SLASHES);

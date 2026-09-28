@@ -6,6 +6,7 @@ namespace Tetrix\AiBridge\Streaming\Drivers;
 
 use Illuminate\Contracts\Redis\Factory as RedisFactory;
 use Illuminate\Redis\Connections\Connection;
+use Tetrix\AiBridge\Contracts\MergesStreamMetadata;
 use Tetrix\AiBridge\Contracts\StreamStoreContract;
 
 /**
@@ -22,7 +23,7 @@ use Tetrix\AiBridge\Contracts\StreamStoreContract;
  *   On complete(), TTL is shortened to $completedTtl so a recent reload can
  *   still replay but the entry doesn't linger.
  */
-final class RedisStreamStore implements StreamStoreContract
+final class RedisStreamStore implements StreamStoreContract, MergesStreamMetadata
 {
     public function __construct(
         private readonly RedisFactory $redis,
@@ -46,6 +47,30 @@ final class RedisStreamStore implements StreamStoreContract
         $conn->set(
             $this->key($requestId, 'meta'),
             json_encode($metadata, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+            'EX',
+            $this->streamingTtl,
+        );
+    }
+
+    public function mergeMetadata(string $requestId, array $metadata): void
+    {
+        $conn = $this->conn();
+
+        // Only for a turn that exists: status is the key every reader checks
+        // first, so metadata without it would be written for nobody.
+        if ($conn->get($this->key($requestId, 'status')) === null) {
+            return;
+        }
+
+        // Read-modify-write. Every writer after start() is the one serve
+        // process, whose event loop runs one frame at a time, so there is no
+        // second writer to race; start() itself runs before the turn is sent.
+        $rawMeta = $conn->get($this->key($requestId, 'meta'));
+        $current = $rawMeta === null ? [] : json_decode((string) $rawMeta, true);
+
+        $conn->set(
+            $this->key($requestId, 'meta'),
+            json_encode(array_merge(is_array($current) ? $current : [], $metadata), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
             'EX',
             $this->streamingTtl,
         );

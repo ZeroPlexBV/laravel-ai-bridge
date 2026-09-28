@@ -1091,6 +1091,35 @@ The turn's helper totals arrive on `done` as `$meta['subagent_stats']`, in the
 CLI's own shape. Both reach a browser through the buffered SSE stream. See
 `PROTOCOL.md` for every field.
 
+### A message sent while a turn runs
+
+A bridge turn can keep its input open, so a message the person types while it
+runs — typically after the assistant has answered while its helpers are still
+working — reaches the assistant in that turn instead of waiting for all of it
+to end. Opt in per turn with `accepts_input` (server-side only; background
+tasks are on for such a turn):
+
+```php
+$requestId = AiBridge::startConversationStream($conversation, $message, ['accepts_input' => true]);
+
+// Later, from another request, when the person sends something else:
+if (AiBridge::inputOpen($requestId)) {
+    $result = AiBridge::sendTurnInput($requestId, $clientMessageId, $text);
+    // $result->status: 'accepted' | 'rejected'
+    // $result->reason: 'turn_not_running' (start a new turn with it),
+    //                  or anything else (hold it until the turn ends)
+}
+```
+
+`inputOpen()` is true only once the bridge has confirmed the mode on its ack,
+and only while the turn runs; an older bridge never confirms it. Accepted means
+queued, not read: the stream carries `user_input` (`message_id`) at the moment
+the assistant takes the message in, and `main_state` (`working` / `idle`) says
+whether a message now is read straight away or after the current step. Both
+are buffered and replay by index (`onUserInput`, `onMainState` on a
+`StreamHandler`). A stopped turn lists the ids it never read in
+`pending_inputs` on `cancelled`. See `PROTOCOL.md`, "Turn Input".
+
 ### What the turn cost
 
 `onDone` receives a second argument with everything the provider reported

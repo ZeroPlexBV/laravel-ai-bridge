@@ -6,6 +6,7 @@ namespace Tetrix\AiBridge;
 
 use Closure;
 use InvalidArgumentException;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 use Tetrix\AiBridge\Auth\TokenManager;
@@ -24,6 +25,7 @@ use Tetrix\AiBridge\Streaming\BufferingSink;
 use Tetrix\AiBridge\Streaming\ChatCompletionsStream;
 use Tetrix\AiBridge\Streaming\ConversationRecorder;
 use Tetrix\AiBridge\Streaming\StreamHandler;
+use Tetrix\AiBridge\Streaming\TurnInputResult;
 use Tetrix\AiBridge\Support\BridgeLog;
 use Tetrix\AiBridge\Tools\ToolRegistry;
 use Tetrix\AiBridge\WebSocket\BridgeConnectionManager;
@@ -67,6 +69,8 @@ class AiBridgeManager
      *   - 'api_key': Override API key for BYOK (server-side only, stripped from HTTP input by StreamController).
      *   - 'mode': ProviderMode enum instance (server-side only, stripped from HTTP input by StreamController).
      *   - 'user_id': User ID for bridge mode (server-side only, stripped from HTTP input by StreamController).
+     *   - 'accepts_input': true to keep a bridge turn's input open, so a message can reach it
+     *     while it runs via sendTurnInput() (bridge mode, server-side only; see inputOpen()).
      * @return StreamHandler
      */
     public function stream(string $conversationId, string $message, array $options = []): StreamHandler
@@ -162,6 +166,155 @@ class AiBridgeManager
     public function usage(Connection $connection, ?string $provider = null): array
     {
         return app(ConnectionStatus::class)->usage($connection, $provider);
+    }
+
+    /**
+     * Send a message into a bridge turn that is still running.
+     *
+     * Only a turn started with the `accepts_input` option can take one, and only once its
+     * bridge has confirmed that — which {@see inputOpen()} reports. Answers once the bridge
+     * has accepted or refused, within `ai-bridge.server.turn_input_timeout` seconds (5): see
+     * {@see TurnInputResult} for what each answer means and what to do with the message.
+     *
+     * Accepted is not read. The turn's stream carries a `user_input` event with the same
+     * `$messageId` at the moment the assistant takes it in.
+     *
+     * Reaches the serve process over its internal HTTP API, like a relayed turn, so it works
+     * from a PHP-FPM worker or a queued job. Do not call it from inside the serve process.
+     *
+     * @param  string  $messageId  The application's own id for the message; echoed back in
+     *                             `user_input` and in a cancelled turn's `pending_inputs`.
+     * @param  string|array<int, mixed>  $content  Text, or a list of content blocks.
+     * @param  int|string|null  $userId  Whose bridge runs the turn. Defaults to the user the
+     *                                   turn was routed to: the conversation's connection, else
+     *                                   the authenticated user — as streamConversation() did.
+     *
+     * @throws InvalidArgumentException When the content is empty or no user can be resolved.
+     */
+    public function sendTurnInput(string $requestId, string $messageId, string|array $content, int|string|null $userId = null): TurnInputResult
+    {
+        if ($content === '' || $content === []) {
+            throw new InvalidArgumentException('Turn input needs content.');
+        }
+
+        $userId ??= $this->turnOwnerFor($requestId);
+
+        if ($userId === null) {
+            throw new InvalidArgumentException(
+                'Sending turn input requires the turn\'s user: pass $userId, or call it where the turn\'s conversation or an authenticated user resolves one.'
+            );
+        }
+
+        try {
+            $relayToken = $this->tokenManager->generate($userId, ['scope' => TokenManager::INTERNAL_RELAY_SCOPE], 60);
+
+            // The serve process holds the request open until the bridge answers or its own
+            // timeout fires, so this waits a little longer than that.
+            $timeout = (int) config('ai-bridge.server.turn_input_timeout', 5) + 3;
+
+            $response = Http::withToken($relayToken)
+                ->timeout($timeout)
+                ->acceptJson()
+                ->post($this->internalApiBase().'/api/request/input', [
+                    'request_id' => $requestId,
+                    'message_id' => $messageId,
+                    'content' => $content,
+                ]);
+        } catch (\Throwable $e) {
+            Log::info('AI Bridge: could not reach the serve process for turn input', [
+                'request_id' => $requestId,
+                'error' => $e->getMessage(),
+            ]);
+
+            return TurnInputResult::rejected('unreachable');
+        }
+
+        if ($response->status() === 403) {
+            return TurnInputResult::rejected('not_owner');
+        }
+
+        if (! $response->successful()) {
+            return TurnInputResult::rejected($response->status() === 400 ? 'invalid_request' : 'unreachable');
+        }
+
+        if ($response->json('status') === TurnInputResult::ACCEPTED) {
+            return TurnInputResult::accepted();
+        }
+
+        $reason = $response->json('reason');
+
+        return TurnInputResult::rejected(is_string($reason) && $reason !== '' ? $reason : null);
+    }
+
+    /**
+     * Whether a running turn has its input open, so sendTurnInput() can reach it.
+     *
+     * True only while the turn is streaming AND its bridge confirmed `input_open` on the
+     * ack. False for a turn that did not ask, a bridge too old to confirm, a turn that has
+     * ended, and a stream store that cannot record it — in each of which a message typed now
+     * is best held until the turn ends, exactly as before turn input existed.
+     */
+    public function inputOpen(string $requestId): bool
+    {
+        try {
+            $status = app(StreamStoreContract::class)->status($requestId);
+        } catch (\Throwable $e) {
+            Log::warning('AI Bridge: could not read the stream status for input_open', [
+                'request_id' => $requestId,
+                'error' => $e->getMessage(),
+            ]);
+
+            return false;
+        }
+
+        return ($status['status'] ?? null) === 'streaming'
+            && (($status['metadata'] ?? [])['input_open'] ?? null) === true;
+    }
+
+    /**
+     * The user a running turn was routed to, as streamConversation() chose it.
+     *
+     * Read back through the conversation the turn's stream metadata names, because that is
+     * all a later request knows: the person sending the message may not be the identity the
+     * bridge connected as (a managed connection connects under its connection_key).
+     */
+    private function turnOwnerFor(string $requestId): ?string
+    {
+        try {
+            $conversationId = app(StreamStoreContract::class)->status($requestId)['metadata']['conversation_id'] ?? null;
+            $conversation = $conversationId !== null && $conversationId !== '' ? Conversation::find($conversationId) : null;
+        } catch (\Throwable) {
+            $conversation = null;
+        }
+
+        if ($conversation !== null) {
+            return $this->bridgeUserIdFor($conversation);
+        }
+
+        $userId = $this->resolveAuthUserId();
+
+        return $userId === null ? null : (string) $userId;
+    }
+
+    /**
+     * Where the serve process's internal HTTP API listens.
+     *
+     * The same resolution ConnectionStatus and ConnectionController use.
+     */
+    private function internalApiBase(): string
+    {
+        $relayUrl = config('ai-bridge.server.relay_url');
+        if (! empty($relayUrl)) {
+            return rtrim((string) $relayUrl, '/');
+        }
+
+        $host = (string) config('ai-bridge.server.host', '127.0.0.1');
+        $port = (int) config('ai-bridge.server.port', 8085);
+        if ($host === '0.0.0.0') {
+            $host = '127.0.0.1';
+        }
+
+        return "http://{$host}:{$port}";
     }
 
     /**
@@ -452,8 +605,8 @@ class AiBridgeManager
      * Wire the stream callbacks to a sink callable.
      *
      * Callbacks: onBlockStart, onBlockDelta, onBlockStop, onToolCall,
-     * onToolResult, onRateLimit, onAttachment, onTask, onDone, onError,
-     * onCancelled.
+     * onToolResult, onRateLimit, onAttachment, onTask, onUserInput,
+     * onMainState, onDone, onError, onCancelled.
      * The $sink receives a normalized payload array with 'event' and 'data' keys.
      * The optional $onTerminal callback is called after done/error/cancelled events (e.g. for SSE [DONE] flush).
      */
@@ -547,6 +700,16 @@ class AiBridgeManager
             $sink(['event' => MessageTypes::TASK, 'data' => $task]);
         });
 
+        // A mid-turn message was read, and whether the main assistant is
+        // working or free — forwarded whole, as BufferingSink buffers them.
+        $stream->onUserInput(function (array $data) use ($sink) {
+            $sink(['event' => MessageTypes::USER_INPUT, 'data' => $data]);
+        });
+
+        $stream->onMainState(function (array $data) use ($sink) {
+            $sink(['event' => MessageTypes::MAIN_STATE, 'data' => $data]);
+        });
+
         $stream->onDone(function (?array $usage, array $meta = []) use ($sink, $onTerminal) {
             // One allowlist, not two copies — a future field must be reviewed
             // once, not remembered in two places. cli_session_id is the
@@ -574,9 +737,9 @@ class AiBridgeManager
             }
         });
 
-        $stream->onCancelled(function (string $reason) use ($sink, $onTerminal) {
+        $stream->onCancelled(function (string $reason, array $meta = []) use ($sink, $onTerminal) {
             try {
-                $sink(['event' => MessageTypes::CANCELLED, 'data' => ['reason' => $reason]]);
+                $sink(['event' => MessageTypes::CANCELLED, 'data' => ['reason' => $reason] + BufferingSink::publicCancelledMeta($meta)]);
             } finally {
                 if ($onTerminal) {
                     $onTerminal();

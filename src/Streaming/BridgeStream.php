@@ -149,6 +149,10 @@ class BridgeStream implements StreamableProvider
                 'temperature' => $this->options['temperature'] ?? null,
                 'max_tokens' => $this->options['max_tokens'] ?? null,
                 'model' => $this->options['model'] ?? null,
+                // Keep the turn's input open so a message can reach it while
+                // it runs (AiBridge::sendTurnInput). Opt-in per turn; the
+                // bridge confirms it with `input_open` on the ack.
+                'accepts_input' => ($this->options['accepts_input'] ?? null) === true ? true : null,
             ],
             'cli_session_id' => $this->options['cli_session_id'] ?? null,
             'history' => $this->options['messages'] ?? null,

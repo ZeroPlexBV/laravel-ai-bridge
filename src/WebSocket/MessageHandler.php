@@ -7,6 +7,7 @@ namespace Tetrix\AiBridge\WebSocket;
 use Illuminate\Support\Facades\Log;
 use Tetrix\AiBridge\Auth\TokenManager;
 use Tetrix\AiBridge\Auth\TokenValidationException;
+use Tetrix\AiBridge\Contracts\MergesStreamMetadata;
 use Tetrix\AiBridge\Contracts\StreamStoreContract;
 use Tetrix\AiBridge\Enums\BlockType;
 use Tetrix\AiBridge\Models\Conversation;
@@ -47,6 +48,14 @@ class MessageHandler
      * branches on, and a value it has never heard of is indistinguishable from a bug in it.
      */
     private const USAGE_REASONS = ['unsupported', 'no_credential', 'failed'];
+
+    /**
+     * The `reason` values a rejecting `turn_input_ack` may carry, per PROTOCOL.md.
+     *
+     * An allowlist for the same reason as USAGE_REASONS: the application branches on it —
+     * `turn_not_running` is the one that makes it start a new turn with the message.
+     */
+    private const TURN_INPUT_REASONS = ['turn_not_running', 'input_not_open'];
 
     public function __construct(
         private readonly BridgeConnectionManager $connectionManager,
@@ -124,6 +133,7 @@ class MessageHandler
             MessageTypes::AI_REQUEST_ACK => $this->handleAiRequestAck($connectionId, $message),
             MessageTypes::POSTURE => $this->handlePosture($connectionId, $message),
             MessageTypes::USAGE_RESULT => $this->handleUsageResult($connectionId, $message),
+            MessageTypes::TURN_INPUT_ACK => $this->handleTurnInputAck($connectionId, $message),
             MessageTypes::STREAM => $this->handleStreamEnvelope($connectionId, $message),
             MessageTypes::TOOL_CALL => $this->handleToolCall($connectionId, $message),
             MessageTypes::ERROR => $this->handleError($connectionId, $message),
@@ -308,6 +318,56 @@ class MessageHandler
             // A bridge that said ok but sent nothing usable is not the same as one reporting
             // an empty allowance, and must not be presented as "nothing used".
             : ['ok' => false, 'reason' => $reason ?? 'failed']);
+
+        return null;
+    }
+
+    /**
+     * The bridge's answer to a mid-turn message, handed to whoever is waiting.
+     *
+     * Shaped like handleUsageResult(): the sender must have completed the handshake, and
+     * every field is type-checked, because a TypeError here takes the serve process down.
+     * Only `accepted` means accepted; anything else is a rejection, so a confused frame can
+     * never make the application believe a message reached the assistant.
+     *
+     * Returns null: the answer goes to the waiting HTTP response, not back to the bridge.
+     *
+     * @param  array<string, mixed>  $message
+     */
+    private function handleTurnInputAck(string $connectionId, array $message): ?array
+    {
+        $userId = $this->connectionManager->getUserIdByConnectionId($connectionId);
+
+        if ($userId === null) {
+            Log::warning('AI Bridge: turn_input_ack from unauthenticated connection', [
+                'connection_id' => $connectionId,
+            ]);
+
+            return null;
+        }
+
+        $requestId = $message['request_id'] ?? null;
+        $messageId = $message['message_id'] ?? null;
+
+        if (! is_string($requestId) || $requestId === '' || ! is_string($messageId) || $messageId === '') {
+            Log::warning('AI Bridge: turn_input_ack without a request_id or message_id', [
+                'connection_id' => $connectionId,
+            ]);
+
+            return null;
+        }
+
+        if (($message['status'] ?? null) === 'accepted') {
+            $answer = ['status' => 'accepted'];
+        } else {
+            $reason = $message['reason'] ?? null;
+            $answer = ['status' => 'rejected'];
+            if (is_string($reason) && in_array($reason, self::TURN_INPUT_REASONS, true)) {
+                $answer['reason'] = $reason;
+            }
+        }
+
+        $this->connectionManager->resolvePendingTurnInput($requestId, $messageId, $userId, $answer);
 
         return null;
     }
@@ -651,7 +711,47 @@ class MessageHandler
             ]);
         }
 
+        // The bridge confirming that this turn's input is open, so a message
+        // can reach it while it runs. Written to the turn's stream metadata,
+        // because the process that has to read it — the PHP-FPM worker holding
+        // the person's next message — is not this one. Only `true` counts, and
+        // only from the bridge that owns the turn: this is what makes the
+        // application send a message to a turn rather than hold it.
+        //
+        // Absent from a bridge that predates turn input, and from any turn
+        // that did not ask for it: absence means closed, which is what every
+        // turn meant before.
+        if (($message['input_open'] ?? null) === true
+            && is_string($requestId) && $requestId !== ''
+            && $this->verifySenderOwnsRequest($connectionId, $requestId)) {
+            $this->markInputOpen($requestId);
+        }
+
         return null;
+    }
+
+    /**
+     * Record in the turn's stream metadata that its input is open.
+     *
+     * A store that cannot merge metadata (a custom driver written before the
+     * capability existed) simply does not record it, and the application then
+     * holds a mid-turn message as before. Failures are logged, never thrown:
+     * this runs inside the event loop.
+     */
+    private function markInputOpen(string $requestId): void
+    {
+        try {
+            $store = app(StreamStoreContract::class);
+
+            if ($store instanceof MergesStreamMetadata) {
+                $store->mergeMetadata($requestId, ['input_open' => true]);
+            }
+        } catch (\Throwable $e) {
+            BridgeLog::warning('failed to record input_open in the stream metadata', [
+                'request_id' => $requestId,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     /**
@@ -1394,7 +1494,15 @@ class MessageHandler
 
         $handler = $this->connectionManager->getPendingRequest($requestId);
         if ($handler) {
-            $handler->dispatchCancelled('Request was cancelled.');
+            // Messages delivered mid-turn that the CLI never read, so the
+            // application can offer them again rather than count them as
+            // answered. Only a list of ids passes.
+            $pending = $message['pending_inputs'] ?? null;
+            $pending = is_array($pending) && array_is_list($pending)
+                ? array_values(array_filter($pending, static fn ($id): bool => is_string($id) && $id !== ''))
+                : [];
+
+            $handler->dispatchCancelled('Request was cancelled.', $pending !== [] ? ['pending_inputs' => $pending] : []);
             $this->connectionManager->removePendingRequest($requestId);
             unset($this->recoveredRequests[$requestId]);
         }

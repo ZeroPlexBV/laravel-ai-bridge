@@ -67,6 +67,12 @@ class StreamHandler
     /** @var array<int, Closure> */
     private array $taskCallbacks = [];
 
+    /** @var array<int, Closure> */
+    private array $userInputCallbacks = [];
+
+    /** @var array<int, Closure> */
+    private array $mainStateCallbacks = [];
+
     /**
      * Partially received tool results, keyed by tool_call_id.
      *
@@ -252,7 +258,11 @@ class StreamHandler
     /**
      * Register a callback for when the stream is cancelled.
      *
-     * The callback receives: string $reason.
+     * The callback receives: string $reason, array $meta. $meta carries what
+     * the bridge said beside the cancellation — currently `pending_inputs`, the
+     * `message_id`s of messages delivered mid-turn that the CLI never read —
+     * and is empty when it said nothing. A callback declaring only $reason
+     * keeps working: PHP drops the extra argument.
      */
     public function onCancelled(Closure $callback): static
     {
@@ -306,6 +316,38 @@ class StreamHandler
     public function onTask(Closure $callback): static
     {
         $this->taskCallbacks[] = $callback;
+
+        return $this;
+    }
+
+    /**
+     * Register a callback for user_input events — the CLI took in a message
+     * delivered mid-turn (see AiBridgeManager::sendTurnInput()).
+     *
+     * The callback receives the event's data array as the bridge sent it,
+     * `message_id` being the id the server gave the message. Passed through
+     * whole, like task. Non-terminal: the reply continues after it, now
+     * answering that message too.
+     */
+    public function onUserInput(Closure $callback): static
+    {
+        $this->userInputCallbacks[] = $callback;
+
+        return $this;
+    }
+
+    /**
+     * Register a callback for main_state events — whether the main assistant
+     * of a turn that keeps its input open is `working` or `idle`.
+     *
+     * The callback receives the event's data array as the bridge sent it
+     * (`state`). Passed through whole, like task. Informational and
+     * non-terminal: `idle` means the main assistant has answered while
+     * helpers or background commands still run, not that the turn is over.
+     */
+    public function onMainState(Closure $callback): static
+    {
+        $this->mainStateCallbacks[] = $callback;
 
         return $this;
     }
@@ -537,6 +579,38 @@ class StreamHandler
         }
 
         $this->dispatchCallbacks($this->taskCallbacks, [$task], 'task');
+    }
+
+    /**
+     * Dispatch a user_input event: a message delivered mid-turn was read.
+     *
+     * @param  array<string, mixed>  $data
+     *
+     * @internal Called by StreamableProvider implementations.
+     */
+    public function dispatchUserInput(array $data): void
+    {
+        if ($this->cancelled || $this->terminated) {
+            return;
+        }
+
+        $this->dispatchCallbacks($this->userInputCallbacks, [$data], 'user_input');
+    }
+
+    /**
+     * Dispatch a main_state event: the main assistant is working or idle.
+     *
+     * @param  array<string, mixed>  $data
+     *
+     * @internal Called by StreamableProvider implementations.
+     */
+    public function dispatchMainState(array $data): void
+    {
+        if ($this->cancelled || $this->terminated) {
+            return;
+        }
+
+        $this->dispatchCallbacks($this->mainStateCallbacks, [$data], 'main_state');
     }
 
     /**
@@ -901,9 +975,11 @@ class StreamHandler
      * Unlike error, this emits event type 'cancelled' so consumers can
      * differentiate between errors and intentional cancellation.
      *
+     * @param  array<string, mixed>  $meta  What the bridge said beside it, e.g. `pending_inputs`.
+     *
      * @internal Called by StreamableProvider implementations.
      */
-    public function dispatchCancelled(string $reason = 'Request was cancelled.'): void
+    public function dispatchCancelled(string $reason = 'Request was cancelled.', array $meta = []): void
     {
         if ($this->terminated) {
             return;
@@ -916,7 +992,7 @@ class StreamHandler
 
         $this->terminated = true;
 
-        $this->dispatchCallbacks($this->cancelledCallbacks, [$reason], 'cancelled');
+        $this->dispatchCallbacks($this->cancelledCallbacks, [$reason, $meta], 'cancelled');
 
         $this->dispatchStreamCompleted(false, null, "cancelled: {$reason}", TerminatedBy::Cancelled);
 
@@ -945,6 +1021,8 @@ class StreamHandler
                 is_array($event->data['info'] ?? null) ? $event->data['info'] : [],
             ),
             MessageTypes::TASK => $this->dispatchTask($event->data),
+            MessageTypes::USER_INPUT => $this->dispatchUserInput($event->data),
+            MessageTypes::MAIN_STATE => $this->dispatchMainState($event->data),
             MessageTypes::ATTACHMENT => $this->dispatchAttachment($event->data),
             MessageTypes::DONE => $this->dispatchDone(
                 $event->data['usage'] ?? null,

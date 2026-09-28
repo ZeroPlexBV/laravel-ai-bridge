@@ -143,6 +143,11 @@ return [
         // trip to the machine AND the machine's own call to its vendor, not just on us.
         'usage_timeout' => env('AI_BRIDGE_USAGE_TIMEOUT', 12), // seconds
 
+        // How long the serve process waits for the bridge to accept or refuse a message sent
+        // into a running turn (AiBridge::sendTurnInput) before answering `no_answer`. The
+        // bridge answers at once — it only writes to the CLI's input — so this is short.
+        'turn_input_timeout' => env('AI_BRIDGE_TURN_INPUT_TIMEOUT', 5), // seconds
+
         // URL for internal relay requests (PHP-FPM → bridge server communication).
         // Override to use HTTPS if the bridge server is behind a TLS-terminating proxy.
         // Security: When running the bridge server on a separate host, use HTTPS to
