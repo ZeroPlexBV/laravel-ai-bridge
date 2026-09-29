@@ -632,6 +632,11 @@ know the frame, and the server would have to wait out a timeout to find out whic
 - **`unsupported`** — this CLI has no notion of a subscription allowance.
 - **`no_credential`** — it has one, but nobody is signed in, or the sign-in has expired.
 - **`failed`** — it tried and could not.
+- **`rate_limited`** — the vendor refused for being asked too often (HTTP 429). May carry
+  **`retry_after`**: whole seconds until it is worth asking again (from the vendor's
+  `Retry-After` header when it sent one). This server accepts it and passes both on
+  (`retry_after` bounded to a day); ai-bridge 0.21 does not send it yet and reports a 429 as
+  `failed`.
 
 **Money is deliberately absent.** The vendor's answer may also carry spend and credit
 balances; they are dropped here rather than forwarded, so an allowance figure cannot be

@@ -160,11 +160,12 @@ class AiBridgeManager
      * app's own `connectionsQuery()` scope; this now cannot skip it, because authorising the
      * lookup is the caller's job and a signature that accepts a bare key invites forgetting.
      *
-     * @return array{ok: bool, limits?: array<int, array<string, mixed>>, reason?: string}
+     * @return array{ok: bool, limits?: array<int, array<string, mixed>>, reason?: string, retry_after?: int}
      *                                 Each limit carries `label` and `percent`, plus
      *                                 `resets_at`, `kind` and `group` when the CLI reports
      *                                 them. On failure, `reason` is `not_connected`,
-     *                                 `unsupported`, `no_credential` or `failed`.
+     *                                 `unsupported`, `no_credential`, `rate_limited` (with
+     *                                 `retry_after` seconds when known) or `failed`.
      */
     public function usage(Connection $connection, ?string $provider = null): array
     {
