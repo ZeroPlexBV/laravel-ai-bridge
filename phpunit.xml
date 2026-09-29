@@ -5,6 +5,11 @@
          colors="true"
          cacheDirectory=".phpunit.cache"
 >
+    <php>
+        <!-- The tool-result ceiling tests push tens of MB through the stream handler on
+             purpose, and the suite outgrows PHP's default 128 MB (it did on v0.15.0 too). -->
+        <ini name="memory_limit" value="-1"/>
+    </php>
     <testsuites>
         <testsuite name="Unit">
             <directory>tests</directory>
