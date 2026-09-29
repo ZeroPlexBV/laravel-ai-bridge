@@ -403,5 +403,12 @@ return [
         // Persist a partial assistant message when a stream errors or is
         // cancelled mid-response. The row is flagged incomplete=true.
         'persist_partial_on_error' => env('AI_BRIDGE_PERSIST_PARTIAL', true),
+
+        // Clear, every five minutes, a conversation's "a turn is running" bookmark
+        // (streaming_request_id) when its turn is over: its buffer ended, or it has no buffer
+        // and is older than the grace period (an application's claim for a turn still being
+        // started has no buffer yet). Command: ai-bridge:sweep-turn-markers.
+        'sweep_turn_markers' => env('AI_BRIDGE_SWEEP_TURN_MARKERS', true),
+        'turn_marker_grace_seconds' => (int) env('AI_BRIDGE_TURN_MARKER_GRACE', 600),
     ],
 ];

@@ -16,6 +16,7 @@ use Tetrix\AiBridge\Protocol\MessageTypes;
 use Tetrix\AiBridge\Protocol\StreamEvent;
 use Tetrix\AiBridge\Streaming\RelayStream;
 use Tetrix\AiBridge\Streaming\StreamHandler;
+use Tetrix\AiBridge\Streaming\TurnMarker;
 use Tetrix\AiBridge\Support\BridgeLog;
 use Tetrix\AiBridge\Tools\ToolRegistry;
 
@@ -1313,6 +1314,7 @@ class MessageHandler
                 'request_id' => $requestId,
                 'usage' => $usage,
             ]);
+            $this->settleOrphanedTurn($connectionId, (string) $requestId);
 
             return null;
         }
@@ -1393,6 +1395,11 @@ class MessageHandler
 
         $handler = $this->connectionManager->getPendingRequest($requestId);
         if (! $handler) {
+            // session_lost asks for a re-issue; only a real ending settles a lost turn.
+            if ($code !== 'session_lost') {
+                $this->settleOrphanedTurn($connectionId, (string) $requestId);
+            }
+
             return null;
         }
 
@@ -1572,6 +1579,7 @@ class MessageHandler
         if (is_string($requestId) && $requestId !== ''
             && $this->connectionManager->getPendingRequest($requestId) === null) {
             $this->recordLatePendingInputs($connectionId, $requestId, $pending);
+            $this->settleOrphanedTurn($connectionId, $requestId);
 
             return null;
         }
@@ -1701,6 +1709,7 @@ class MessageHandler
             $pending = self::pendingInputsOf($message);
             if ($pending !== null && $pending !== []) {
                 $this->recordLatePendingInputs($connectionId, $requestId, $pending);
+                $this->settleOrphanedTurn($connectionId, (string) $requestId);
 
                 return null;
             }
@@ -1709,6 +1718,7 @@ class MessageHandler
                 'connection_id' => $connectionId,
                 'request_id' => $requestId,
             ]);
+            $this->settleOrphanedTurn($connectionId, (string) $requestId);
 
             return null;
         }
@@ -1742,6 +1752,21 @@ class MessageHandler
         }
 
         return null;
+    }
+
+    /**
+     * A bridge ended a turn no handler here knows: most often one a serve process that has
+     * since restarted was running, so its handler (and the recorder that clears the
+     * conversation's `streaming_request_id`) died with it. Settled only for the bridge of the
+     * user the conversation is routed to; see TurnMarker::settleOrphan().
+     */
+    private function settleOrphanedTurn(string $connectionId, string $requestId): void
+    {
+        if ($requestId === '') {
+            return;
+        }
+
+        TurnMarker::settleOrphan($requestId, $this->connectionManager->getUserIdByConnectionId($connectionId));
     }
 
     /**

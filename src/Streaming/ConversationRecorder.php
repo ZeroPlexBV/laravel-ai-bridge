@@ -400,14 +400,14 @@ final class ConversationRecorder
 
             $blocks[] = $block;
         });
-        $handler->onDone(function (?array $usage) use (&$blocks, &$current, &$inStreamToolCall, &$pendingFrames, $conversation) {
+        $handler->onDone(function (?array $usage) use (&$blocks, &$current, &$inStreamToolCall, &$pendingFrames, $conversation, $handler) {
             $inStreamToolCall = false;
             self::flushCurrent($blocks, $current, $pendingFrames);
             self::persist($conversation, $blocks, $usage, false);
-            self::clearStreamingRequestId($conversation);
+            self::clearStreamingRequestId($conversation, $handler->requestId);
         });
 
-        $persistPartial = function () use (&$blocks, &$current, &$inStreamToolCall, &$pendingFrames, $conversation) {
+        $persistPartial = function () use (&$blocks, &$current, &$inStreamToolCall, &$pendingFrames, $conversation, $handler) {
             // A truncated stream may have left $inStreamToolCall set without a
             // matching block_stop. Clearing it isn't strictly necessary here
             // (this is a terminal — no more events arrive), but resetting
@@ -418,7 +418,7 @@ final class ConversationRecorder
             if (config('ai-bridge.persistence.persist_partial_on_error', true) && self::hasContent($blocks)) {
                 self::persist($conversation, $blocks, null, true);
             }
-            self::clearStreamingRequestId($conversation);
+            self::clearStreamingRequestId($conversation, $handler->requestId);
         };
         $handler->onError(fn () => $persistPartial());
         $handler->onCancelled(fn () => $persistPartial());
@@ -430,12 +430,17 @@ final class ConversationRecorder
      * Done in a separate UPDATE rather than via the model instance so the
      * write is safe even if the recorder is operating on a stale Eloquent
      * instance (e.g. across the web/serve process split).
+     *
+     * Only while the bookmark still names THIS turn: an ending that arrives late (a stop
+     * answered after the person already started the next turn) must not clear the next
+     * turn's bookmark, or an application's claim for it.
      */
-    private static function clearStreamingRequestId(Conversation $conversation): void
+    private static function clearStreamingRequestId(Conversation $conversation, string $requestId): void
     {
         try {
             Conversation::query()
                 ->whereKey($conversation->id)
+                ->where('streaming_request_id', $requestId)
                 ->update(['streaming_request_id' => null]);
         } catch (\Throwable $e) {
             Log::warning('AI Bridge: failed to clear streaming_request_id', [

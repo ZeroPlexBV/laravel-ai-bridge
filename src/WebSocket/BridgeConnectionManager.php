@@ -9,6 +9,7 @@ use Illuminate\Support\Facades\Log;
 use Tetrix\AiBridge\Contracts\SendableConnection;
 use Tetrix\AiBridge\Events\BridgeConnected;
 use Tetrix\AiBridge\Events\BridgeDisconnected;
+use Tetrix\AiBridge\Protocol\MessageTypes;
 use Tetrix\AiBridge\Streaming\StreamHandler;
 
 /**
@@ -767,6 +768,47 @@ class BridgeConnectionManager
     public function connectionCount(): int
     {
         return count($this->connections);
+    }
+
+    /**
+     * The serve process is stopping: end every turn it is relaying.
+     *
+     * Nothing will relay the rest of these turns (a new serve process does not know them), so
+     * each is ended here as failed, through its handler, which ends its buffer for whoever
+     * reads it and clears its conversation's `streaming_request_id`. And the machine is told
+     * to stop it: a turn nobody is listening to would otherwise run on, unseen, and the
+     * person's next message would start a second one on the same session beside it.
+     *
+     * @return int how many turns were ended
+     */
+    public function failAllPendingRequests(string $code = 'server_restarting', string $message = 'The server restarted while this reply was running. Ask again to continue.'): int
+    {
+        $ended = 0;
+
+        foreach ($this->pendingRequests as $requestId => $entry) {
+            unset($this->pendingRequests[$requestId]);
+
+            if (($entry['user_id'] ?? '') !== '') {
+                try {
+                    $this->sendToUser($entry['user_id'], ['type' => MessageTypes::CANCEL, 'request_id' => (string) $requestId]);
+                } catch (\Throwable) {
+                    // The machine may already be gone; the turn still ends here.
+                }
+            }
+
+            try {
+                $entry['stream_handler']->dispatchError($code, $message);
+            } catch (\Throwable $e) {
+                Log::warning('AI Bridge: could not end a turn on shutdown', [
+                    'request_id' => $requestId,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+
+            $ended++;
+        }
+
+        return $ended;
     }
 
     /**
