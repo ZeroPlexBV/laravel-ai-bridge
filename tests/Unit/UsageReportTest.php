@@ -385,3 +385,36 @@ it('still passes the documented reasons through untouched', function () {
             ->toBe(['ok' => false, 'reason' => $reason]);
     }
 });
+
+it('passes a rate limit through as its own reason, with when to ask again', function () {
+    // ai-bridge 0.21 reports the usage endpoint's 429 as a plain `failed`; a bridge that tells
+    // them apart is heard, so the application can wait as long as it was asked to.
+    expect(deliverUsage(usageManager(), ['ok' => false, 'reason' => 'rate_limited', 'retry_after' => 61.2]))
+        ->toBe(['ok' => false, 'reason' => 'rate_limited', 'retry_after' => 62])
+        ->and(deliverUsage(usageManager(), ['ok' => false, 'reason' => 'rate_limited'], 'usage-2'))
+        ->toBe(['ok' => false, 'reason' => 'rate_limited']);
+});
+
+it('bounds retry_after and ignores it on anything but a rate limit', function () {
+    expect(deliverUsage(usageManager(), ['ok' => false, 'reason' => 'rate_limited', 'retry_after' => 10 ** 9]))
+        ->toBe(['ok' => false, 'reason' => 'rate_limited', 'retry_after' => 86400])
+        ->and(deliverUsage(usageManager(), ['ok' => false, 'reason' => 'rate_limited', 'retry_after' => -5], 'usage-2'))
+        ->toBe(['ok' => false, 'reason' => 'rate_limited'])
+        ->and(deliverUsage(usageManager(), ['ok' => false, 'reason' => 'rate_limited', 'retry_after' => 'soon'], 'usage-3'))
+        ->toBe(['ok' => false, 'reason' => 'rate_limited'])
+        ->and(deliverUsage(usageManager(), ['ok' => false, 'reason' => 'failed', 'retry_after' => 30], 'usage-4'))
+        ->toBe(['ok' => false, 'reason' => 'failed']);
+});
+
+it('hands a rate limit and its retry_after on to the application', function () {
+    Http::fake(['*/api/usage' => Http::response(['ok' => false, 'reason' => 'rate_limited', 'retry_after' => 120])]);
+
+    $connection = Connection::create([
+        'type' => Connection::TYPE_BRIDGE,
+        'name' => 'Busy machine',
+        'connection_key' => 'user-1',
+    ]);
+
+    expect(app(ConnectionStatus::class)->usage($connection))
+        ->toBe(['ok' => false, 'reason' => 'rate_limited', 'retry_after' => 120]);
+});

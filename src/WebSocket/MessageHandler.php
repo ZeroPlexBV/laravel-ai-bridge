@@ -16,6 +16,7 @@ use Tetrix\AiBridge\Protocol\MessageTypes;
 use Tetrix\AiBridge\Protocol\StreamEvent;
 use Tetrix\AiBridge\Streaming\RelayStream;
 use Tetrix\AiBridge\Streaming\StreamHandler;
+use Tetrix\AiBridge\Streaming\TurnMarker;
 use Tetrix\AiBridge\Support\BridgeLog;
 use Tetrix\AiBridge\Tools\ToolRegistry;
 
@@ -60,8 +61,15 @@ class MessageHandler
      *
      * An allowlist rather than a passthrough: this is an enum the consuming application
      * branches on, and a value it has never heard of is indistinguishable from a bug in it.
+     *
+     * `rate_limited`: the vendor's usage endpoint refused for asking too often (HTTP 429),
+     * optionally with `retry_after` seconds. Not sent by ai-bridge 0.21 (a 429 is `failed`
+     * there); accepted here so a bridge that tells them apart is heard without another release.
      */
-    private const USAGE_REASONS = ['unsupported', 'no_credential', 'failed'];
+    private const USAGE_REASONS = ['unsupported', 'no_credential', 'failed', 'rate_limited'];
+
+    /** The longest `retry_after` a usage_result may ask for, in seconds (a day). */
+    private const USAGE_RETRY_AFTER_MAX = 86400;
 
     /**
      * The `reason` values a rejecting `turn_input_ack` may carry, per PROTOCOL.md.
@@ -378,11 +386,20 @@ class MessageHandler
                 : null;
         $ok = ($message['ok'] ?? null) === true && $limits !== [];
 
+        $failure = ['ok' => false, 'reason' => $reason ?? 'failed'];
+
+        // How long to leave the endpoint alone, when the machine was told: whole seconds,
+        // positive, and bounded, since the application schedules its next question from it.
+        $retryAfter = $message['retry_after'] ?? null;
+        if ($failure['reason'] === 'rate_limited' && is_numeric($retryAfter) && (float) $retryAfter > 0) {
+            $failure['retry_after'] = (int) min(self::USAGE_RETRY_AFTER_MAX, (int) ceil((float) $retryAfter));
+        }
+
         $this->connectionManager->resolvePendingUsage($requestId, $userId, $ok
             ? ['ok' => true, 'limits' => $limits]
             // A bridge that said ok but sent nothing usable is not the same as one reporting
             // an empty allowance, and must not be presented as "nothing used".
-            : ['ok' => false, 'reason' => $reason ?? 'failed']);
+            : $failure);
 
         return null;
     }
@@ -1313,6 +1330,7 @@ class MessageHandler
                 'request_id' => $requestId,
                 'usage' => $usage,
             ]);
+            $this->settleOrphanedTurn($connectionId, (string) $requestId);
 
             return null;
         }
@@ -1393,6 +1411,11 @@ class MessageHandler
 
         $handler = $this->connectionManager->getPendingRequest($requestId);
         if (! $handler) {
+            // session_lost asks for a re-issue; only a real ending settles a lost turn.
+            if ($code !== 'session_lost') {
+                $this->settleOrphanedTurn($connectionId, (string) $requestId);
+            }
+
             return null;
         }
 
@@ -1572,6 +1595,7 @@ class MessageHandler
         if (is_string($requestId) && $requestId !== ''
             && $this->connectionManager->getPendingRequest($requestId) === null) {
             $this->recordLatePendingInputs($connectionId, $requestId, $pending);
+            $this->settleOrphanedTurn($connectionId, $requestId);
 
             return null;
         }
@@ -1701,6 +1725,7 @@ class MessageHandler
             $pending = self::pendingInputsOf($message);
             if ($pending !== null && $pending !== []) {
                 $this->recordLatePendingInputs($connectionId, $requestId, $pending);
+                $this->settleOrphanedTurn($connectionId, (string) $requestId);
 
                 return null;
             }
@@ -1709,6 +1734,7 @@ class MessageHandler
                 'connection_id' => $connectionId,
                 'request_id' => $requestId,
             ]);
+            $this->settleOrphanedTurn($connectionId, (string) $requestId);
 
             return null;
         }
@@ -1742,6 +1768,21 @@ class MessageHandler
         }
 
         return null;
+    }
+
+    /**
+     * A bridge ended a turn no handler here knows: most often one a serve process that has
+     * since restarted was running, so its handler (and the recorder that clears the
+     * conversation's `streaming_request_id`) died with it. Settled only for the bridge of the
+     * user the conversation is routed to; see TurnMarker::settleOrphan().
+     */
+    private function settleOrphanedTurn(string $connectionId, string $requestId): void
+    {
+        if ($requestId === '') {
+            return;
+        }
+
+        TurnMarker::settleOrphan($requestId, $this->connectionManager->getUserIdByConnectionId($connectionId));
     }
 
     /**

@@ -258,9 +258,10 @@ class ConnectionStatus
      * Nothing is stored for the same reason, so there is no `last_usage` column to match
      * `last_posture`. That absence is deliberate.
      *
-     * @return array{ok: bool, limits?: array<int, array<string, mixed>>, reason?: string}
+     * @return array{ok: bool, limits?: array<int, array<string, mixed>>, reason?: string, retry_after?: int}
      *                                 `reason` is `not_connected`, `unsupported`,
-     *                                 `no_credential` or `failed`.
+     *                                 `no_credential`, `rate_limited` (with `retry_after`
+     *                                 seconds when the machine was told) or `failed`.
      */
     public function usage(Connection $connection, ?string $provider = null): array
     {
@@ -316,8 +317,15 @@ class ConnectionStatus
         }
 
         $reason = $response->json('reason');
+        $failure = ['ok' => false, 'reason' => is_string($reason) && $reason !== '' ? $reason : 'failed'];
 
-        return ['ok' => false, 'reason' => is_string($reason) && $reason !== '' ? $reason : 'failed'];
+        // Only a rate limit says when to ask again; the serve process already bounded it.
+        $retryAfter = $response->json('retry_after');
+        if ($failure['reason'] === 'rate_limited' && is_int($retryAfter) && $retryAfter > 0) {
+            $failure['retry_after'] = $retryAfter;
+        }
+
+        return $failure;
     }
 
     private function internalApiBase(): string
