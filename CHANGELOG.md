@@ -3,6 +3,13 @@
 Release notes for earlier versions are on the GitHub releases page of
 tetrixdev/laravel-ai-bridge. This file starts with 0.16.0-RC1.
 
+## [0.16.0] — 2026-09-30
+
+The final release of 0.16.0, identical in code to 0.16.0-RC1. It pairs with **zeroplex/ai 9.4.0**
+and **ai-bridge 0.17.0 or newer** (0.21.0 recommended). Published from the ZeroPlexBV fork while the
+changes wait to go upstream. Everything listed under 0.16.0-RC1 below applies; run the migration
+(one new column) when upgrading from 0.15.0.
+
 ## [0.16.0-RC1] — 2026-09-29
 
 A release candidate, published from the ZeroPlexBV fork while it waits to go upstream.
