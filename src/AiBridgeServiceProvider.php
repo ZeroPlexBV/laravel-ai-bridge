@@ -4,11 +4,13 @@ declare(strict_types=1);
 
 namespace Tetrix\AiBridge;
 
+use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\ServiceProvider;
 use Tetrix\AiBridge\Auth\TokenManager;
 use Tetrix\AiBridge\Console\GenerateTokenCommand;
 use Tetrix\AiBridge\Console\ServeCommand;
+use Tetrix\AiBridge\Console\SweepTurnMarkersCommand;
 use Tetrix\AiBridge\Console\TestCommand;
 use Tetrix\AiBridge\Contracts\StreamStoreContract;
 use Tetrix\AiBridge\Http\Middleware\ValidateBridgeToken;
@@ -149,7 +151,20 @@ class AiBridgeServiceProvider extends ServiceProvider
                 GenerateTokenCommand::class,
                 TestCommand::class,
                 ServeCommand::class,
+                SweepTurnMarkersCommand::class,
             ]);
+        }
+
+        // Clear conversation turn bookmarks a turn left behind (a serve process that stopped
+        // mid-turn, a process killed outright). Cheap: one query over the conversations that
+        // have a bookmark at all, which is only the ones running a turn.
+        if (config('ai-bridge.persistence.sweep_turn_markers', true)) {
+            $this->callAfterResolving(Schedule::class, function (Schedule $schedule): void {
+                $schedule->command('ai-bridge:sweep-turn-markers')
+                    ->everyFiveMinutes()
+                    ->withoutOverlapping()
+                    ->runInBackground();
+            });
         }
     }
 }

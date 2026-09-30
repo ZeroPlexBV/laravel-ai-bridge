@@ -12,6 +12,8 @@ Specification for the WebSocket protocol between `@tetrixdev/ai-bridge` (npm, cl
 - [Local Calls](#local-calls)
 - [Subscription Usage](#subscription-usage)
 - [AI Requests](#ai-requests)
+- [Turn Input](#turn-input)
+- [Streamed uploads and downloads](#streamed-uploads-and-downloads)
 - [Conversation Continuity](#conversation-continuity)
 - [Streaming Events](#streaming-events)
 - [Tool Calls](#tool-calls)
@@ -175,6 +177,19 @@ Each provider entry may include a `models` array listing available models (popul
 - `gemini --version` → Gemini availability
 
 If a CLI is not installed, `available` is `false` and the server won't route requests to it.
+
+**What else `hello` says about the bridge**, all optional and all recorded by this package (`ConnectionStatus::for()` → `bridge_version`, `attachment_limits`, `capabilities`; cached on the connection as `last_bridge`):
+
+| Field | Since | Meaning |
+|---|---|---|
+| `bridge_version` | always | The ai-bridge release the machine runs, e.g. `0.21.0`. Not the protocol `version` (`0.1`). Compare it with the release you pin to tell a person their machine is behind. |
+| `attachment_limits` | 0.16 | `{max_file_bytes, max_total_bytes, max_count}`, bytes. The caps the bridge enforces, so a server can refuse before the upload. |
+| `turn_input` | 0.19 | `true`: understands `options.accepts_input` and `turn_input` (each turn still confirms with `input_open`). |
+| `file_uploads` | 0.18 | `true`: accepts `upload_offer`. See [Streamed uploads](#streamed-uploads-and-downloads). |
+| `file_downloads` | 0.18 | `true`: answers `file_read`. |
+| `app_backends` | 0.21 | `true`: understands `app_call` (Engram app backends; not used by this package). |
+
+Absent means the bridge predates the field: test the capability, not the version.
 
 **`supports_tools`** indicates whether the provider can invoke server-defined bridge tools. All three currently supported providers (Codex, Claude, Gemini) report `true`. Even CLIs without native tool calling can use bridge tools: the bridge injects them as Bash wrapper scripts on the CLI's `PATH` that route calls back through the WebSocket. For Codex this additionally requires running `codex exec` with a workspace-write sandbox and network access so the wrapper scripts' loopback callback succeeds — the bridge handles this automatically. Per-provider capability values are reported dynamically in the `hello` handshake; this spec documents the format, not fixed values. See [Tool Calls](#tool-calls).
 
@@ -617,6 +632,11 @@ know the frame, and the server would have to wait out a timeout to find out whic
 - **`unsupported`** — this CLI has no notion of a subscription allowance.
 - **`no_credential`** — it has one, but nobody is signed in, or the sign-in has expired.
 - **`failed`** — it tried and could not.
+- **`rate_limited`** — the vendor refused for being asked too often (HTTP 429). May carry
+  **`retry_after`**: whole seconds until it is worth asking again (from the vendor's
+  `Retry-After` header when it sent one). This server accepts it and passes both on
+  (`retry_after` bounded to a day); ai-bridge 0.21 does not send it yet and reports a 429 as
+  `failed`.
 
 **Money is deliberately absent.** The vendor's answer may also carry spend and credit
 balances; they are dropped here rather than forwarded, so an allowance figure cannot be
@@ -669,6 +689,8 @@ When the server needs an AI response (triggered by a user message in the browser
 **`history`**: Prior conversation turns (`{role, content}`). Included only when `cli_session_id` is `null`, so a fresh CLI session can be seeded with context. Omitted when resuming — the resumed session already holds its history.
 
 **`options`**: Provider-agnostic generation options. The bridge maps these to CLI-specific flags where supported.
+
+**`options.accepts_input`**: `true` to keep the CLI's input open for the whole turn, so a message can reach the assistant while the turn runs. Opt-in, per turn; Claude only. See [Turn Input](#turn-input). Only `true` means yes; absent, `null` and `false` all mean the turn runs as every turn did before.
 
 #### Additive field: `working_dir`
 
@@ -775,6 +797,8 @@ A key the bridge does not allow is **dropped and named in the ack**, not refused
 | `append` | Bridge addendum, then the project's text. The expected way to add project-specific rules. |
 | `replace` | The project's text instead of the bridge addendum. |
 
+From Laravel, pass it as the `bridge_prompt` option of `AiBridge::stream()` / `streamConversation()` (server-side only; the HTTP stream endpoint never accepts it from a browser). `AiRequestPayload` applies the same validation as the bridge and throws `InvalidArgumentException` before anything is sent; `default` is sent as absent. For Claude, `system_prompt` goes on `--system-prompt` (replacing the CLI's own default prompt) and the resolved addendum on `--append-system-prompt`, re-sent every turn.
+
 Validation is strict, and a contradictory spec is refused with `bridge_prompt_invalid` rather than guessed at — a chat whose instructions are not what either side believes is worse than a refused turn:
 
 | Mode | Text | Result |
@@ -813,6 +837,8 @@ The bridge acknowledges receipt before starting the CLI process, echoing the ses
 
 A bridge that predates this field omits it entirely, so a server must treat absence as *unknown* — never as *defaults applied*.
 
+**`input_open`**: Present, and `true`, when this turn runs with its input open — the server asked with `options.accepts_input` and the bridge will take [`turn_input`](#server--bridge-turn_input) for it while it runs. Absent otherwise, and absent from any bridge that predates the field. A server must read absence as "input is not open" and hold a message typed mid-turn as it always did; that is what makes the option safe to send to every bridge.
+
 ### Server → Bridge: `cancel`
 
 Stop a turn that is running, and leave a session that can be resumed.
@@ -848,6 +874,154 @@ The turn named by a `cancel` has stopped.
 **Sent after the turn's own events, not on receipt of the cancel.** The CLI is asked to stop rather than shot, so it commonly writes a little more on the way out; a server treats `cancelled` as terminal, so a reply that went out first would cut off the partial answer that stopping cleanly exists to keep.
 
 Sent only in response to a `cancel`. A turn ended by one of the bridge's own bounds reports a timeout on the `error` event and ends with `done`, like any other turn.
+
+**`pending_inputs`**: On a turn that ran with its input open, the `message_id` of every [`turn_input`](#server--bridge-turn_input) the bridge accepted and the assistant never read (no `user_input` came for it), oldest first. They are dropped with the turn. Always present on such a turn, empty when nothing was pending; absent on every other turn.
+
+```json
+{
+  "type": "cancelled",
+  "request_id": "req_abc123",
+  "pending_inputs": ["msg_42"]
+}
+```
+
+---
+
+## Turn Input
+
+A message a person types while a turn is still running reaches the assistant **in that turn**, instead of waiting for everything to finish. That matters most after the main assistant has answered while helpers or background commands it started are still working — exactly when someone is likely to ask something else.
+
+The whole mode is opt-in, per turn: the server asks with `options.accepts_input: true`, and the bridge confirms with `input_open: true` on the `ai_request_ack`. Without that confirmation nothing about the turn differs from one that did not ask, and a server holds the message until the turn ends, as before. That is also the way back if the mode misbehaves: stop asking.
+
+What changes for a turn with its input open (Claude only):
+
+- **The CLI's input stays open** for the whole turn, and the opening message is written to it as the first frame.
+- **Background tasks are on.** Every other turn keeps them off. Background work may occasionally die with the turn; the main assistant stays reachable, is told when a task failed or stopped, can read its output and can run it again.
+- **The turn ends when everything it started has ended**, not at the first result: see [The ending rule](#the-ending-rule). It is not a long-lived process per conversation.
+- **Stopping a turn stops everything it started**, background commands included.
+- The bridge reports whether the main assistant is working or free ([`main_state`](#main_state)) and when it took each message in ([`user_input`](#user_input)).
+
+**Nothing promises the assistant changes course.** A message is read at the assistant's next step; what it does with it is up to it.
+
+### Server → Bridge: `turn_input`
+
+A message for a turn that is still running. Only for a turn whose `ai_request_ack` said `input_open: true`.
+
+```json
+{
+  "type": "turn_input",
+  "request_id": "req_abc123",
+  "message_id": "msg_42",
+  "content": "Also check the tests while you are at it."
+}
+```
+
+**`message_id`**: The server's own id for the message, echoed on the ack, on `user_input` and in `pending_inputs`.
+
+**`content`**: What the person wrote. A non-empty string; nothing else is accepted.
+
+### Bridge → Server: `turn_input_ack`
+
+The bridge answers every `turn_input` straight away.
+
+```json
+{ "type": "turn_input_ack", "request_id": "req_abc123", "message_id": "msg_42", "status": "accepted" }
+{ "type": "turn_input_ack", "request_id": "req_abc123", "message_id": "msg_43", "status": "rejected", "reason": "turn_not_running" }
+```
+
+- **`accepted`**: the message was written to the running CLI and is queued there. The assistant reads it at its next step; `user_input` says when.
+- **`rejected`**: nothing was written. `reason` is present only on a rejection:
+  - `turn_not_running` — no turn by that id is running (it never existed, or it ended and its terminal frame went out ahead of this ack). The server starts a normal new turn with the message.
+  - `turn_ending` (bridge 0.21+) — the turn is still running but will take nothing more: its input was closed, or it is being stopped (a cancel, a bound, a dropped connection). Its CLI may still be writing the session, so the server **holds** the message until this request's terminal frame and only then starts a new turn with it. Starting one sooner runs a second `--resume` of the session while the first still writes it. (Before 0.21 this case was reported as `turn_not_running`.)
+  - `input_not_open` — the turn is running but cannot take it (it was not started with `accepts_input`, or the CLI has not started yet). The server holds it until the turn is over.
+
+**Every accepted message ends in exactly one state**: read (a `user_input` names it), returned (a `pending_inputs` list names it: on `cancelled`, on `done` after a timeout or crash, and on the `bridge_disconnected` error the bridge replays after a dropped connection), or unknown (an ending with no list). This package passes `pending_inputs` through on all three; for a turn it had already ended itself (failed when the socket closed, or stopped through the abort flag, whose `cancelled` from the bridge arrives after the turn is over here), the list lands in the turn's stream metadata (`pending_inputs`) and fires `TurnInputsReturned`.
+
+**`content` is text only.** The bridge drops a frame whose `content` is not a non-empty string without answering it. This package reduces a list of content blocks to its text before sending, and refuses one with no text.
+
+A bridge that predates turn input never answers — but it also never confirms `input_open`, so a server that waits for that confirmation never sends it a `turn_input` at all.
+
+#### `user_input`
+
+Stream event: the assistant has just taken in a message the bridge accepted as `turn_input`.
+
+```json
+{
+  "type": "stream",
+  "request_id": "req_abc123",
+  "event": "user_input",
+  "data": { "message_id": "msg_42" }
+}
+```
+
+Emitted when the CLI echoes the message back, which it does at the moment it dequeues it, so **everything after this event in the stream is the assistant's response to it** (or later). Messages are read in the order they were accepted. Place the message in the conversation here, not where it was sent.
+
+#### `main_state`
+
+Stream event, on turns that run with their input open: whether the **main** assistant (not a helper) is working or free.
+
+```json
+{
+  "type": "stream",
+  "request_id": "req_abc123",
+  "event": "main_state",
+  "data": { "state": "idle" }
+}
+```
+
+- `working` right after the turn starts (once, right after the ack) and whenever the main assistant writes again after having been free.
+- `idle` when its message ends while the turn goes on — a helper or a background command is still running.
+- Never sent twice in a row with the same state.
+
+A message sent while it is `idle` is read straight away; one sent while it is `working` is read after its current step. Informational and non-terminal: `idle` does not mean the turn is over, `done` does.
+
+### The ending rule
+
+A turn with its input open ends — the bridge closes the CLI's input and sends `done` — only when **all three** hold:
+
+1. the main assistant is idle,
+2. **no** task it spawned is still running — a helper, a background command, or any other `task_type` (tracked from the [`task`](#task) events), and
+3. every accepted `turn_input` has been read.
+
+A CLI `result` before that is **not** the end of the turn: the bridge emits `main_state {state:'idle'}` and keeps reading. In particular, with the input open the CLI reports an early result, unstamped, as soon as the main message ends while a background command runs; that is not the answer. Writes and the close decision run on one event loop, so an accepted message can never be lost to a close in between.
+
+`done` then carries the last result, with `usage` and `num_turns` summed over the turn. If the turn ends with accepted messages the assistant never read (a timeout, a crash), `done` lists them in `pending_inputs`; a stopped turn lists them on `cancelled`.
+
+The bridge's silence and wall-clock bounds are unchanged; accepted inputs and `main_state` count as activity. The silence bound is the backstop for a background command that never ends: the turn dies, the next turn is told, and the command's output stays on disk.
+
+---
+
+## Streamed uploads and downloads
+
+Bridge **0.18+** (`hello.file_uploads`, `hello.file_downloads`). A file a person picks in a chat goes straight to the machine, and a file the machine holds comes straight back, **without the server keeping a copy** and **without the bytes on the WebSocket** (frames are capped far below a file). The socket carries small control frames; the bytes travel over one HTTP request from the machine to a **one-time URL on the origin it connected to** (the bridge refuses any other origin, and plain `http://` off loopback), authenticated with its own connection token.
+
+In this package the one-time URL is the public WebSocket URL plus `?transfer=<id>`, answered by the serve process, which pipes the bytes to and from the PHP-FPM worker holding the browser's request. Application API: [`docs/file-transfers.md`](docs/file-transfers.md).
+
+### Upload
+
+```json
+{ "type": "upload_offer", "id": "u1", "url": "https://studio.example/api/ai-bridge/ws?transfer=u1",
+  "working_dir": "/home/dev/repo", "name": "report.pdf", "mime_type": "application/pdf", "size": 48213 }
+```
+
+1. `upload_offer` (server → bridge). `working_dir` is checked like a turn's `working_dir` (inside an `--allow-dir` root); `size` is exact and at most the bridge's `max_file_bytes`.
+2. The bridge **GETs** `url`. The server streams exactly `size` bytes as they arrive from the browser, counting and hashing them.
+3. `upload_sent` (server → bridge) once every byte has passed: `{ "type": "upload_sent", "id": "u1", "size": 48213, "sha256": "…" }`. The bridge compares with what it received.
+4. `upload_done` (bridge → server), exactly once per offer, possibly before the bytes (a refusal):
+   - `{ "type": "upload_done", "id": "u1", "ok": true, "path": "/home/dev/repo/file-uploads/report.pdf", "name": "report.pdf", "size": 48213, "sha256": "…", "file_id": "…" }`
+   - `{ "type": "upload_done", "id": "u1", "ok": false, "code": "working_dir_not_allowed" | "upload_refused" | "upload_too_large" | "upload_failed" | "upload_cancelled" | …, "error": "…" }`
+5. `upload_abort` (server → bridge) `{ "type": "upload_abort", "id": "u1", "reason": "…" }` when the server gives up (browser gone, stall, mismatch), so the partial file goes at once.
+
+The file is written as a hidden `.part` and named only after the digests agree, in `<working_dir>/file-uploads/` (created with a `.gitignore` of `*`), `-2`, `-3` appended on collision. `file_id` is what the file is asked for by later.
+
+### Download
+
+1. `file_read` (server → bridge) `{ "type": "file_read", "id": "d1", "file_id": "…", "url": "…?transfer=d1", "range": "bytes=0-1023", "head": true }` (`range` and `head` optional). The bridge serves **only files it recorded itself** (received uploads; files the assistant handed back in `device` mode), by the id it minted, never by path.
+2. `file_read_result` (bridge → server): `{ "ok": true, "size": 48213, "status": 200 | 206 | 416, "start": 0, "end": 1023 }` or `{ "ok": false, "code": "file_unknown" | "file_gone" | "file_changed" | "file_refused" | "file_failed", "error": "…" }`.
+3. Unless it was a HEAD, a 416 or an empty range, the bridge **POSTs** the bytes (`application/octet-stream`, streamed) to `url`.
+4. `file_read_cancel` (server → bridge) `{ "type": "file_read_cancel", "id": "d1" }` when the reader goes away.
+
+`attachment_read` (a download by path) is refused by bridges from 0.18 and is not used by this package.
 
 ---
 
@@ -986,6 +1160,33 @@ For a server-resolved tool the block is a shadow of the `tool_call` frame; rende
 
 `tool_call_id` pairs the call to its [`tool_result`](#tool_result).
 
+##### Which helper a block belongs to: `parent_tool_use_id`
+
+When the assistant hands work to a **helper** (a sub-agent — Claude's `Agent` tool), the helper's own blocks and results arrive in the same stream, interleaved with the main assistant's. `parent_tool_use_id` says which is which:
+
+```json
+{
+  "type": "stream",
+  "request_id": "req_abc123",
+  "event": "block_start",
+  "data": {
+    "block_index": 3,
+    "block_type": "tool_call",
+    "tool_name": "Bash",
+    "tool_call_id": "toolu_01Qm…",
+    "parent_tool_use_id": "toolu_01A4…"
+  }
+}
+```
+
+- **Absent means the main assistant** — never `null`, never an empty string. That is what every block meant before the field existed, so a consumer that ignores it sees exactly the stream it always did.
+- **Present** on a helper's `text`, `thinking` and `tool_call` blocks alike, and on the `tool_result` of every call the helper made. Its value is the `tool_call_id` of the `Agent` block that spawned the helper, and the `tool_use_id` of that helper's [`task`](#task) events — so a consumer can nest the helper's calls under it by identity, even when they arrive long after it started or after the main assistant has finished its reply.
+- A helper's text is the helper's, not the main assistant's answer. A consumer that shows only helper summaries (from `task` `finished`) and drops helper prose is using the field as intended.
+- A helper of a helper is marked with **its own** spawning call. Its `task` `started` carries `spawn_depth: 2`.
+- `block_index` stays one sequence across the whole turn, main assistant and helpers together.
+
+Carried by the Claude adapter. The Codex and Gemini adapters have no helper concept to report and never send it.
+
 #### `block_delta`
 
 Incremental content within an open block.
@@ -1090,6 +1291,8 @@ What a tool returned. Emitted for **both** kinds of tool call:
 
 `tool_call_id` is the same id carried on the matching `tool_call` block's `block_start`, so a consumer can pair a result to the call that produced it.
 
+`parent_tool_use_id` is present when the call was a helper's, exactly as on the call's `block_start` (see [Which helper a block belongs to](#which-helper-a-block-belongs-to-parent_tool_use_id)), and rides on every chunk of a chunked result.
+
 `is_error` is the authoritative failure signal, and is **absent when the provider did not report one** — absent never means "succeeded". Do not infer failure from the text: a tool legitimately printing `Error: no matches` is indistinguishable from one that failed. (For historical reasons the Codex and Gemini adapters additionally prefix `Error: ` onto a failed result; that prefix is not a substitute for the field.)
 
 ##### Chunked results
@@ -1173,6 +1376,66 @@ The provider's own rate-limit status, forwarded as the CLI reports it. **Informa
 
 `info` is the provider's own shape, passed through unchanged rather than normalised — its contents differ per provider and are expected to change. Carried so a server can show what the operator's CLI already knows, instead of discovering a limit by hitting it.
 
+#### `task`
+
+The life of a **helper** the CLI runs for the main assistant: a sub-agent, or a background shell command. **Informational and non-terminal**, like `rate_limit`. Blocks say what a helper *did*; this says what it *is* — its kind, whether the main assistant waits for it, what it has spent, whether it is still alive, and how it ended.
+
+```json
+{
+  "type": "stream",
+  "request_id": "req_abc123",
+  "event": "task",
+  "data": {
+    "phase": "started",
+    "task_id": "af2e05936428f6e8e",
+    "tool_use_id": "toolu_018UGfE8HLBqgFmXMDrzDgD5",
+    "task_type": "local_agent",
+    "subagent_type": "general-purpose",
+    "description": "Run the migration dry-run",
+    "spawn_depth": 1,
+    "is_backgrounded": true
+  }
+}
+```
+
+`phase` is a string, one of:
+
+| Phase | When | Fields beside `task_id` and `tool_use_id` |
+|---|---|---|
+| `started` | The helper was started. | `task_type`, `subagent_type`, `description`, `spawn_depth`, `is_backgrounded` |
+| `progress` | The helper moved on to another step. | `description` (what it is doing now), `subagent_type`, `last_tool_name`, `usage` |
+| `heartbeat` | Every ~30 s while the main assistant is **blocked waiting** on the helper. | `elapsed_seconds` |
+| `updated` | The helper's state changed. | `status` |
+| `finished` | The helper ended. | `status`, `summary`, `usage`, `subagent_type`, `description` |
+
+```json
+{ "phase": "progress",  "task_id": "af2e…", "tool_use_id": "toolu_018U…", "subagent_type": "general-purpose",
+  "description": "Running php artisan migrate --pretend", "last_tool_name": "Bash",
+  "usage": { "total_tokens": 23921, "tool_uses": 1, "duration_ms": 2976 } }
+{ "phase": "heartbeat", "task_id": "ad5d…", "tool_use_id": "toolu_01A4…", "elapsed_seconds": 60 }
+{ "phase": "updated",   "task_id": "af2e…", "tool_use_id": "toolu_018U…", "status": "completed" }
+{ "phase": "finished",  "task_id": "af2e…", "tool_use_id": "toolu_018U…", "status": "completed",
+  "summary": "The dry-run lists 3 pending migrations…",
+  "usage": { "total_tokens": 24742, "tool_uses": 1, "duration_ms": 45887 } }
+```
+
+- **`tool_use_id` is the key to group by.** It is the `tool_call_id` of the block that spawned the helper, and the `parent_tool_use_id` on the helper's own blocks. The CLI omits it on some phases; the bridge fills it in from the task's `started`. `task_id` is the CLI's own id and is present on every phase.
+- **Every task a consumer sees was introduced by a `started`** in the same turn. On a resumed session the CLI first reports on work an *earlier* turn left running; those reports are not forwarded, because they are not helpers of this turn.
+- **A helper is finished only when `finished` says so.** Not when its spawning call's `tool_result` arrives, and not when the main assistant's reply ends: a background helper's spawning call returns at once ("launched"), and the helper keeps working — and keeps sending `task` events and blocks — after the main assistant has written its whole answer. `done` still comes last.
+- **The end of the request ends every task.** `done`, a stream `error`, a top-level `error`, or `cancelled` for this `request_id` ends every task of that request, whatever phase it last reported. `finished` is sent only for a helper that actually finished: a stop, a silence or request timeout, a crashed CLI, a dropped connection, or a `result` while a background shell was still running send no `finished` for what was still open. A consumer that waits for `finished` alone keeps a helper spinning forever under a stopped answer. **Close them all yourself on the terminal frame**, keep the last `status` each reported, and show them as ended with the request, not as `completed`. This package does not synthesise `finished` events.
+- **`is_backgrounded`** says whether the main assistant waits. `false`: it is blocked inside the spawning call until the helper finishes, and `heartbeat`s arrive meanwhile. `true`: it is free to reply while the helper works; the CLI sends no heartbeat for such a helper, so `progress` and the helper's own blocks are its only signs of life.
+- **`task_type`** is the CLI's word for what the task is: `local_agent` for a helper, `local_bash` for a shell command run as a task — including one a helper runs for itself, whose `tool_use_id` is then the helper's call, not the main assistant's. Show `local_agent` tasks as helpers; do not assume the list is closed.
+- **`elapsed_seconds`** comes from the CLI's own clock, counted from the spawning call. Two buffers can sit between the bridge and a browser, and neither preserves timing, so compute nothing from arrival times.
+- **`status`** is the CLI's own word — `completed`, `failed`, `stopped`, `killed` have been seen.
+- **`usage`** is the helper's running total: `total_tokens`, `tool_uses`, `duration_ms`, each present when the CLI reported it.
+- **`summary`** is the helper's closing report, meant to be shown. It is bounded to **8 KB** (JSON-encoded), cut on a character boundary and ending in a `…[truncated by the bridge: showing N of M characters]` marker when cut. `description` has the same bound.
+- **The helper's instructions are never sent.** The CLI reports the helper's whole prompt at `started`; it is the largest frame in the family, and a non-terminal frame over the frame cap is dropped outright rather than trimmed, so forwarding it would risk losing the event. `description` is what a person reads. Local file paths the CLI reports (the helper's output file) are not forwarded either.
+- A `task` event counts as activity for the bridge's silence bound, like every other event. A helper busy in one long step keeps a turn alive through its heartbeats.
+
+Carried by the Claude adapter; Codex and Gemini never send it. A consumer that does not know the event ignores it.
+
+On a turn with its input open, two more stream events can appear: [`user_input`](#user_input) and [`main_state`](#main_state), described under [Turn Input](#turn-input).
+
 #### `attachment`
 
 A file the assistant produced and chose to hand back. Emitted when the model calls the bridge-owned `bridge__attach_file` tool and the upload succeeded.
@@ -1244,6 +1507,8 @@ Everything beside `usage` is likewise provider-reported and optional. **Absent m
 | `num_turns` | How many assistant turns the CLI took internally to answer. |
 | `subtype` | How the CLI itself classified the end of the turn — `success`, `error_during_execution`, `error_max_turns`. Worth showing when a turn arrives with no text at all: `stop_reason` is null on several of those paths, so this is the only thing that says what happened. |
 | `permission_denials` | Tool calls the CLI's own permission system refused. In `isolated` this is the record of what the posture actually stopped — an empty answer with three denials reads very differently from an empty answer with none. |
+| `subagent_stats` | What the turn spent on helpers, in the CLI's own shape: `spawned`, `completed`, `failed`, `started_in_background`, `max_depth`, `by_type{}`, `killed{}`, `refused{}` and so on. Passed through unchanged. Tokens per helper come from the [`task`](#task) events. |
+| `pending_inputs` | On a turn that ran with its input open and ended with accepted [`turn_input`](#turn-input) messages the assistant never read (a timeout, a crash): their `message_id`s, oldest first. Absent when there were none, which is every turn that ended normally. |
 
 `cli_session_id` is the CLI session this turn ran under — the id created on a fresh start, or the id resumed. The server persists it on the conversation so the next turn can resume. Absent/`null` when no session id was produced.
 
@@ -1566,11 +1831,15 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `stream` (block_delta) | Incremental content within a block |
 | `stream` (block_stop) | Closing a content block |
 | `stream` (tool_result) | Acknowledging tool result received |
+| `stream` (task) | A helper started, progressed, is still alive, or ended |
 | `stream` (done) | Response complete |
 | `stream` (error) | Error during streaming |
 | `tool_call` | CLI invoked a server-side tool (via callback) |
 | `cancelled` | A turn stopped because the server asked |
 | `local_result` | Answering a `local_call`, run or refused |
+| `turn_input_ack` | Answering a `turn_input` |
+| `upload_done` | The one answer to an `upload_offer` |
+| `file_read_result` | Answering a `file_read` |
 | `error` | Request-level error (non-streaming) |
 
 ### Server → Bridge
@@ -1584,6 +1853,9 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `tool_resolve` | Returning tool execution result |
 | `tool_error` | Tool execution failed |
 | `local_call` | Asking the bridge to run one tool on this machine |
+| `turn_input` | A message for a turn that is still running |
+| `upload_offer` / `upload_sent` / `upload_abort` | A person's file on its way to the machine |
+| `file_read` / `file_read_cancel` | Asking for a file the machine recorded |
 
 ---
 
@@ -1627,6 +1899,8 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 
 - `0.x` — Pre-release, breaking changes allowed between minor versions
 - `1.x` — Stable, semantic versioning applies
+
+**Helper activity does not bump the version either.** `parent_tool_use_id` on `block_start` and `tool_result`, the `task` stream event and `done.subagent_stats` are additive: absent means what it always meant, and a consumer ignores an event it does not know.
 
 **Workspaces, attachments and `workspace` isolation do not bump the version.** They stay on `0.1`, deliberately. Every one of them is optional in both directions — `hello.workspaces`, `ai_request.working_dir`, `ai_request.attachments`, the `attachment` stream event and the `workspace` value of `cli_isolation` are all additive, and both ends already ignore fields they do not recognise. Only the major number is enforced, so a bump would refuse every bridge already installed in exchange for nothing.
 

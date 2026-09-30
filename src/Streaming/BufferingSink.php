@@ -42,6 +42,14 @@ final class BufferingSink
         // null on several of those paths, so without it the only thing a chat
         // can say about an empty answer is nothing.
         'subtype',
+        // What the turn spent on helpers, in the CLI's own shape. Counts only
+        // — spawned, completed, failed, by type — nothing a browser should not
+        // see, and the only place a chat can state a turn's helper totals.
+        'subagent_stats',
+        // Messages delivered mid-turn that the assistant never read, on a turn
+        // that ended without reading them (a timeout, a crash). Ids only, the
+        // application's own, so a chat can offer them again.
+        'pending_inputs',
     ];
 
     /**
@@ -108,13 +116,17 @@ final class BufferingSink
         // Without this the browser could never see a tool result at all: the
         // bridge sends them, StreamHandler dispatches them, and the SSE buffer
         // simply had no handler, so they stopped here.
-        $handler->onToolResult(function (string $toolCallId, mixed $result, ?bool $isError = null) use ($append): void {
+        $handler->onToolResult(function (string $toolCallId, mixed $result, ?bool $isError = null, ?string $parentToolUseId = null) use ($append): void {
             // `result` is sent even when null — dropping the key leaves the
             // browser waiting for a result that has already arrived, and the
             // call renders as still running for ever.
             $data = ['tool_call_id' => $toolCallId, 'result' => $result];
             if ($isError !== null) {
                 $data['is_error'] = $isError;
+            }
+            // Absent for the main assistant, as on the wire.
+            if ($parentToolUseId !== null) {
+                $data['parent_tool_use_id'] = $parentToolUseId;
             }
             $append(MessageTypes::TOOL_RESULT, $data);
         });
@@ -127,6 +139,26 @@ final class BufferingSink
             $append(MessageTypes::ATTACHMENT, $attachment);
         });
 
+        // A helper's life: started, progress, heartbeat, updated, finished.
+        // Buffered whole, so a browser that reconnects mid-turn replays every
+        // helper's state — including one still running after the main
+        // assistant's reply has ended.
+        $handler->onTask(function (array $task) use ($append): void {
+            $append(MessageTypes::TASK, $task);
+        });
+
+        // A message delivered mid-turn was read, and whether the main
+        // assistant is working or free. Buffered in order among the blocks, so
+        // a browser replaying by index places the message where the CLI read
+        // it and knows, on reconnect, whether a new one would be read at once.
+        $handler->onUserInput(function (array $data) use ($append): void {
+            $append(MessageTypes::USER_INPUT, $data);
+        });
+
+        $handler->onMainState(function (array $data) use ($append): void {
+            $append(MessageTypes::MAIN_STATE, $data);
+        });
+
         // Terminal events both write the event AND flip the buffer status, so
         // the SSE tail and the status endpoint can tell the turn is finished.
         $handler->onDone(function (?array $usage, array $meta = []) use ($append, $store, $rid): void {
@@ -134,13 +166,13 @@ final class BufferingSink
             self::completeQuietly($store, $rid, 'completed');
         });
 
-        $handler->onError(function (string $code, string $errorMessage) use ($append, $store, $rid): void {
-            $append(MessageTypes::ERROR, ['code' => $code, 'message' => $errorMessage]);
+        $handler->onError(function (string $code, string $errorMessage, array $meta = []) use ($append, $store, $rid): void {
+            $append(MessageTypes::ERROR, ['code' => $code, 'message' => $errorMessage] + self::publicCancelledMeta($meta));
             self::completeQuietly($store, $rid, 'failed');
         });
 
-        $handler->onCancelled(function (string $reason) use ($append, $store, $rid): void {
-            $append(MessageTypes::CANCELLED, ['reason' => $reason]);
+        $handler->onCancelled(function (string $reason, array $meta = []) use ($append, $store, $rid): void {
+            $append(MessageTypes::CANCELLED, ['reason' => $reason] + self::publicCancelledMeta($meta));
             self::completeQuietly($store, $rid, 'cancelled');
         });
     }
@@ -164,11 +196,24 @@ final class BufferingSink
         }
     }
     /**
-     * Reduce the provider's turn metadata to the fields a browser may see.
+     * What a browser is told beside a cancellation.
+     *
+     * Only `pending_inputs`: the ids of messages delivered mid-turn that the
+     * CLI never read, so a chat can offer them again instead of showing them
+     * as answered. Absent when there were none to report.
+     *
+     * Public for the same reason as publicDoneMeta().
      *
      * @param  array<string, mixed>  $meta
      * @return array<string, mixed>
      */
+    public static function publicCancelledMeta(array $meta): array
+    {
+        $pending = $meta['pending_inputs'] ?? null;
+
+        return is_array($pending) && $pending !== [] ? ['pending_inputs' => $pending] : [];
+    }
+
     /**
      * Reduce the provider's turn metadata to the fields a browser may see.
      *

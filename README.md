@@ -1053,6 +1053,73 @@ A result too large for one WebSocket frame arrives in chunks and is reassembled
 before this callback runs, so you always receive it whole. See `PROTOCOL.md`
 for the size bounds that apply on the way in and on the way to the database.
 
+### Helpers (sub-agents)
+
+When the assistant hands work to a helper — Claude's `Agent` tool — the
+helper's blocks and results arrive in the same stream as the main assistant's.
+`parent_tool_use_id` says which is which: it is on a helper's `block_start`
+data and is the fourth argument of `onToolResult`, holding the `tool_call_id`
+of the call that spawned the helper. Absent (null) means the main assistant,
+so a consumer that ignores it sees what it always saw. The recorder stores it
+on each helper `tool_call` block, so a reload can still nest the call.
+
+`onTask` reports each helper's life, with the bridge's data passed through
+whole — `phase` (`started`, `progress`, `heartbeat`, `updated`, `finished`),
+`task_id`, `tool_use_id` (the key to group by) and whatever that phase carries:
+
+```php
+$stream->onToolResult(function (string $callId, mixed $result, ?bool $isError, ?string $parentToolUseId) {
+    // $parentToolUseId: null for the main assistant's own calls.
+});
+
+$stream->onTask(function (array $task) {
+    // A background helper (`is_backgrounded: true` at `started`) keeps
+    // reporting after the main assistant has finished its reply. It is done
+    // only when a `finished` phase says so — never when its spawning call's
+    // tool_result arrives, which for a background helper is at once.
+    if ($task['phase'] === 'finished') {
+        Log::info('helper finished', [
+            'helper' => $task['tool_use_id'] ?? null,
+            'status' => $task['status'] ?? null,
+            'tokens' => $task['usage']['total_tokens'] ?? null,
+        ]);
+    }
+});
+```
+
+The turn's helper totals arrive on `done` as `$meta['subagent_stats']`, in the
+CLI's own shape. Both reach a browser through the buffered SSE stream. See
+`PROTOCOL.md` for every field.
+
+### A message sent while a turn runs
+
+A bridge turn can keep its input open, so a message the person types while it
+runs — typically after the assistant has answered while its helpers are still
+working — reaches the assistant in that turn instead of waiting for all of it
+to end. Opt in per turn with `accepts_input` (server-side only; background
+tasks are on for such a turn):
+
+```php
+$requestId = AiBridge::startConversationStream($conversation, $message, ['accepts_input' => true]);
+
+// Later, from another request, when the person sends something else:
+if (AiBridge::inputOpen($requestId)) {
+    $result = AiBridge::sendTurnInput($requestId, $clientMessageId, $text);
+    // $result->status: 'accepted' | 'rejected'
+    // $result->reason: 'turn_not_running' (start a new turn with it),
+    //                  or anything else (hold it until the turn ends)
+}
+```
+
+`inputOpen()` is true only once the bridge has confirmed the mode on its ack,
+and only while the turn runs; an older bridge never confirms it. Accepted means
+queued, not read: the stream carries `user_input` (`message_id`) at the moment
+the assistant takes the message in, and `main_state` (`working` / `idle`) says
+whether a message now is read straight away or after the current step. Both
+are buffered and replay by index (`onUserInput`, `onMainState` on a
+`StreamHandler`). A stopped turn lists the ids it never read in
+`pending_inputs` on `cancelled`. See `PROTOCOL.md`, "Turn Input".
+
 ### What the turn cost
 
 `onDone` receives a second argument with everything the provider reported
@@ -1228,6 +1295,10 @@ Browser <--SSE--> Laravel App <--WebSocket--> Bridge (local) --> CLI tools
 2. The serve process sends the request over WebSocket to the user's local bridge; events come back asynchronously into the same serve process.
 3. Each event is written to the per-turn buffer (and the assistant message is persisted at terminal).
 4. Browser tails the buffer over SSE, same as BYOK/Managed — uniform shape across modes.
+
+## Files on the machine
+
+Bridge 0.18+ receives files a person picks in a chat and hands back files it holds, streamed through the serve process and never stored on the server: `MachineFiles::upload()` / `MachineFiles::download()`. See [docs/file-transfers.md](docs/file-transfers.md).
 
 ## Protocol
 

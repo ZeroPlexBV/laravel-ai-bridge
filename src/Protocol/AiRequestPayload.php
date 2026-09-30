@@ -22,6 +22,12 @@ use InvalidArgumentException;
  */
 final class AiRequestPayload
 {
+    /** The `bridge_prompt.mode` values the bridge accepts (0.12.0+). */
+    public const BRIDGE_PROMPT_MODES = ['default', 'off', 'append', 'replace'];
+
+    /** The bridge's cap on `bridge_prompt.text`, in bytes (MAX_BRIDGE_PROMPT_BYTES). */
+    public const MAX_BRIDGE_PROMPT_BYTES = 8192;
+
     /**
      * Build the wire payload.
      *
@@ -42,6 +48,7 @@ final class AiRequestPayload
      *     tools?: array<int, mixed>|null,
      *     working_dir?: string|null,
      *     attachments?: array<int, array<string, mixed>>|null,
+     *     bridge_prompt?: array{mode?: string|null, text?: string|null}|null,
      * }  $input
      * @return array<string, mixed>
      */
@@ -68,6 +75,13 @@ final class AiRequestPayload
             is_array($input['options'] ?? null) ? $input['options'] : [],
             static fn ($value) => $value !== null,
         );
+        // Opt-in, and only ever `true` on the wire. It switches the turn into
+        // a mode where the CLI's input stays open and background tasks are on,
+        // so a stray truthy value ("1", "yes") from a relay body must not be
+        // what turns it on, and `false` means the same as absent.
+        if (array_key_exists('accepts_input', $options) && $options['accepts_input'] !== true) {
+            unset($options['accepts_input']);
+        }
         if (! empty($options)) {
             $payload['options'] = $options;
         }
@@ -103,7 +117,77 @@ final class AiRequestPayload
             $payload['attachments'] = $attachments;
         }
 
+        $bridgePrompt = self::normaliseBridgePrompt($input['bridge_prompt'] ?? null);
+        if ($bridgePrompt !== null) {
+            $payload['bridge_prompt'] = $bridgePrompt;
+        }
+
         return $payload;
+    }
+
+    /**
+     * The bridge's own prompt addendum, as the request wants it handled.
+     *
+     * Beside `system_prompt`, never instead of it. For Claude, `system_prompt`
+     * goes on `--system-prompt` and replaces the CLI's default prompt; the
+     * bridge's addendum (how the session runs: one process per turn, what that
+     * means for background work, and on an `accepts_input` turn how messages
+     * arrive mid-turn) goes on `--append-system-prompt`. `bridge_prompt`
+     * decides what that second part is:
+     *
+     *  - `default` (or absent): the bridge's addendum. No text allowed.
+     *  - `off`: nothing appended. No text allowed.
+     *  - `append`: the bridge's addendum, then `text`. Text required.
+     *  - `replace`: `text` instead of the addendum. Text required.
+     *
+     * Validated here with the bridge's own rules (ai-bridge providers/env.ts,
+     * validateBridgePrompt) so a contradictory spec fails at the caller rather
+     * than as a `bridge_prompt_invalid` refusal of the whole turn. Understood by
+     * bridges from 0.12.0; an older bridge ignores the field. `default` is sent
+     * as absent: it is what absent means, on every bridge version.
+     *
+     * @return array{mode: string, text?: string}|null
+     */
+    private static function normaliseBridgePrompt(mixed $spec): ?array
+    {
+        if ($spec === null) {
+            return null;
+        }
+        if (is_string($spec)) {
+            $spec = ['mode' => $spec];
+        }
+        if (! is_array($spec)) {
+            throw new InvalidArgumentException('"bridge_prompt" must be an object with "mode" and optional "text".');
+        }
+
+        $mode = $spec['mode'] ?? 'default';
+        if (! is_string($mode) || ! in_array($mode, self::BRIDGE_PROMPT_MODES, true)) {
+            throw new InvalidArgumentException(
+                'bridge_prompt.mode must be one of '.implode(', ', self::BRIDGE_PROMPT_MODES).'.'
+            );
+        }
+
+        $text = $spec['text'] ?? null;
+        if ($text !== null && ! is_string($text)) {
+            throw new InvalidArgumentException('bridge_prompt.text must be a string.');
+        }
+        $hasText = $text !== null && $text !== '';
+
+        if (in_array($mode, ['default', 'off'], true) && $hasText) {
+            throw new InvalidArgumentException("bridge_prompt.text is not allowed with mode \"{$mode}\"; it would be discarded.");
+        }
+        if (in_array($mode, ['append', 'replace'], true) && ! $hasText) {
+            throw new InvalidArgumentException("bridge_prompt.text is required with mode \"{$mode}\".");
+        }
+        if ($hasText && strlen($text) > self::MAX_BRIDGE_PROMPT_BYTES) {
+            throw new InvalidArgumentException('bridge_prompt.text exceeds '.self::MAX_BRIDGE_PROMPT_BYTES.' bytes.');
+        }
+
+        if ($mode === 'default') {
+            return null;
+        }
+
+        return $hasText ? ['mode' => $mode, 'text' => $text] : ['mode' => $mode];
     }
 
     /**
@@ -137,6 +221,7 @@ final class AiRequestPayload
             'tools' => $body['tools'] ?? null,
             'working_dir' => isset($body['working_dir']) ? self::asString($body['working_dir']) : null,
             'attachments' => $body['attachments'] ?? null,
+            'bridge_prompt' => $body['bridge_prompt'] ?? null,
         ]);
     }
 

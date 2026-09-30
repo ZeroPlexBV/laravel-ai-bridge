@@ -105,6 +105,39 @@ final class MessageTypes
     public const RATE_LIMIT = 'rate_limit';
 
     /**
+     * Stream event: a helper (sub-agent, or a background shell command) the
+     * CLI runs for the main assistant started, progressed, is still alive, or
+     * ended. Informational and non-terminal, like rate_limit.
+     *
+     * Its `tool_use_id` is the `tool_call_id` of the spawning call and the
+     * `parent_tool_use_id` on the helper's own blocks and results. A helper is
+     * finished only when a `finished` phase says so — never when its spawning
+     * call's tool_result arrives, which for a background helper is at once.
+     *
+     * `finished` is NOT promised: the request's terminal frame (done, error,
+     * cancelled) ends every task of that request, and a turn cut short sends
+     * no `finished` for what was open. A consumer closes the rest itself.
+     */
+    public const TASK = 'task';
+
+    /**
+     * Stream event: the CLI took in a message delivered mid-turn by
+     * `turn_input`. Carries the `message_id` the server gave it, so a chat can
+     * place the message at the point in the reply where it was read. Emitted
+     * once per accepted input, in the order they were accepted.
+     */
+    public const USER_INPUT = 'user_input';
+
+    /**
+     * Stream event: whether the main assistant is `working` or `idle` in a
+     * turn that keeps its input open. `working` is sent once at the start of
+     * every such turn and again whenever the main assistant resumes; `idle`
+     * when it has answered while helpers or background commands still run.
+     * Never twice in a row for the same state. Informational and non-terminal.
+     */
+    public const MAIN_STATE = 'main_state';
+
+    /**
      * A file the assistant produced and chose to hand back.
      *
      * Emitted by the bridge after it has uploaded the file to
@@ -167,7 +200,57 @@ final class MessageTypes
      */
     public const TOOL_ERROR = 'tool_error';
 
+    /**
+     * Server → bridge: a message for a turn that is still running.
+     *
+     * Carries `request_id`, `message_id` (the server's own id for the message,
+     * echoed back) and `content`. Only a turn started with
+     * `options.accepts_input: true`, and acknowledged with `input_open: true`,
+     * can take one. Answered by exactly one TURN_INPUT_ACK.
+     */
+    public const TURN_INPUT = 'turn_input';
+
+    /**
+     * Bridge → server: whether a `turn_input` was accepted into the running
+     * turn. `status` is `accepted` or `rejected`; a rejection carries `reason`
+     * `turn_not_running` or `input_not_open`.
+     *
+     * Accepted means written to the CLI's input, not yet read: the `user_input`
+     * stream event says when it was. Absence of this type means an older
+     * bridge — which also never acknowledges `input_open`, so a server that
+     * waits for that never sends it a turn_input at all.
+     */
+    public const TURN_INPUT_ACK = 'turn_input_ack';
+
     /** Stream event: the entire AI response is complete. */
+    /*
+     * Streamed uploads and downloads (bridge 0.18+). The bytes never ride the
+     * socket: the bridge GETs an upload from, and POSTs a download to, a
+     * one-time URL on the connected origin that the serve process answers.
+     * See PROTOCOL.md "Streamed uploads and downloads" and Transfers\TransferHub.
+     */
+
+    /** Server → bridge: a person's file is on its way; GET it from `url`. */
+    public const UPLOAD_OFFER = 'upload_offer';
+
+    /** Server → bridge: every byte has passed; this is what was counted and hashed. */
+    public const UPLOAD_SENT = 'upload_sent';
+
+    /** Server → bridge: stop receiving that upload and remove what arrived. */
+    public const UPLOAD_ABORT = 'upload_abort';
+
+    /** Bridge → server: the one answer to an offer, with where the file landed and its file_id. */
+    public const UPLOAD_DONE = 'upload_done';
+
+    /** Server → bridge: POST the file recorded under `file_id` (optionally a Range) to `url`. */
+    public const FILE_READ = 'file_read';
+
+    /** Server → bridge: the reader went away; stop sending. */
+    public const FILE_READ_CANCEL = 'file_read_cancel';
+
+    /** Bridge → server: whether it has the file, its size, and the range it will send. */
+    public const FILE_READ_RESULT = 'file_read_result';
+
     public const DONE = 'done';
 
     /** Sent by bridge: an error occurred during AI processing. */
@@ -213,12 +296,24 @@ final class MessageTypes
             self::TOOL_CALL,
             self::TOOL_RESULT,
             self::RATE_LIMIT,
+            self::TASK,
+            self::USER_INPUT,
+            self::MAIN_STATE,
             self::ATTACHMENT,
             self::POSTURE,
             self::USAGE_REQUEST,
             self::USAGE_RESULT,
             self::TOOL_RESOLVE,
             self::TOOL_ERROR,
+            self::TURN_INPUT,
+            self::TURN_INPUT_ACK,
+            self::UPLOAD_OFFER,
+            self::UPLOAD_SENT,
+            self::UPLOAD_ABORT,
+            self::UPLOAD_DONE,
+            self::FILE_READ,
+            self::FILE_READ_CANCEL,
+            self::FILE_READ_RESULT,
             self::DONE,
             self::ERROR,
             self::CANCEL,
@@ -241,6 +336,7 @@ final class MessageTypes
      * - hello: after WebSocket connects
      * - ping: every heartbeat interval (bridge pings, server pongs)
      * - ai_request_ack: after receiving an ai_request
+     * - turn_input_ack: after receiving a turn_input
      * - stream: envelope for all streaming events (block_start, block_delta, etc.)
      * - tool_call: AI wants to invoke a server-side tool
      * - error: request-level error (non-streaming)
@@ -257,6 +353,9 @@ final class MessageTypes
             self::USAGE_RESULT,
             self::PING,
             self::AI_REQUEST_ACK,
+            self::TURN_INPUT_ACK,
+            self::UPLOAD_DONE,
+            self::FILE_READ_RESULT,
             self::STREAM,
             self::TOOL_CALL,
             self::ERROR,
@@ -274,6 +373,7 @@ final class MessageTypes
      * - session_reset: replay conversation after lost session
      * - tool_resolve: returning tool execution result to bridge
      * - tool_error: tool execution failed
+     * - turn_input: a message for a turn that is still running
      * - cancel: cancel an in-progress request
      *
      * @return string[]
@@ -290,6 +390,12 @@ final class MessageTypes
             self::TOOL_RESOLVE,
             self::TOOL_ERROR,
             self::USAGE_REQUEST,
+            self::TURN_INPUT,
+            self::UPLOAD_OFFER,
+            self::UPLOAD_SENT,
+            self::UPLOAD_ABORT,
+            self::FILE_READ,
+            self::FILE_READ_CANCEL,
             self::CANCEL,
         ];
     }

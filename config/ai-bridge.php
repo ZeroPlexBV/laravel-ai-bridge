@@ -143,6 +143,11 @@ return [
         // trip to the machine AND the machine's own call to its vendor, not just on us.
         'usage_timeout' => env('AI_BRIDGE_USAGE_TIMEOUT', 12), // seconds
 
+        // How long the serve process waits for the bridge to accept or refuse a message sent
+        // into a running turn (AiBridge::sendTurnInput) before answering `no_answer`. The
+        // bridge answers at once — it only writes to the CLI's input — so this is short.
+        'turn_input_timeout' => env('AI_BRIDGE_TURN_INPUT_TIMEOUT', 5), // seconds
+
         // URL for internal relay requests (PHP-FPM → bridge server communication).
         // Override to use HTTPS if the bridge server is behind a TLS-terminating proxy.
         // Security: When running the bridge server on a separate host, use HTTPS to
@@ -155,6 +160,30 @@ return [
         // If null (default), the token endpoint returns ws://{server.host}:{server.port}.
         // Example: AI_BRIDGE_PUBLIC_URL=wss://bridge.example.com
         'public_url' => env('AI_BRIDGE_PUBLIC_URL'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Streamed file transfers (bridge 0.18+)
+    |--------------------------------------------------------------------------
+    |
+    | A browser's upload is piped through the serve process to the machine, and a
+    | machine-held file is piped back the same way; nothing is stored here. The
+    | machine fetches / delivers the bytes at a one-time URL that must be on the
+    | origin it connected to. By default that URL is the public WebSocket URL
+    | (public_url, ws→http) with `?transfer=<id>`: the location that already
+    | routes to the serve process. Set this only when a dedicated location exists
+    | (for example one with proxy_request_buffering off). See docs/file-transfers.md.
+    |
+    */
+
+    'transfers' => [
+        'url' => env('AI_BRIDGE_TRANSFER_URL'),
+
+        // Where a file the assistant hands back goes: 'server' (uploaded to the app's
+        // attachment store, the default) or 'device' (kept on the machine; the
+        // `attachment` event carries `file_id` for MachineFiles::download()).
+        'handed_back' => env('AI_BRIDGE_HANDED_BACK', 'server'),
     ],
 
     /*
@@ -374,5 +403,12 @@ return [
         // Persist a partial assistant message when a stream errors or is
         // cancelled mid-response. The row is flagged incomplete=true.
         'persist_partial_on_error' => env('AI_BRIDGE_PERSIST_PARTIAL', true),
+
+        // Clear, every five minutes, a conversation's "a turn is running" bookmark
+        // (streaming_request_id) when its turn is over: its buffer ended, or it has no buffer
+        // and is older than the grace period (an application's claim for a turn still being
+        // started has no buffer yet). Command: ai-bridge:sweep-turn-markers.
+        'sweep_turn_markers' => env('AI_BRIDGE_SWEEP_TURN_MARKERS', true),
+        'turn_marker_grace_seconds' => (int) env('AI_BRIDGE_TURN_MARKER_GRACE', 600),
     ],
 ];

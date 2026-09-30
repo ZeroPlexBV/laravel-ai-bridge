@@ -24,6 +24,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
  * @property array<int, mixed>|null $last_providers
  * @property array<int, mixed>|null $last_workspaces
  * @property array<string, mixed>|null $last_posture
+ * @property array<string, mixed>|null $last_bridge
  * @property \Illuminate\Support\Carbon|null $last_connected_at
  * @property array<string, mixed>|null $metadata
  */
@@ -44,6 +45,7 @@ class Connection extends Model
         'last_providers',
         'last_workspaces',
         'last_posture',
+        'last_bridge',
         'last_connected_at',
         'metadata',
     ];
@@ -53,6 +55,7 @@ class Connection extends Model
         'last_providers' => 'array',
         'last_workspaces' => 'array',
         'last_posture' => 'array',
+        'last_bridge' => 'array',
         'last_connected_at' => 'datetime',
         'metadata' => 'array',
     ];

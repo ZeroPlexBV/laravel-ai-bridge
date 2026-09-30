@@ -170,3 +170,39 @@ test('numeric relay fields are coerced rather than refused', function () {
 
     expect($payload['conversation_id'])->toBe('42');
 });
+
+test('accepts_input reaches the bridge the same on both paths', function () {
+    // The option that keeps a turn's input open. Lost on the relay, it would
+    // work under Octane and every mid-turn message would be held under PHP-FPM.
+    ['direct' => $direct, 'relayed' => $relayBody] = relayedBodyFor([
+        'cli_session_id' => null,
+        'accepts_input' => true,
+    ]);
+
+    expect($direct['options'])->toBe(['accepts_input' => true])
+        ->and($relayBody['options'])->toBe(['accepts_input' => true])
+        ->and(replayRelayBody($relayBody))->toBe($direct);
+});
+
+test('a turn that did not ask for input sends no accepts_input at all', function (array $options) {
+    ['direct' => $direct, 'relayed' => $relayBody] = relayedBodyFor(['cli_session_id' => null] + $options);
+
+    expect($direct)->not->toHaveKey('options')
+        ->and(replayRelayBody($relayBody))->toBe($direct);
+})->with([
+    'absent' => [[]],
+    'false' => [['accepts_input' => false]],
+    'a truthy string' => [['accepts_input' => 'yes']],
+]);
+
+test('only a real true in a relay body turns input on', function () {
+    // The relay body is caller-supplied JSON; "1" or "yes" must not be what
+    // switches a turn into the mode with background tasks on.
+    foreach (['1', 1, 'true', 'yes', false] as $value) {
+        expect(AiRequestPayload::fromRelayBody(['message' => 'hi', 'options' => ['accepts_input' => $value]], 'req-1'))
+            ->not->toHaveKey('options');
+    }
+
+    expect(AiRequestPayload::fromRelayBody(['message' => 'hi', 'options' => ['accepts_input' => true, 'model' => 'sonnet']], 'req-1')['options'])
+        ->toBe(['accepts_input' => true, 'model' => 'sonnet']);
+});

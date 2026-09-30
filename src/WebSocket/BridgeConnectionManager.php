@@ -9,6 +9,7 @@ use Illuminate\Support\Facades\Log;
 use Tetrix\AiBridge\Contracts\SendableConnection;
 use Tetrix\AiBridge\Events\BridgeConnected;
 use Tetrix\AiBridge\Events\BridgeDisconnected;
+use Tetrix\AiBridge\Protocol\MessageTypes;
 use Tetrix\AiBridge\Streaming\StreamHandler;
 
 /**
@@ -68,6 +69,40 @@ class BridgeConnectionManager
      * @var array<string, array{user_id: string, on_answer: callable(array<string, mixed>): void}>
      */
     private array $pendingUsage = [];
+
+    /**
+     * Mid-turn messages waiting on the bridge's turn_input_ack, keyed by
+     * request id and message id together (see turnInputKey()).
+     *
+     * The same shape and the same authorization rule as `pendingUsage`: the
+     * user id is who the message was sent on behalf of, and only that user's
+     * bridge may answer for it.
+     *
+     * @var array<string, array{user_id: string, on_answer: callable(array<string, mixed>): void}>
+     */
+    private array $pendingTurnInputs = [];
+
+    /**
+     * Turns failed because their user's bridge went away, by request id => user id.
+     *
+     * Kept briefly (the newest DROPPED_MEMORY entries) so the account a bridge replays after
+     * it reconnects — a `bridge_disconnected` error naming the mid-turn messages its CLI
+     * never read — can be matched to the user it belongs to after the turn itself is gone.
+     *
+     * @var array<string, string>
+     */
+    private array $droppedRequests = [];
+
+    private const DROPPED_MEMORY = 500;
+
+    /** @var list<\Closure(string): void> Called with the user id when a user's bridge goes away. */
+    private array $userGoneListeners = [];
+
+    /** Be told when a user's bridge goes away (after their pending requests are failed). */
+    public function onUserGone(\Closure $listener): void
+    {
+        $this->userGoneListeners[] = $listener;
+    }
 
     /**
      * Callback for sending messages over the WebSocket connection.
@@ -146,6 +181,14 @@ class BridgeConnectionManager
 
         unset($this->connections[$userId]);
         unset($this->connectionIdIndex[$connectionId]);
+
+        foreach ($this->userGoneListeners as $listener) {
+            try {
+                $listener($userId);
+            } catch (\Throwable) {
+                // A listener must not stop the connection being removed.
+            }
+        }
 
         Event::dispatch(new BridgeDisconnected($userId, $connectionId, $reason));
     }
@@ -256,6 +299,42 @@ class BridgeConnectionManager
     public function getWorkspaces(int|string $userId): array
     {
         return $this->connections[(string) $userId]['workspaces'] ?? [];
+    }
+
+    /**
+     * Store what the bridge said about itself at `hello`: its release and what it supports.
+     *
+     * @param  int|string  $userId  The user ID.
+     * @param  array<string, mixed>  $info  See MessageHandler::bridgeInfoFromHello().
+     */
+    public function setBridgeInfo(int|string $userId, array $info): void
+    {
+        $userId = (string) $userId;
+
+        if (isset($this->connections[$userId])) {
+            $this->connections[$userId]['bridge'] = $info;
+        }
+    }
+
+    /**
+     * What this user's bridge said about itself at `hello`.
+     *
+     * @return array<string, mixed>  Empty when not connected. Keys: `bridge_version`
+     *                               (?string), `protocol_version` (?string),
+     *                               `attachment_limits` (?array), `capabilities` (string[]).
+     */
+    public function getBridgeInfo(int|string $userId): array
+    {
+        return $this->connections[(string) $userId]['bridge'] ?? [];
+    }
+
+    /**
+     * Whether this user's connected bridge announced a capability at `hello`
+     * (`turn_input`, `file_uploads`, `file_downloads`, `app_backends`).
+     */
+    public function bridgeSupports(int|string $userId, string $capability): bool
+    {
+        return in_array($capability, $this->getBridgeInfo($userId)['capabilities'] ?? [], true);
     }
 
     /**
@@ -501,6 +580,98 @@ class BridgeConnectionManager
     }
 
     /**
+     * Note that a mid-turn message is out, and how to finish when its ack comes back.
+     *
+     * @param  string  $userId  The user the message was sent on behalf of. Only that user's
+     *                          bridge may acknowledge it.
+     * @param  callable(array<string, mixed>): void  $onAnswer  Receives `{status, reason?}`.
+     */
+    public function registerPendingTurnInput(string $requestId, string $messageId, string $userId, callable $onAnswer): void
+    {
+        $this->pendingTurnInputs[self::turnInputKey($requestId, $messageId)] = [
+            'user_id' => $userId,
+            'on_answer' => $onAnswer,
+        ];
+    }
+
+    /** Whether a message is already waiting on its ack. */
+    public function hasPendingTurnInput(string $requestId, string $messageId): bool
+    {
+        return isset($this->pendingTurnInputs[self::turnInputKey($requestId, $messageId)]);
+    }
+
+    /**
+     * Hand a turn_input_ack to whoever is waiting for it, and forget the message.
+     *
+     * At most once, and only from the user the message was sent for — the same two rules as
+     * resolvePendingUsage(), for the same reasons.
+     *
+     * @param  array<string, mixed>  $answer
+     */
+    public function resolvePendingTurnInput(string $requestId, string $messageId, string $userId, array $answer): bool
+    {
+        $key = self::turnInputKey($requestId, $messageId);
+        $pending = $this->pendingTurnInputs[$key] ?? null;
+
+        if ($pending === null) {
+            return false;
+        }
+
+        if ($pending['user_id'] !== $userId) {
+            Log::warning('AI Bridge: turn_input_ack for another user\'s message — refused', [
+                'request_id' => $requestId,
+                'message_id' => $messageId,
+                'answering_user' => $userId,
+            ]);
+
+            return false;
+        }
+
+        unset($this->pendingTurnInputs[$key]);
+
+        ($pending['on_answer'])($answer);
+
+        return true;
+    }
+
+    /** Give up on a mid-turn message (the bridge never answered). */
+    public function forgetPendingTurnInput(string $requestId, string $messageId): void
+    {
+        unset($this->pendingTurnInputs[self::turnInputKey($requestId, $messageId)]);
+    }
+
+    /**
+     * Answer every mid-turn message outstanding for a user whose bridge has gone.
+     *
+     * `no_answer`, not `turn_not_running`: the bridge never said whether it took the message,
+     * and the one answer that must never be given without its word is one that makes the
+     * caller send it again as a new turn.
+     */
+    private function failPendingTurnInputsForUser(string $userId): void
+    {
+        foreach ($this->pendingTurnInputs as $key => $pending) {
+            if ($pending['user_id'] !== $userId) {
+                continue;
+            }
+
+            unset($this->pendingTurnInputs[$key]);
+
+            ($pending['on_answer'])(['status' => 'rejected', 'reason' => 'no_answer']);
+        }
+    }
+
+    /**
+     * One key for a request id and message id, unambiguous whatever either contains.
+     *
+     * Length-prefixed rather than JSON-encoded: both ids arrive from outside, and an encoder
+     * that throws on invalid UTF-8 has no business inside the serve process's event loop.
+     */
+    private static function turnInputKey(string $requestId, string $messageId): string
+    {
+        return strlen($requestId).':'.$requestId.$messageId;
+    }
+
+    /**
      * Get the StreamHandler for a pending request.
      */
     public function getPendingRequest(string $requestId): ?StreamHandler
@@ -546,6 +717,41 @@ class BridgeConnectionManager
         ));
     }
 
+    /** Remember whose turn a dropped request was, for the bridge's replay (see takeDroppedRequestOwner()). */
+    private function rememberDroppedRequest(string $requestId, string $userId): void
+    {
+        unset($this->droppedRequests[$requestId]);
+        $this->droppedRequests[$requestId] = $userId;
+
+        while (count($this->droppedRequests) > self::DROPPED_MEMORY) {
+            unset($this->droppedRequests[array_key_first($this->droppedRequests)]);
+        }
+    }
+
+    /**
+     * Remember whose turn a request was that this process ended on its own because somebody
+     * stopped it (the abort flag). The bridge's own `cancelled` follows once its CLI has
+     * stopped, naming the mid-turn messages the CLI never read, and by then the request is
+     * gone here: this is what lets that list still be recorded (see takeDroppedRequestOwner()).
+     */
+    public function rememberStoppedRequest(string $requestId, int|string $userId): void
+    {
+        $this->rememberDroppedRequest($requestId, (string) $userId);
+    }
+
+    /**
+     * The user a turn belonged to when this process ended it without the bridge's own ending
+     * (its bridge went away, or it was stopped), or null. Forgets it: the bridge sends one
+     * ending per turn.
+     */
+    public function takeDroppedRequestOwner(string $requestId): ?string
+    {
+        $owner = $this->droppedRequests[$requestId] ?? null;
+        unset($this->droppedRequests[$requestId]);
+
+        return $owner;
+    }
+
     /**
      * Get all active connection user IDs.
      *
@@ -562,6 +768,47 @@ class BridgeConnectionManager
     public function connectionCount(): int
     {
         return count($this->connections);
+    }
+
+    /**
+     * The serve process is stopping: end every turn it is relaying.
+     *
+     * Nothing will relay the rest of these turns (a new serve process does not know them), so
+     * each is ended here as failed, through its handler, which ends its buffer for whoever
+     * reads it and clears its conversation's `streaming_request_id`. And the machine is told
+     * to stop it: a turn nobody is listening to would otherwise run on, unseen, and the
+     * person's next message would start a second one on the same session beside it.
+     *
+     * @return int how many turns were ended
+     */
+    public function failAllPendingRequests(string $code = 'server_restarting', string $message = 'The server restarted while this reply was running. Ask again to continue.'): int
+    {
+        $ended = 0;
+
+        foreach ($this->pendingRequests as $requestId => $entry) {
+            unset($this->pendingRequests[$requestId]);
+
+            if (($entry['user_id'] ?? '') !== '') {
+                try {
+                    $this->sendToUser($entry['user_id'], ['type' => MessageTypes::CANCEL, 'request_id' => (string) $requestId]);
+                } catch (\Throwable) {
+                    // The machine may already be gone; the turn still ends here.
+                }
+            }
+
+            try {
+                $entry['stream_handler']->dispatchError($code, $message);
+            } catch (\Throwable $e) {
+                Log::warning('AI Bridge: could not end a turn on shutdown', [
+                    'request_id' => $requestId,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+
+            $ended++;
+        }
+
+        return $ended;
     }
 
     /**
@@ -585,11 +832,13 @@ class BridgeConnectionManager
             if ($handler['user_id'] === $userId) {
                 $handler['stream_handler']->dispatchError($errorCode, $errorMessage);
                 unset($this->pendingRequests[$requestId]);
+                $this->rememberDroppedRequest((string) $requestId, $userId);
             }
         }
 
         // A usage question is an in-flight exchange for this user too, and it is held open
         // by an HTTP response rather than a stream handler — so it needs its own sweep.
         $this->failPendingUsageForUser($userId);
+        $this->failPendingTurnInputsForUser($userId);
     }
 }

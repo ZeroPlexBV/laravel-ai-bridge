@@ -29,6 +29,8 @@ use Tetrix\AiBridge\Protocol\StreamEvent;
  *   $stream->onBlockDelta(fn (StreamEvent $e) => ...);
  *   $stream->onBlockStop(fn (StreamEvent $e) => ...);
  *   $stream->onToolCall(fn (string $name, array $params, string $callId) => ...);
+ *   $stream->onToolResult(fn (string $callId, mixed $result, ?bool $isError, ?string $parentToolUseId) => ...);
+ *   $stream->onTask(fn (array $task) => ...);
  *   $stream->onDone(fn (?array $usage) => ...);
  *   $stream->onError(fn (string $code, string $message) => ...);
  *   $stream->start();
@@ -62,6 +64,15 @@ class StreamHandler
     /** @var array<int, Closure> */
     private array $rateLimitCallbacks = [];
 
+    /** @var array<int, Closure> */
+    private array $taskCallbacks = [];
+
+    /** @var array<int, Closure> */
+    private array $userInputCallbacks = [];
+
+    /** @var array<int, Closure> */
+    private array $mainStateCallbacks = [];
+
     /**
      * Partially received tool results, keyed by tool_call_id.
      *
@@ -70,7 +81,7 @@ class StreamHandler
      * the recorder, the buffering sink, the browser component — keeps seeing a
      * single complete result and needs no knowledge of chunking at all.
      *
-     * @var array<string, array{parts: list<string>, bytes: int, next: int, is_error: bool|null, incomplete: bool}>
+     * @var array<string, array{parts: list<string>, bytes: int, next: int, is_error: bool|null, parent: string|null, incomplete: bool}>
      */
     private array $toolResultChunks = [];
 
@@ -247,7 +258,11 @@ class StreamHandler
     /**
      * Register a callback for when the stream is cancelled.
      *
-     * The callback receives: string $reason.
+     * The callback receives: string $reason, array $meta. $meta carries what
+     * the bridge said beside the cancellation — currently `pending_inputs`, the
+     * `message_id`s of messages delivered mid-turn that the CLI never read —
+     * and is empty when it said nothing. A callback declaring only $reason
+     * keeps working: PHP drops the extra argument.
      */
     public function onCancelled(Closure $callback): static
     {
@@ -259,9 +274,12 @@ class StreamHandler
     /**
      * Register a callback for tool_result events from the bridge.
      *
-     * The callback receives: string $toolCallId, mixed $result, ?bool $isError.
-     * $isError is null when the provider did not report a status — never
-     * assume null means success.
+     * The callback receives: string $toolCallId, mixed $result, ?bool $isError,
+     * ?string $parentToolUseId. $isError is null when the provider did not
+     * report a status — never assume null means success. $parentToolUseId is
+     * the spawning call when the call was a helper's (sub-agent's), and null
+     * for the main assistant's own calls. A callback declaring only the first
+     * three parameters keeps working: PHP drops the extra argument.
      */
     public function onToolResult(Closure $callback): static
     {
@@ -280,6 +298,59 @@ class StreamHandler
     public function onRateLimit(Closure $callback): static
     {
         $this->rateLimitCallbacks[] = $callback;
+
+        return $this;
+    }
+
+    /**
+     * Register a callback for task events — the life of a helper (sub-agent,
+     * or background shell command) the CLI runs for the main assistant.
+     *
+     * The callback receives the event's data array as the bridge sent it:
+     * `phase` (started, progress, heartbeat, updated, finished), `task_id`,
+     * usually `tool_use_id`, and whatever else that phase carries. Passed
+     * through whole, so fields a newer bridge adds arrive too. Informational
+     * and non-terminal. A helper is finished only when a `finished` phase says
+     * so; a background helper keeps reporting after the main assistant's reply.
+     * But `finished` is not promised: the turn's terminal event (done, error,
+     * cancelled) ends every task still open, with no `finished` of its own —
+     * close those yourself there.
+     */
+    public function onTask(Closure $callback): static
+    {
+        $this->taskCallbacks[] = $callback;
+
+        return $this;
+    }
+
+    /**
+     * Register a callback for user_input events — the CLI took in a message
+     * delivered mid-turn (see AiBridgeManager::sendTurnInput()).
+     *
+     * The callback receives the event's data array as the bridge sent it,
+     * `message_id` being the id the server gave the message. Passed through
+     * whole, like task. Non-terminal: the reply continues after it, now
+     * answering that message too.
+     */
+    public function onUserInput(Closure $callback): static
+    {
+        $this->userInputCallbacks[] = $callback;
+
+        return $this;
+    }
+
+    /**
+     * Register a callback for main_state events — whether the main assistant
+     * of a turn that keeps its input open is `working` or `idle`.
+     *
+     * The callback receives the event's data array as the bridge sent it
+     * (`state`). Passed through whole, like task. Informational and
+     * non-terminal: `idle` means the main assistant has answered while
+     * helpers or background commands still run, not that the turn is over.
+     */
+    public function onMainState(Closure $callback): static
+    {
+        $this->mainStateCallbacks[] = $callback;
 
         return $this;
     }
@@ -422,12 +493,13 @@ class StreamHandler
         int $blockIndex,
         ?string $toolName = null,
         ?string $toolCallId = null,
+        ?string $parentToolUseId = null,
     ): void {
         if ($this->cancelled || $this->terminated) {
             return;
         }
 
-        $event = StreamEvent::blockStart($this->requestId, $blockType, $blockIndex, $toolName, $toolCallId);
+        $event = StreamEvent::blockStart($this->requestId, $blockType, $blockIndex, $toolName, $toolCallId, $parentToolUseId);
         $this->dispatchCallbacks($this->blockStartCallbacks, [$event], 'blockStart');
     }
 
@@ -494,6 +566,57 @@ class StreamHandler
     }
 
     /**
+     * Dispatch a task event to all registered callbacks.
+     *
+     * Non-terminal, like rate_limit. $task is forwarded untouched; nothing
+     * here whitelists its fields.
+     *
+     * @param  array<string, mixed>  $task
+     *
+     * @internal Called by StreamableProvider implementations.
+     */
+    public function dispatchTask(array $task): void
+    {
+        if ($this->cancelled || $this->terminated) {
+            return;
+        }
+
+        $this->dispatchCallbacks($this->taskCallbacks, [$task], 'task');
+    }
+
+    /**
+     * Dispatch a user_input event: a message delivered mid-turn was read.
+     *
+     * @param  array<string, mixed>  $data
+     *
+     * @internal Called by StreamableProvider implementations.
+     */
+    public function dispatchUserInput(array $data): void
+    {
+        if ($this->cancelled || $this->terminated) {
+            return;
+        }
+
+        $this->dispatchCallbacks($this->userInputCallbacks, [$data], 'user_input');
+    }
+
+    /**
+     * Dispatch a main_state event: the main assistant is working or idle.
+     *
+     * @param  array<string, mixed>  $data
+     *
+     * @internal Called by StreamableProvider implementations.
+     */
+    public function dispatchMainState(array $data): void
+    {
+        if ($this->cancelled || $this->terminated) {
+            return;
+        }
+
+        $this->dispatchCallbacks($this->mainStateCallbacks, [$data], 'main_state');
+    }
+
+    /**
      * Dispatch a done event to all registered callbacks.
      *
      * Also dispatches the StreamCompleted Laravel event for logging/analytics.
@@ -543,9 +666,16 @@ class StreamHandler
      *
      * Also dispatches the StreamCompleted Laravel event (with success=false).
      *
+     * $meta carries what the bridge said beside the error — currently
+     * `pending_inputs` on a `bridge_disconnected` error for a turn that ran
+     * with its input open: the `message_id`s of messages delivered mid-turn
+     * that the CLI never read. Error callbacks receive it as a third argument.
+     *
+     * @param  array<string, mixed>  $meta
+     *
      * @internal Called by StreamableProvider implementations.
      */
-    public function dispatchError(string $code, string $message): void
+    public function dispatchError(string $code, string $message, array $meta = []): void
     {
         if ($this->terminated) {
             return;
@@ -557,7 +687,7 @@ class StreamHandler
 
         $this->terminated = true;
 
-        $this->dispatchCallbacks($this->errorCallbacks, [$code, $message], 'error');
+        $this->dispatchCallbacks($this->errorCallbacks, [$code, $message, $meta], 'error');
 
         $this->dispatchStreamCompleted(false, null, "{$code}: {$message}", TerminatedBy::Error);
 
@@ -581,6 +711,7 @@ class StreamHandler
 
         $toolCallId = (string) ($data['tool_call_id'] ?? $data['call_id'] ?? '');
         $isError = is_bool($data['is_error'] ?? null) ? $data['is_error'] : null;
+        $parent = self::parentOf($data);
 
         if (! is_int($data['chunk_index'] ?? null)) {
             // An unchunked result supersedes anything half-assembled for the
@@ -602,12 +733,12 @@ class StreamHandler
 
             $superseded = $this->takeToolResult($toolCallId);
             if (! array_key_exists('result', $data) && $superseded !== null) {
-                $this->dispatchToolResult($toolCallId, $superseded['result'], $superseded['is_error']);
+                $this->dispatchToolResult($toolCallId, $superseded['result'], $superseded['is_error'], $parent ?? $superseded['parent']);
 
                 return;
             }
 
-            $this->dispatchToolResult($toolCallId, $data['result'] ?? null, $isError);
+            $this->dispatchToolResult($toolCallId, $data['result'] ?? null, $isError, $parent ?? $superseded['parent'] ?? null);
 
             return;
         }
@@ -640,7 +771,7 @@ class StreamHandler
                     ."\n…[truncated by the server: this result alone exceeded the memory one result may use]";
             }
 
-            $this->dispatchToolResult($toolCallId, $piece.$droppedNote, $isError);
+            $this->dispatchToolResult($toolCallId, $piece.$droppedNote, $isError, $parent);
 
             return;
         }
@@ -655,13 +786,20 @@ class StreamHandler
                 return;
             }
 
-            $buffer = ['parts' => [], 'bytes' => 0, 'next' => 0, 'is_error' => null, 'refused' => false, 'incomplete' => false, 'dropped_note' => ''];
+            $buffer = ['parts' => [], 'bytes' => 0, 'next' => 0, 'is_error' => null, 'parent' => null, 'refused' => false, 'incomplete' => false, 'dropped_note' => ''];
         }
 
         // The verdict rides on every chunk, so the last one seen wins and a
         // result cut short still carries whether it was a failure.
         if ($isError !== null) {
             $buffer['is_error'] = $isError;
+        }
+
+        // So does the helper the call belongs to. Kept across reassembly for
+        // the same reason: a result flushed partial at a terminal must still
+        // say whose it was, or a helper's output lands on the main assistant.
+        if ($parent !== null) {
+            $buffer['parent'] = $parent;
         }
 
         // Out of order means a chunk was lost or duplicated. Reordering would
@@ -712,7 +850,7 @@ class StreamHandler
     /**
      * Take what has been assembled for one call, forgetting the buffer.
      *
-     * @return array{result: string, is_error: bool|null}|null
+     * @return array{result: string, is_error: bool|null, parent: string|null}|null
      */
     private function takeToolResult(string $toolCallId): ?array
     {
@@ -742,7 +880,7 @@ class StreamHandler
 
         $result .= $buffer['dropped_note'] ?? '';
 
-        return ['result' => $result, 'is_error' => $buffer['is_error']];
+        return ['result' => $result, 'is_error' => $buffer['is_error'], 'parent' => $buffer['parent'] ?? null];
     }
 
     /**
@@ -755,7 +893,7 @@ class StreamHandler
             return;
         }
 
-        $this->dispatchToolResult($toolCallId, $assembled['result'], $assembled['is_error']);
+        $this->dispatchToolResult($toolCallId, $assembled['result'], $assembled['is_error'], $assembled['parent']);
     }
 
     /**
@@ -783,7 +921,7 @@ class StreamHandler
 
             $this->dispatchCallbacks(
                 $this->toolResultCallbacks,
-                [$toolCallId, $assembled['result'], $assembled['is_error']],
+                [$toolCallId, $assembled['result'], $assembled['is_error'], $assembled['parent']],
                 'toolResult',
             );
         }
@@ -794,7 +932,7 @@ class StreamHandler
      *
      * @internal Called when the bridge acknowledges receipt of a tool result.
      */
-    public function dispatchToolResult(string $toolCallId, mixed $result, ?bool $isError = null): void
+    public function dispatchToolResult(string $toolCallId, mixed $result, ?bool $isError = null, ?string $parentToolUseId = null): void
     {
         if ($this->cancelled || $this->terminated) {
             return;
@@ -805,7 +943,7 @@ class StreamHandler
             'tool_call_id' => $toolCallId,
         ]);
 
-        $this->dispatchCallbacks($this->toolResultCallbacks, [$toolCallId, $result, $isError], 'toolResult');
+        $this->dispatchCallbacks($this->toolResultCallbacks, [$toolCallId, $result, $isError, $parentToolUseId], 'toolResult');
     }
 
     /**
@@ -847,9 +985,11 @@ class StreamHandler
      * Unlike error, this emits event type 'cancelled' so consumers can
      * differentiate between errors and intentional cancellation.
      *
+     * @param  array<string, mixed>  $meta  What the bridge said beside it, e.g. `pending_inputs`.
+     *
      * @internal Called by StreamableProvider implementations.
      */
-    public function dispatchCancelled(string $reason = 'Request was cancelled.'): void
+    public function dispatchCancelled(string $reason = 'Request was cancelled.', array $meta = []): void
     {
         if ($this->terminated) {
             return;
@@ -862,7 +1002,7 @@ class StreamHandler
 
         $this->terminated = true;
 
-        $this->dispatchCallbacks($this->cancelledCallbacks, [$reason], 'cancelled');
+        $this->dispatchCallbacks($this->cancelledCallbacks, [$reason, $meta], 'cancelled');
 
         $this->dispatchStreamCompleted(false, null, "cancelled: {$reason}", TerminatedBy::Cancelled);
 
@@ -890,6 +1030,9 @@ class StreamHandler
                 is_string($event->data['provider'] ?? null) ? $event->data['provider'] : 'unknown',
                 is_array($event->data['info'] ?? null) ? $event->data['info'] : [],
             ),
+            MessageTypes::TASK => $this->dispatchTask($event->data),
+            MessageTypes::USER_INPUT => $this->dispatchUserInput($event->data),
+            MessageTypes::MAIN_STATE => $this->dispatchMainState($event->data),
             MessageTypes::ATTACHMENT => $this->dispatchAttachment($event->data),
             MessageTypes::DONE => $this->dispatchDone(
                 $event->data['usage'] ?? null,
@@ -899,8 +1042,30 @@ class StreamHandler
                 $event->data['code'] ?? 'unknown',
                 $event->data['message'] ?? 'Unknown error',
             ),
-            default => null, // Ignore unknown event types
+            // Ignored, not an error: PROTOCOL.md has a consumer skip an event
+            // it does not know. Logged at debug so a new event from a newer
+            // bridge is visible to whoever looks, instead of vanishing.
+            default => Log::debug('AI Bridge: ignoring unknown stream event', [
+                'request_id' => $this->requestId,
+                'event' => $event->event,
+            ]),
         };
+    }
+
+    /**
+     * The helper a frame belongs to, or null for the main assistant.
+     *
+     * Absent, null and an empty string all mean the main assistant; the bridge
+     * never sends the last two, but a stray one must not turn a main-assistant
+     * call into a helper's with an id that matches nothing.
+     *
+     * @param  array<string, mixed>  $data
+     */
+    private static function parentOf(array $data): ?string
+    {
+        $parent = $data['parent_tool_use_id'] ?? null;
+
+        return is_string($parent) && $parent !== '' ? $parent : null;
     }
 
     /**
@@ -931,6 +1096,7 @@ class StreamHandler
             $blockIndex,
             is_string($toolName) && $toolName !== '' ? $toolName : null,
             is_string($toolCallId) && $toolCallId !== '' ? $toolCallId : null,
+            self::parentOf($event->data),
         );
     }
 

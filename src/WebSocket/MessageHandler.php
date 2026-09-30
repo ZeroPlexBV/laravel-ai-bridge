@@ -7,6 +7,7 @@ namespace Tetrix\AiBridge\WebSocket;
 use Illuminate\Support\Facades\Log;
 use Tetrix\AiBridge\Auth\TokenManager;
 use Tetrix\AiBridge\Auth\TokenValidationException;
+use Tetrix\AiBridge\Contracts\MergesStreamMetadata;
 use Tetrix\AiBridge\Contracts\StreamStoreContract;
 use Tetrix\AiBridge\Enums\BlockType;
 use Tetrix\AiBridge\Models\Conversation;
@@ -15,6 +16,7 @@ use Tetrix\AiBridge\Protocol\MessageTypes;
 use Tetrix\AiBridge\Protocol\StreamEvent;
 use Tetrix\AiBridge\Streaming\RelayStream;
 use Tetrix\AiBridge\Streaming\StreamHandler;
+use Tetrix\AiBridge\Streaming\TurnMarker;
 use Tetrix\AiBridge\Support\BridgeLog;
 use Tetrix\AiBridge\Tools\ToolRegistry;
 
@@ -41,18 +43,81 @@ class MessageHandler
     private array $recoveredRequests = [];
 
     /**
+     * Per-request fields of a relayed turn that buildFreshAiRequest() cannot rebuild from
+     * the conversation (`bridge_prompt`, `options.accepts_input`), by request id.
+     *
+     * @var array<string, array<string, mixed>>
+     */
+    private array $requestCarry = [];
+
+    /** Forget a request's recovery state once it has ended. */
+    private function forgetRecovery(string $requestId): void
+    {
+        unset($this->recoveredRequests[$requestId], $this->requestCarry[$requestId]);
+    }
+
+    /**
      * The `reason` values a `usage_result` may carry, per PROTOCOL.md.
      *
      * An allowlist rather than a passthrough: this is an enum the consuming application
      * branches on, and a value it has never heard of is indistinguishable from a bug in it.
+     *
+     * `rate_limited`: the vendor's usage endpoint refused for asking too often (HTTP 429),
+     * optionally with `retry_after` seconds. Not sent by ai-bridge 0.21 (a 429 is `failed`
+     * there); accepted here so a bridge that tells them apart is heard without another release.
      */
-    private const USAGE_REASONS = ['unsupported', 'no_credential', 'failed'];
+    private const USAGE_REASONS = ['unsupported', 'no_credential', 'failed', 'rate_limited'];
+
+    /** The longest `retry_after` a usage_result may ask for, in seconds (a day). */
+    private const USAGE_RETRY_AFTER_MAX = 86400;
+
+    /**
+     * The `reason` values a rejecting `turn_input_ack` may carry, per PROTOCOL.md.
+     *
+     * An allowlist for the same reason as USAGE_REASONS: the application branches on it —
+     * `turn_not_running` is the one that makes it start a new turn with the message.
+     * `turn_ending` (bridge 0.21) means the turn will take nothing more but its CLI may
+     * still be writing the session: hold the message until this request's terminal frame,
+     * and only then start a new turn with it.
+     */
+    private const TURN_INPUT_REASONS = ['turn_not_running', 'turn_ending', 'input_not_open'];
 
     public function __construct(
         private readonly BridgeConnectionManager $connectionManager,
         private readonly TokenManager $tokenManager,
         private readonly ToolRegistry $toolRegistry,
     ) {}
+
+    /** Where `upload_done` and `file_read_result` go. Set by the serve process. */
+    private ?\Tetrix\AiBridge\Transfers\TransferHub $transferHub = null;
+
+    public function setTransferHub(\Tetrix\AiBridge\Transfers\TransferHub $hub): void
+    {
+        $this->transferHub = $hub;
+    }
+
+    /**
+     * A machine answering about a file transfer. Handed to the hub with the sender's user,
+     * which the hub matches against the transfer's own before acting on it.
+     *
+     * @param  array<string, mixed>  $message
+     */
+    private function handleTransferAnswer(string $connectionId, string $type, array $message): ?array
+    {
+        $userId = $this->connectionManager->getUserIdByConnectionId($connectionId);
+
+        if ($userId === null || $this->transferHub === null) {
+            return null;
+        }
+
+        if ($type === MessageTypes::UPLOAD_DONE) {
+            $this->transferHub->onUploadDone($userId, $message);
+        } else {
+            $this->transferHub->onFileReadResult($userId, $message);
+        }
+
+        return null;
+    }
 
     /**
      * Register a relayed (PHP-FPM) request as pending in the serve process.
@@ -70,9 +135,20 @@ class MessageHandler
      * Cleanup is handled by the existing done/error/cancelled handlers, which
      * already call removePendingRequest().
      */
-    public function registerRelayedRequest(string $requestId, string $userId, string $conversationId): void
+    public function registerRelayedRequest(string $requestId, string $userId, string $conversationId, array $carry = []): void
     {
         $relay = new RelayStream($requestId, $conversationId);
+
+        // What a re-issue after `session_lost` must send again that the conversation row
+        // does not hold: the turn's `bridge_prompt` and whether its input is open.
+        if ($carry !== []) {
+            $this->requestCarry[$requestId] = $carry;
+            // A turn failed by a dropped connection ends outside this class; bound the map
+            // rather than chase every ending.
+            while (count($this->requestCarry) > 1000) {
+                unset($this->requestCarry[array_key_first($this->requestCarry)]);
+            }
+        }
 
         $this->connectionManager->registerPendingRequest(
             $requestId,
@@ -124,6 +200,8 @@ class MessageHandler
             MessageTypes::AI_REQUEST_ACK => $this->handleAiRequestAck($connectionId, $message),
             MessageTypes::POSTURE => $this->handlePosture($connectionId, $message),
             MessageTypes::USAGE_RESULT => $this->handleUsageResult($connectionId, $message),
+            MessageTypes::TURN_INPUT_ACK => $this->handleTurnInputAck($connectionId, $message),
+            MessageTypes::UPLOAD_DONE, MessageTypes::FILE_READ_RESULT => $this->handleTransferAnswer($connectionId, $type, $message),
             MessageTypes::STREAM => $this->handleStreamEnvelope($connectionId, $message),
             MessageTypes::TOOL_CALL => $this->handleToolCall($connectionId, $message),
             MessageTypes::ERROR => $this->handleError($connectionId, $message),
@@ -147,6 +225,9 @@ class MessageHandler
     private function handleHello(string $connectionId, mixed $connection, array $message): array
     {
         $protocolVersion = $message['version'] ?? $message['protocol_version'] ?? 'unknown';
+        // A number, or anything else, where a string belongs is a TypeError in
+        // ltrim() below under strict_types, inside the event loop.
+        $protocolVersion = is_string($protocolVersion) ? $protocolVersion : 'unknown';
 
         // Validate protocol version compatibility — reject incompatible major
         // versions. Minor version differences are allowed (additive changes).
@@ -178,6 +259,7 @@ class MessageHandler
             $providers = self::asList($message['providers'] ?? null);
             $this->connectionManager->setProviders($existingUserId, $providers);
             $this->connectionManager->setWorkspaces($existingUserId, self::asList($message['workspaces'] ?? null));
+            $this->connectionManager->setBridgeInfo($existingUserId, self::bridgeInfoFromHello($message));
 
             $this->logBridgeConnection($existingUserId, $connectionId, $protocolVersion, $providers, 'pre-authenticated');
 
@@ -225,6 +307,7 @@ class MessageHandler
         // Recorded after addConnection(), which is what creates the entry the
         // setter writes into.
         $this->connectionManager->setWorkspaces($userId, self::asList($message['workspaces'] ?? null));
+        $this->connectionManager->setBridgeInfo($userId, self::bridgeInfoFromHello($message));
 
         $this->logBridgeConnection($userId, $connectionId, $protocolVersion, $providers, 'connected');
 
@@ -303,11 +386,70 @@ class MessageHandler
                 : null;
         $ok = ($message['ok'] ?? null) === true && $limits !== [];
 
+        $failure = ['ok' => false, 'reason' => $reason ?? 'failed'];
+
+        // How long to leave the endpoint alone, when the machine was told: whole seconds,
+        // positive, and bounded, since the application schedules its next question from it.
+        $retryAfter = $message['retry_after'] ?? null;
+        if ($failure['reason'] === 'rate_limited' && is_numeric($retryAfter) && (float) $retryAfter > 0) {
+            $failure['retry_after'] = (int) min(self::USAGE_RETRY_AFTER_MAX, (int) ceil((float) $retryAfter));
+        }
+
         $this->connectionManager->resolvePendingUsage($requestId, $userId, $ok
             ? ['ok' => true, 'limits' => $limits]
             // A bridge that said ok but sent nothing usable is not the same as one reporting
             // an empty allowance, and must not be presented as "nothing used".
-            : ['ok' => false, 'reason' => $reason ?? 'failed']);
+            : $failure);
+
+        return null;
+    }
+
+    /**
+     * The bridge's answer to a mid-turn message, handed to whoever is waiting.
+     *
+     * Shaped like handleUsageResult(): the sender must have completed the handshake, and
+     * every field is type-checked, because a TypeError here takes the serve process down.
+     * Only `accepted` means accepted; anything else is a rejection, so a confused frame can
+     * never make the application believe a message reached the assistant.
+     *
+     * Returns null: the answer goes to the waiting HTTP response, not back to the bridge.
+     *
+     * @param  array<string, mixed>  $message
+     */
+    private function handleTurnInputAck(string $connectionId, array $message): ?array
+    {
+        $userId = $this->connectionManager->getUserIdByConnectionId($connectionId);
+
+        if ($userId === null) {
+            Log::warning('AI Bridge: turn_input_ack from unauthenticated connection', [
+                'connection_id' => $connectionId,
+            ]);
+
+            return null;
+        }
+
+        $requestId = $message['request_id'] ?? null;
+        $messageId = $message['message_id'] ?? null;
+
+        if (! is_string($requestId) || $requestId === '' || ! is_string($messageId) || $messageId === '') {
+            Log::warning('AI Bridge: turn_input_ack without a request_id or message_id', [
+                'connection_id' => $connectionId,
+            ]);
+
+            return null;
+        }
+
+        if (($message['status'] ?? null) === 'accepted') {
+            $answer = ['status' => 'accepted'];
+        } else {
+            $reason = $message['reason'] ?? null;
+            $answer = ['status' => 'rejected'];
+            if (is_string($reason) && in_array($reason, self::TURN_INPUT_REASONS, true)) {
+                $answer['reason'] = $reason;
+            }
+        }
+
+        $this->connectionManager->resolvePendingTurnInput($requestId, $messageId, $userId, $answer);
 
         return null;
     }
@@ -405,6 +547,60 @@ class MessageHandler
     }
 
     /**
+     * The capability flags a `hello` may carry, each `true` when present.
+     *
+     * Absent from a bridge that predates the feature, which is what makes them
+     * safe to test: absence means "cannot", never "unknown but probably".
+     */
+    public const HELLO_CAPABILITIES = ['turn_input', 'file_uploads', 'file_downloads', 'app_backends'];
+
+    /**
+     * What a bridge says about itself at `hello`, reduced to checked fields.
+     *
+     * `bridge_version` is the npm release the machine runs (e.g. `0.21.0`), which
+     * is what an application compares against the version it pins to say "this
+     * machine is behind". It is NOT the protocol `version` (still `0.1`), which
+     * only gates the handshake. `attachment_limits` arrives from 0.16.0, in bytes.
+     *
+     * Every field is type-checked, because this runs in the serve process's
+     * event loop and a TypeError there drops every connected bridge.
+     *
+     * @param  array<string, mixed>  $message
+     * @return array{bridge_version: string|null, protocol_version: string|null, attachment_limits: array<string, int>|null, capabilities: list<string>}
+     */
+    public static function bridgeInfoFromHello(array $message): array
+    {
+        $version = $message['bridge_version'] ?? null;
+        $protocol = $message['version'] ?? $message['protocol_version'] ?? null;
+
+        $limits = null;
+        $rawLimits = $message['attachment_limits'] ?? null;
+        if (is_array($rawLimits)) {
+            $limits = [];
+            foreach (['max_file_bytes', 'max_total_bytes', 'max_count'] as $key) {
+                if (is_int($rawLimits[$key] ?? null) && $rawLimits[$key] >= 0) {
+                    $limits[$key] = $rawLimits[$key];
+                }
+            }
+            $limits = $limits === [] ? null : $limits;
+        }
+
+        $capabilities = [];
+        foreach (self::HELLO_CAPABILITIES as $flag) {
+            if (($message[$flag] ?? null) === true) {
+                $capabilities[] = $flag;
+            }
+        }
+
+        return [
+            'bridge_version' => is_string($version) && $version !== '' ? mb_substr($version, 0, 64) : null,
+            'protocol_version' => is_string($protocol) && $protocol !== '' ? mb_substr($protocol, 0, 32) : null,
+            'attachment_limits' => $limits,
+            'capabilities' => $capabilities,
+        ];
+    }
+
+    /**
      * Coerce a hello/providers_update field to a list.
      *
      * These arrive as parsed JSON from a client, and they are handed straight
@@ -440,7 +636,7 @@ class MessageHandler
                 // field ignores it and keeps its own behaviour, so this can
                 // ship without the two moving in step.
                 'silence_timeout' => (int) config('ai-bridge.websocket.silence_timeout', 900),
-            ],
+            ] + self::handedBackConfig(),
             // How much the local CLI environment is allowed to influence
             // behaviour. The bridge translates this into a different per-
             // provider flag set: `isolated` means MCP-only tools, no
@@ -462,6 +658,22 @@ class MessageHandler
         }
 
         return $welcome;
+    }
+
+    /**
+     * Where a file the assistant hands back goes (bridge 0.18+ `config.attachments`).
+     *
+     * `server` (absent, the default): the bridge uploads it to POST /ai-bridge/attachments
+     * and the app's attachment store keeps it. `device`: it stays on the machine and the
+     * `attachment` event carries `path` and `file_id` instead of an id, to be fetched with
+     * MachineFiles::download() when someone opens it. Only sent when set to `device`, so
+     * nothing changes for an application that does not ask.
+     *
+     * @return array<string, string>
+     */
+    private static function handedBackConfig(): array
+    {
+        return config('ai-bridge.transfers.handed_back') === 'device' ? ['attachments' => 'device'] : [];
     }
 
     /**
@@ -546,6 +758,7 @@ class MessageHandler
             'user_id' => $userId,
             'connection_id' => $connectionId,
             'protocol_version' => $protocolVersion,
+            'bridge_version' => $this->connectionManager->getBridgeInfo($userId)['bridge_version'] ?? null,
             'providers' => array_map(fn ($p) => $p['name'] ?? 'unknown', $availableProviders),
         ]);
     }
@@ -651,7 +864,47 @@ class MessageHandler
             ]);
         }
 
+        // The bridge confirming that this turn's input is open, so a message
+        // can reach it while it runs. Written to the turn's stream metadata,
+        // because the process that has to read it — the PHP-FPM worker holding
+        // the person's next message — is not this one. Only `true` counts, and
+        // only from the bridge that owns the turn: this is what makes the
+        // application send a message to a turn rather than hold it.
+        //
+        // Absent from a bridge that predates turn input, and from any turn
+        // that did not ask for it: absence means closed, which is what every
+        // turn meant before.
+        if (($message['input_open'] ?? null) === true
+            && is_string($requestId) && $requestId !== ''
+            && $this->verifySenderOwnsRequest($connectionId, $requestId)) {
+            $this->markInputOpen($requestId);
+        }
+
         return null;
+    }
+
+    /**
+     * Record in the turn's stream metadata that its input is open.
+     *
+     * A store that cannot merge metadata (a custom driver written before the
+     * capability existed) simply does not record it, and the application then
+     * holds a mid-turn message as before. Failures are logged, never thrown:
+     * this runs inside the event loop.
+     */
+    private function markInputOpen(string $requestId): void
+    {
+        try {
+            $store = app(StreamStoreContract::class);
+
+            if ($store instanceof MergesStreamMetadata) {
+                $store->mergeMetadata($requestId, ['input_open' => true]);
+            }
+        } catch (\Throwable $e) {
+            BridgeLog::warning('failed to record input_open in the stream metadata', [
+                'request_id' => $requestId,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     /**
@@ -830,7 +1083,14 @@ class MessageHandler
 
         $handler->dispatchCancelled('Cancelled by user.');
         $this->connectionManager->removePendingRequest($requestId);
-        unset($this->recoveredRequests[$requestId]);
+        $this->forgetRecovery($requestId);
+
+        // The bridge answers the cancel once its CLI has stopped, with the mid-turn messages
+        // the CLI never read. The turn is over here by then, so whose it was is remembered
+        // for that answer (handleCancelled() -> recordLatePendingInputs()).
+        if ($userId !== null) {
+            $this->connectionManager->rememberStoppedRequest($requestId, $userId);
+        }
     }
 
     /**
@@ -1070,6 +1330,7 @@ class MessageHandler
                 'request_id' => $requestId,
                 'usage' => $usage,
             ]);
+            $this->settleOrphanedTurn($connectionId, (string) $requestId);
 
             return null;
         }
@@ -1096,7 +1357,7 @@ class MessageHandler
         // arrived.
         $handler->dispatchDone($usage, array_diff_key($data, ['usage' => true]));
         $this->connectionManager->removePendingRequest($requestId);
-        unset($this->recoveredRequests[$requestId]);
+        $this->forgetRecovery($requestId);
 
         return null;
     }
@@ -1150,6 +1411,11 @@ class MessageHandler
 
         $handler = $this->connectionManager->getPendingRequest($requestId);
         if (! $handler) {
+            // session_lost asks for a re-issue; only a real ending settles a lost turn.
+            if ($code !== 'session_lost') {
+                $this->settleOrphanedTurn($connectionId, (string) $requestId);
+            }
+
             return null;
         }
 
@@ -1181,7 +1447,7 @@ class MessageHandler
 
         $handler->dispatchError($code, $errorMessage);
         $this->connectionManager->removePendingRequest($requestId);
-        unset($this->recoveredRequests[$requestId]);
+        $this->forgetRecovery($requestId);
 
         return null;
     }
@@ -1210,7 +1476,7 @@ class MessageHandler
             ]);
             $handler->dispatchError('session_lost', $detail);
             $this->connectionManager->removePendingRequest($requestId);
-            unset($this->recoveredRequests[$requestId]);
+            $this->forgetRecovery($requestId);
 
             return null;
         }
@@ -1240,7 +1506,7 @@ class MessageHandler
         $conversation->save();
 
         $userId = (string) $this->connectionManager->getUserIdByConnectionId($connectionId);
-        $payload = $this->buildFreshAiRequest($conversation, $requestId);
+        $payload = $this->buildFreshAiRequest($conversation, $requestId, $this->requestCarry[$requestId] ?? []);
 
         BridgeLog::info('session_lost — wiped cli_session_id, re-issuing as a fresh session', [
             'request_id' => $requestId,
@@ -1257,7 +1523,7 @@ class MessageHandler
             ]);
             $handler->dispatchError('bridge_send_failed', 'Could not recover the lost CLI session.');
             $this->connectionManager->removePendingRequest($requestId);
-            unset($this->recoveredRequests[$requestId]);
+            $this->forgetRecovery($requestId);
         }
 
         return null;
@@ -1273,7 +1539,7 @@ class MessageHandler
      *
      * @return array<string, mixed>
      */
-    private function buildFreshAiRequest(Conversation $conversation, string $requestId): array
+    private function buildFreshAiRequest(Conversation $conversation, string $requestId, array $carry = []): array
     {
         $history = $conversation->historyFor();
         $current = array_pop($history); // the latest (user) turn to respond to
@@ -1284,7 +1550,13 @@ class MessageHandler
             'provider' => (string) ($conversation->provider ?? ''),
             'message' => is_array($current) ? (string) ($current['content'] ?? '') : '',
             'system_prompt' => $conversation->system_prompt ?: null,
-            'options' => ['model' => $conversation->model ?: null],
+            'options' => [
+                'model' => $conversation->model ?: null,
+                // Asked for on the original turn; without it the re-issue runs with its
+                // input closed while the stream metadata still says it is open.
+                'accepts_input' => ($carry['accepts_input'] ?? null) === true ? true : null,
+            ],
+            'bridge_prompt' => $carry['bridge_prompt'] ?? null,
             'cli_session_id' => null,
             'history' => array_values($history),
             'tools' => $this->toolRegistry->toArray($conversation->allowed_tools),
@@ -1312,6 +1584,22 @@ class MessageHandler
         $rawMessage = $message['data']['message'] ?? $message['message'] ?? 'Unknown error';
         $errorMessage = mb_substr(strip_tags($rawMessage), 0, 500);
 
+        $pending = self::pendingInputsOf($message);
+
+        // The normal way this frame arrives for a turn this process has already
+        // ended: the bridge's connection dropped mid-turn, this side failed the
+        // turn at once (bridge_disconnected), and the bridge, once reconnected,
+        // replays its own account of the ending — with the messages the CLI never
+        // read. That list is the only word on which delivered messages were read
+        // before the connection went, so it is recorded rather than discarded.
+        if (is_string($requestId) && $requestId !== ''
+            && $this->connectionManager->getPendingRequest($requestId) === null) {
+            $this->recordLatePendingInputs($connectionId, $requestId, $pending);
+            $this->settleOrphanedTurn($connectionId, $requestId);
+
+            return null;
+        }
+
         // Verify the sender owns this request before dispatching the error.
         if (! $this->verifySenderOwnsRequest($connectionId, $requestId)) {
             Log::warning('AI Bridge: error message from wrong or unregistered user, discarding', [
@@ -1331,12 +1619,74 @@ class MessageHandler
 
         $handler = $this->connectionManager->getPendingRequest($requestId);
         if ($handler) {
-            $handler->dispatchError($code, $errorMessage);
+            $handler->dispatchError($code, $errorMessage, $pending !== null ? ['pending_inputs' => $pending] : []);
             $this->connectionManager->removePendingRequest($requestId);
-            unset($this->recoveredRequests[$requestId]);
+            $this->forgetRecovery($requestId);
         }
 
         return null;
+    }
+
+    /**
+     * The `pending_inputs` a terminal frame carries: a list of non-empty ids, or null when
+     * the frame has none (a turn whose input was not open, or an older bridge).
+     *
+     * @param  array<string, mixed>  $message
+     * @return list<string>|null
+     */
+    private static function pendingInputsOf(array $message): ?array
+    {
+        $pending = $message['pending_inputs'] ?? $message['data']['pending_inputs'] ?? null;
+
+        if (! is_array($pending) || ! array_is_list($pending)) {
+            return null;
+        }
+
+        return array_values(array_filter($pending, static fn ($id): bool => is_string($id) && $id !== ''));
+    }
+
+    /**
+     * Record the unread-message list a bridge replays for a turn this side already ended.
+     *
+     * Only for a turn this process failed because that same user's bridge went away
+     * (BridgeConnectionManager remembers those briefly), so a bridge cannot write into
+     * another user's turn by naming its id. Written to the turn's stream metadata as
+     * `pending_inputs`, where an application reads it with
+     * StreamStore::status($requestId)['metadata']['pending_inputs'], and announced as a TurnInputsReturned event, which fires
+     * in the serve process.
+     *
+     * @param  list<string>|null  $pending
+     */
+    private function recordLatePendingInputs(string $connectionId, string $requestId, ?array $pending): void
+    {
+        $userId = $this->connectionManager->getUserIdByConnectionId($connectionId);
+        $owner = $this->connectionManager->takeDroppedRequestOwner($requestId);
+
+        if ($userId === null || $owner === null || $owner !== $userId) {
+            Log::info('AI Bridge: error for a turn that has already been cleaned up', [
+                'connection_id' => $connectionId,
+                'request_id' => $requestId,
+            ]);
+
+            return;
+        }
+
+        if ($pending === null) {
+            return;
+        }
+
+        try {
+            $store = app(StreamStoreContract::class);
+            if ($store instanceof MergesStreamMetadata) {
+                $store->mergeMetadata($requestId, ['pending_inputs' => $pending]);
+            }
+            \Tetrix\AiBridge\Events\TurnInputsReturned::dispatch($userId, $requestId, $pending);
+        } catch (\Throwable $e) {
+            BridgeLog::warning('failed to record the unread messages of a dropped turn', [
+                'request_id' => $requestId,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     /**
@@ -1368,10 +1718,23 @@ class MessageHandler
         // owner ('' or '0') reads as absent, and this would then say a live
         // turn had "already been cleaned up".
         if ($this->connectionManager->getPendingRequest($requestId) === null) {
+            // A stop ended the turn here first; the bridge's answer still names the messages
+            // the CLI never read, and those go back to the person like any other unread ones
+            // (stream metadata `pending_inputs` and TurnInputsReturned). Only for the user whose
+            // turn it was, which recordLatePendingInputs() checks.
+            $pending = self::pendingInputsOf($message);
+            if ($pending !== null && $pending !== []) {
+                $this->recordLatePendingInputs($connectionId, $requestId, $pending);
+                $this->settleOrphanedTurn($connectionId, (string) $requestId);
+
+                return null;
+            }
+
             Log::info('AI Bridge: cancelled for a turn that has already been cleaned up', [
                 'connection_id' => $connectionId,
                 'request_id' => $requestId,
             ]);
+            $this->settleOrphanedTurn($connectionId, (string) $requestId);
 
             return null;
         }
@@ -1394,12 +1757,32 @@ class MessageHandler
 
         $handler = $this->connectionManager->getPendingRequest($requestId);
         if ($handler) {
-            $handler->dispatchCancelled('Request was cancelled.');
+            // Messages delivered mid-turn that the CLI never read, so the
+            // application can offer them again rather than count them as
+            // answered. Only a list of ids passes.
+            $pending = self::pendingInputsOf($message) ?? [];
+
+            $handler->dispatchCancelled('Request was cancelled.', $pending !== [] ? ['pending_inputs' => $pending] : []);
             $this->connectionManager->removePendingRequest($requestId);
-            unset($this->recoveredRequests[$requestId]);
+            $this->forgetRecovery($requestId);
         }
 
         return null;
+    }
+
+    /**
+     * A bridge ended a turn no handler here knows: most often one a serve process that has
+     * since restarted was running, so its handler (and the recorder that clears the
+     * conversation's `streaming_request_id`) died with it. Settled only for the bridge of the
+     * user the conversation is routed to; see TurnMarker::settleOrphan().
+     */
+    private function settleOrphanedTurn(string $connectionId, string $requestId): void
+    {
+        if ($requestId === '') {
+            return;
+        }
+
+        TurnMarker::settleOrphan($requestId, $this->connectionManager->getUserIdByConnectionId($connectionId));
     }
 
     /**

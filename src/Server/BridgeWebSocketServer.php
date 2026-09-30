@@ -23,6 +23,7 @@ use Tetrix\AiBridge\Auth\TokenManager;
 use Tetrix\AiBridge\Protocol\AiRequestPayload;
 use Tetrix\AiBridge\Support\BridgeLog;
 use Tetrix\AiBridge\Protocol\MessageTypes;
+use Tetrix\AiBridge\Transfers\TransferHub;
 use Tetrix\AiBridge\WebSocket\BridgeConnectionManager;
 use Tetrix\AiBridge\WebSocket\MessageHandler;
 
@@ -62,6 +63,9 @@ class BridgeWebSocketServer
      */
     private ?ServerNegotiator $negotiator = null;
 
+    /** Where streamed uploads and downloads meet the machine (bridge 0.18+). */
+    private ?TransferHub $transfers = null;
+
     public function __construct(
         private readonly BridgeConnectionManager $connectionManager,
         private readonly MessageHandler $messageHandler,
@@ -94,6 +98,8 @@ class BridgeWebSocketServer
 
         $this->socket = new SocketServer("{$this->host}:{$this->port}", [], $this->loop);
 
+        $this->useTransferHub(new TransferHub($this->connectionManager, $this->tokenManager, $this->loop));
+
         $this->socket->on('connection', function (ConnectionInterface $tcpConnection) use ($handler) {
             $this->handleTcpConnection($tcpConnection, $handler);
         });
@@ -113,6 +119,17 @@ class BridgeWebSocketServer
         }
 
         $this->loop->run();
+    }
+
+    /**
+     * Wire the transfer hub in: the message handler hands it `upload_done` and
+     * `file_read_result`, and a machine that goes away ends its transfers at once.
+     */
+    public function useTransferHub(TransferHub $hub): void
+    {
+        $this->transfers = $hub;
+        $this->messageHandler->setTransferHub($hub);
+        $this->connectionManager->onUserGone(static fn (string $userId) => $hub->userGone($userId));
     }
 
     /**
@@ -159,6 +176,17 @@ class BridgeWebSocketServer
 
                 $headersComplete = true;
                 $headerLength = $headerEnd + 4;
+
+                // A file on its way through (an upload from a worker, or a machine
+                // collecting or delivering one) is streamed, never buffered: it can be
+                // far larger than any body limit here, and holding it is the one thing
+                // this path exists not to do. Decided on the headers alone.
+                if ($this->maybeStreamTransfer($tcpConnection, substr($httpBuffer, 0, $headerEnd), (string) substr($httpBuffer, $headerLength), $httpListener)) {
+                    $upgraded = true;
+                    $httpBuffer = '';
+
+                    return;
+                }
 
                 // Extract Content-Length from headers to know how much body to expect
                 $headerSection = substr($httpBuffer, 0, $headerEnd);
@@ -384,10 +412,106 @@ class BridgeWebSocketServer
     //
     // Endpoints:
     //   POST /api/request    — Send an ai_request to a user's bridge
+    //   POST /api/request/input — Send a message into a user's running turn
     //   POST /api/disconnect — Forcibly drop a user's bridge connection
+    //   POST /api/upload     — Stream a browser's file to the user's machine (TransferHub)
+    //   POST /api/file-read  — Stream a file from the user's machine (TransferHub)
     //   GET  /api/status     — Check connected users
     //   GET  /api/health     — Health check
     // -------------------------------------------------------------------------
+
+    /**
+     * Hand a request to the transfer hub if it is one of the streamed ones.
+     *
+     *  - `POST /api/upload` from a worker (internal relay token): a browser's file.
+     *  - `GET|POST <any path>?transfer=<id>` from a machine (its own token): collecting
+     *    an upload, or delivering a download. Reached through the public WebSocket
+     *    location, whose path is matched exactly and whose query is free.
+     *
+     * @return bool  True when the request was taken over (the caller stops buffering).
+     */
+    private function maybeStreamTransfer(ConnectionInterface $tcp, string $head, string $early, ?callable $httpListener): bool
+    {
+        if ($this->transfers === null) {
+            return false;
+        }
+
+        $lines = explode("\r\n", $head);
+        $parts = explode(' ', (string) array_shift($lines));
+        if (count($parts) < 2) {
+            return false;
+        }
+        [$method, $target] = [strtoupper($parts[0]), $parts[1]];
+        $path = (string) parse_url($target, PHP_URL_PATH);
+        parse_str((string) parse_url($target, PHP_URL_QUERY), $query);
+
+        $isUpload = $method === 'POST' && $path === '/api/upload';
+        $transferId = is_string($query['transfer'] ?? null) ? $query['transfer'] : null;
+        $isMachine = ! $isUpload && $transferId !== null && in_array($method, ['GET', 'POST'], true)
+            && ! str_starts_with($path, '/api/status') && ! str_starts_with($path, '/api/request');
+
+        if (! $isUpload && ! $isMachine) {
+            return false;
+        }
+
+        $headers = [];
+        foreach ($lines as $line) {
+            $colon = strpos($line, ':');
+            if ($colon !== false) {
+                $headers[strtolower(trim(substr($line, 0, $colon)))] = trim(substr($line, $colon + 1));
+            }
+        }
+
+        if ($httpListener !== null) {
+            $tcp->removeListener('data', $httpListener);
+        }
+
+        if ($isMachine) {
+            $this->transfers->machineRequest($tcp, $method, (string) $transferId, $headers, $early);
+
+            return true;
+        }
+
+        $auth = $headers['authorization'] ?? '';
+        try {
+            if (! str_starts_with($auth, 'Bearer ')) {
+                throw new \RuntimeException('missing token');
+            }
+            $decoded = $this->tokenManager->validate(substr($auth, 7), TokenManager::INTERNAL_RELAY_SCOPE);
+            $userId = (string) ($decoded->sub ?? '');
+            if ($userId === '') {
+                throw new \RuntimeException('missing subject');
+            }
+        } catch (\Throwable) {
+            TransferHub::answer($tcp, 401, ['ok' => false, 'code' => 'invalid_token', 'error' => 'A relay token is required.'], drain: true);
+
+            return true;
+        }
+
+        $this->transfers->startUpload($tcp, $userId, $headers, $early);
+
+        return true;
+    }
+
+    /**
+     * POST /api/file-read — stream a file the machine recorded back to the worker.
+     *
+     * Body `{file_id, range?, head?}`. Answered by the transfer hub: headers as soon as
+     * the machine says whether it has the file, then the bytes as the machine sends them.
+     */
+    private function apiFileRead(ConnectionInterface $tcpConnection, RequestInterface $request, object $decoded): void
+    {
+        $userId = (string) ($decoded->sub ?? '');
+        $body = json_decode((string) $request->getBody(), true);
+
+        if ($userId === '' || ! is_array($body) || $this->transfers === null) {
+            $this->httpResponse($tcpConnection, 400, ['ok' => false, 'code' => 'invalid_request', 'error' => 'Body must be JSON with "file_id".']);
+
+            return;
+        }
+
+        $this->transfers->startDownload($tcpConnection, $userId, $body);
+    }
 
     /**
      * Check whether the HTTP request is a WebSocket upgrade.
@@ -450,8 +574,10 @@ class BridgeWebSocketServer
         match (true) {
             $method === 'GET' && $path === '/api/status' => $this->apiStatus($tcpConnection, $decoded),
             $method === 'POST' && $path === '/api/request' => $this->apiRequest($tcpConnection, $request, $decoded),
+            $method === 'POST' && $path === '/api/request/input' => $this->apiRequestInput($tcpConnection, $request, $decoded),
             $method === 'GET' && $path === '/api/usage' => $this->apiUsage($tcpConnection, $request, $decoded),
             $method === 'POST' && $path === '/api/disconnect' => $this->apiDisconnect($tcpConnection, $decoded),
+            $method === 'POST' && $path === '/api/file-read' => $this->apiFileRead($tcpConnection, $request, $decoded),
             default => $this->httpResponse($tcpConnection, 404, [
                 'error' => 'not_found',
                 'message' => "Unknown endpoint: {$method} {$path}",
@@ -555,6 +681,197 @@ class BridgeWebSocketServer
     }
 
     /**
+     * POST /api/request/input — Send a message into a turn that is still running.
+     *
+     * Body: `{request_id, message_id, content}`, `content` being a string or a list of
+     * content blocks. Answers `{status: 'accepted'|'rejected', reason?}` once the bridge's
+     * `turn_input_ack` arrives, and waits no longer than `turn_input_timeout` for it.
+     *
+     * Rejections the bridge gives are passed on (`turn_not_running`, `turn_ending`,
+     * `input_not_open`).
+     * The ones decided here:
+     *  - `turn_not_running` — this process has no running turn under that id, so there is
+     *    nothing to send it to (the turn ended, or never started). The caller then starts a
+     *    new turn with the message, which is what that reason means.
+     *  - `no_answer` — the bridge did not answer in time, or disconnected first. It may or
+     *    may not have taken the message, so this must never read as `turn_not_running`.
+     *  - `duplicate` — the same message is already waiting on its answer; sending it again
+     *    would write it to the CLI twice.
+     *  - `send_failed` — the frame could not be written to the bridge's socket.
+     *
+     * **The requesting user must own the turn**, checked exactly as apiRequest() checks a
+     * caller-supplied request_id: the user is the token's subject, never the body, and a
+     * turn registered to anyone else is refused with 403. Otherwise any relay token could
+     * write into any running conversation whose request id it had learned.
+     */
+    private function apiRequestInput(ConnectionInterface $tcpConnection, RequestInterface $request, object $decoded): void
+    {
+        $body = json_decode((string) $request->getBody(), true);
+        $userId = (string) ($decoded->sub ?? '');
+
+        if ($userId === '') {
+            $this->httpResponse($tcpConnection, 400, [
+                'error' => 'missing_subject',
+                'message' => 'Token is missing the "sub" claim.',
+            ]);
+
+            return;
+        }
+
+        // Shape-checked before anything touches it, for the reason apiRequest() gives: a
+        // TypeError here is raised inside a ReactPHP callback and exits the serve process.
+        $requestId = is_array($body) ? ($body['request_id'] ?? null) : null;
+        $messageId = is_array($body) ? ($body['message_id'] ?? null) : null;
+        $content = is_array($body) ? ($body['content'] ?? null) : null;
+
+        if (! is_string($requestId) || $requestId === ''
+            || ! is_string($messageId) || $messageId === ''
+            || ! ((is_string($content) && $content !== '') || (is_array($content) && $content !== [] && array_is_list($content)))) {
+            $this->httpResponse($tcpConnection, 400, [
+                'error' => 'invalid_request',
+                'message' => 'Body must be JSON with string "request_id" and "message_id", and "content" as a non-empty string or list of content blocks.',
+            ]);
+
+            return;
+        }
+
+        // The bridge takes text and nothing else: a frame whose content is not a non-empty
+        // string is dropped there WITHOUT an ack, which this side would then report as
+        // `no_answer` ("it may have taken it") five seconds later. So a list of content
+        // blocks is reduced to its text here, and one with no text is refused now.
+        $text = self::turnInputText($content);
+
+        if ($text === '') {
+            $this->httpResponse($tcpConnection, 400, [
+                'error' => 'invalid_request',
+                'message' => 'Turn input carries text only, and this content has none.',
+            ]);
+
+            return;
+        }
+
+        // Asked with getPendingRequest() rather than by owner: a request registered with a
+        // falsy owner reads as absent through getPendingRequestUserId(), and must not be
+        // mistaken for "not running" — it is someone's, just not provably this caller's.
+        if ($this->connectionManager->getPendingRequest($requestId) === null) {
+            $this->httpResponse($tcpConnection, 200, [
+                'status' => 'rejected',
+                'reason' => 'turn_not_running',
+            ]);
+
+            return;
+        }
+
+        if ($this->connectionManager->getPendingRequestUserId($requestId) !== $userId) {
+            Log::warning('AI Bridge: turn input for a request owned by a different user — refused', [
+                'request_id' => $requestId,
+                'caller_user_id' => $userId,
+            ]);
+
+            // SEC: not the owner's id, and not whether it is running — only a refusal.
+            $this->httpResponse($tcpConnection, 403, [
+                'status' => 'rejected',
+                'reason' => 'not_owner',
+            ]);
+
+            return;
+        }
+
+        if ($this->connectionManager->hasPendingTurnInput($requestId, $messageId)) {
+            $this->httpResponse($tcpConnection, 200, [
+                'status' => 'rejected',
+                'reason' => 'duplicate',
+            ]);
+
+            return;
+        }
+
+        $answered = false;
+
+        // Registered BEFORE sending, as apiRequest() registers its turn: a bridge on the same
+        // host can acknowledge before sendToUser() has even returned.
+        $this->connectionManager->registerPendingTurnInput(
+            $requestId,
+            $messageId,
+            $userId,
+            function (array $answer) use (&$answered, $tcpConnection): void {
+                if ($answered) {
+                    return;
+                }
+
+                $answered = true;
+                $this->httpResponse($tcpConnection, 200, $answer);
+            }
+        );
+
+        $sent = $this->connectionManager->sendToUser($userId, [
+            'type' => MessageTypes::TURN_INPUT,
+            'request_id' => $requestId,
+            'message_id' => $messageId,
+            'content' => $text,
+        ]);
+
+        if (! $sent) {
+            $this->connectionManager->forgetPendingTurnInput($requestId, $messageId);
+
+            if (! $answered) {
+                $answered = true;
+                $this->httpResponse($tcpConnection, 200, [
+                    'status' => 'rejected',
+                    'reason' => 'send_failed',
+                ]);
+            }
+
+            return;
+        }
+
+        if ($answered) {
+            return;
+        }
+
+        // A bridge too old to know turn_input never answers. It also never confirms
+        // `input_open`, so a well-behaved caller does not get here with one — but a caller
+        // that does must not be held open for ever.
+        $timeout = (float) config('ai-bridge.server.turn_input_timeout', 5);
+
+        $this->loop->addTimer($timeout, function () use ($requestId, $messageId, &$answered, $tcpConnection): void {
+            $this->connectionManager->forgetPendingTurnInput($requestId, $messageId);
+
+            if ($answered) {
+                return;
+            }
+
+            $answered = true;
+            $this->httpResponse($tcpConnection, 200, [
+                'status' => 'rejected',
+                'reason' => 'no_answer',
+            ]);
+        });
+    }
+
+    /**
+     * The text of a turn input: the string itself, or the `text` of each text block of a
+     * list, joined by blank lines. Anything that is not text is left out.
+     */
+    private static function turnInputText(mixed $content): string
+    {
+        if (is_string($content)) {
+            return $content;
+        }
+
+        $parts = [];
+        foreach (is_array($content) ? $content : [] as $block) {
+            if (is_string($block)) {
+                $parts[] = $block;
+            } elseif (is_array($block) && ($block['type'] ?? 'text') === 'text' && is_string($block['text'] ?? null)) {
+                $parts[] = $block['text'];
+            }
+        }
+
+        return trim(implode("\n\n", array_filter($parts, static fn (string $p): bool => $p !== '')));
+    }
+
+    /**
      * GET /api/status — Return connection status for the authenticated user only.
      *
      * SEC: Only shows the requesting user's own connection data, not all users.
@@ -591,6 +908,9 @@ class BridgeWebSocketServer
             // What the bridge is actually running as, which only this process
             // knows and which a PHP-FPM worker otherwise cannot see.
             $response['posture'] = $this->connectionManager->getPosture($userId);
+            // What the bridge said about itself at hello: its release, its
+            // attachment caps, and which optional frames it understands.
+            $response['bridge'] = $this->connectionManager->getBridgeInfo($userId);
         }
 
         $this->httpResponse($tcpConnection, 200, $response);
@@ -759,7 +1079,10 @@ class BridgeWebSocketServer
         // stream events from the bridge can be verified and buffered for the
         // browser's SSE tail. Register BEFORE sending so a fast bridge reply
         // cannot race ahead of the registration.
-        $this->messageHandler->registerRelayedRequest($requestId, $userId, (string) $conversationId);
+        $this->messageHandler->registerRelayedRequest($requestId, $userId, (string) $conversationId, array_filter([
+            'bridge_prompt' => $payload['bridge_prompt'] ?? null,
+            'accepts_input' => ($payload['options']['accepts_input'] ?? null) === true ? true : null,
+        ], static fn ($v) => $v !== null));
 
         $sent = $this->connectionManager->sendToUser($userId, $payload);
 
@@ -789,7 +1112,7 @@ class BridgeWebSocketServer
     {
         // 413 is included so the buffer-overflow guard in handleTcpConnection()
         // can use httpResponse() consistently.
-        $statusTexts = [200 => 'OK', 400 => 'Bad Request', 401 => 'Unauthorized', 404 => 'Not Found', 413 => 'Payload Too Large', 500 => 'Internal Server Error', 504 => 'Gateway Timeout'];
+        $statusTexts = [200 => 'OK', 400 => 'Bad Request', 401 => 'Unauthorized', 403 => 'Forbidden', 404 => 'Not Found', 413 => 'Payload Too Large', 500 => 'Internal Server Error', 504 => 'Gateway Timeout'];
         $statusText = $statusTexts[$statusCode] ?? 'Unknown';
 
         $json = json_encode($data, JSON_UNESCAPED_SLASHES);

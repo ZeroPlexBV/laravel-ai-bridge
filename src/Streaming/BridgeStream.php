@@ -149,6 +149,10 @@ class BridgeStream implements StreamableProvider
                 'temperature' => $this->options['temperature'] ?? null,
                 'max_tokens' => $this->options['max_tokens'] ?? null,
                 'model' => $this->options['model'] ?? null,
+                // Keep the turn's input open so a message can reach it while
+                // it runs (AiBridge::sendTurnInput). Opt-in per turn; the
+                // bridge confirms it with `input_open` on the ack.
+                'accepts_input' => ($this->options['accepts_input'] ?? null) === true ? true : null,
             ],
             'cli_session_id' => $this->options['cli_session_id'] ?? null,
             'history' => $this->options['messages'] ?? null,
@@ -159,6 +163,9 @@ class BridgeStream implements StreamableProvider
             // refuses a resume that names somewhere else.
             'working_dir' => $this->options['working_dir'] ?? null,
             'attachments' => $this->options['attachments'] ?? null,
+            // How the bridge's own prompt addendum is handled (default, off,
+            // append, replace). See AiRequestPayload::normaliseBridgePrompt().
+            'bridge_prompt' => $this->options['bridge_prompt'] ?? null,
         ]);
     }
 
@@ -320,6 +327,10 @@ class BridgeStream implements StreamableProvider
 
             if (isset($payload['attachments'])) {
                 $relayBody['attachments'] = $payload['attachments'];
+            }
+
+            if (isset($payload['bridge_prompt'])) {
+                $relayBody['bridge_prompt'] = $payload['bridge_prompt'];
             }
 
             BridgeLog::verbose('relay request payload', [
