@@ -96,6 +96,17 @@ final class RedisStreamStore implements StreamStoreContract, MergesStreamMetadat
 
         $conn->expire($eventsKey, $this->streamingTtl);
 
+        // A live turn's status and metadata last as long as its log does. Only the log was
+        // renewed here, so the other two expired $streamingTtl after the turn STARTED,
+        // however busy it was: past that a long turn read as not_found while it still
+        // wrote events, and inputOpen() refused every message for it. Only while it
+        // streams, so an event after the end cannot stretch a finished turn's short life.
+        $statusKey = $this->key($requestId, 'status');
+        if ($conn->get($statusKey) === 'streaming') {
+            $conn->expire($statusKey, $this->streamingTtl);
+            $conn->expire($this->key($requestId, 'meta'), $this->streamingTtl);
+        }
+
         return $newLength - 1;
     }
 
