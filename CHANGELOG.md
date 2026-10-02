@@ -3,6 +3,21 @@
 Release notes for earlier versions are on the GitHub releases page of
 tetrixdev/laravel-ai-bridge. This file starts with 0.16.0-RC1.
 
+## [0.16.1] — 2026-10-02
+
+### Fixed
+
+- **A turn running for more than an hour stopped taking messages.** The Redis stream store
+  renewed only a turn's event log as events came in. Its status and metadata kept the lifetime
+  they got when the turn started (`ttl_streaming`, an hour by default), so a long turn (a helper
+  working on) read as `not_found` while it was still writing events, and `inputOpen()` refused
+  every message typed for it. In the chat, "Send now" said the reply was not taking messages
+  while the assistant was free. Each event now renews the status and metadata too, while the
+  turn is streaming. A turn that goes quiet still expires `ttl_streaming` after its last event,
+  and an event after the end does not stretch a finished turn.
+
+No migration, no config change.
+
 ## [0.16.0] — 2026-09-30
 
 The final release of 0.16.0, identical in code to 0.16.0-RC1. It pairs with **zeroplex/ai 9.4.0**
