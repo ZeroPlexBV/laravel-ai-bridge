@@ -2,7 +2,11 @@
 
 declare(strict_types=1);
 
+use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Http;
+use Tetrix\AiBridge\Connections\ConnectionStatus;
+use Tetrix\AiBridge\Models\Connection;
 use Tetrix\AiBridge\Auth\TokenManager;
 use Tetrix\AiBridge\Contracts\HasView;
 use Tetrix\AiBridge\Contracts\ToolHandler;
@@ -17,9 +21,12 @@ use Tetrix\AiBridge\Tools\ViewRegistry;
 use Tetrix\AiBridge\WebSocket\BridgeConnectionManager;
 use Tetrix\AiBridge\WebSocket\MessageHandler;
 
+uses(RefreshDatabase::class);
+
 /*
 |--------------------------------------------------------------------------
-| Tools with a view (MCP Apps): declaring one, and the views registry
+| Tools with a view (MCP Apps): declaring one, the views registry, and the
+| bridge's hello `mcp_apps`
 |--------------------------------------------------------------------------
 */
 
@@ -179,4 +186,61 @@ describe('the views registry', function () {
         $views->register('ui://app/card', fn () => ['not' => 'html']);
         $views->render('ui://app/card');
     })->throws(UnexpectedValueException::class);
+});
+
+describe('hello mcp_apps', function () {
+    function mcpAppsHello(array $extra): BridgeConnectionManager
+    {
+        Event::fake();
+        $manager = new BridgeConnectionManager();
+        $manager->addConnection('user-1', 'conn-1');
+        (new MessageHandler($manager, app(TokenManager::class), new ToolRegistry()))
+            ->handleMessage('conn-1', null, json_encode(['type' => 'hello', 'version' => '0.1', 'bridge_version' => '0.29.0', 'providers' => []] + $extra));
+
+        return $manager;
+    }
+
+    it('records a valid mcp_apps object in the bridge record', function () {
+        $manager = mcpAppsHello(['mcp_apps' => ['spec' => '2026-01-26', 'revision' => 1]]);
+
+        expect($manager->getBridgeInfo('user-1')['mcp_apps'])->toBe(['spec' => '2026-01-26', 'revision' => 1]);
+    });
+
+    it('records none for an older bridge or a malformed field', function (mixed $field) {
+        $manager = mcpAppsHello($field === 'absent' ? [] : ['mcp_apps' => $field]);
+
+        expect($manager->getBridgeInfo('user-1')['mcp_apps'])->toBeNull();
+    })->with(['absent', true, 'yes', [[]], [['spec' => 3]], [['spec' => '']]]);
+
+    it('reports mcp_apps on the connection status, from last_bridge too while the machine is off', function () {
+        Http::fake(['*/api/status' => Http::sequence()
+            ->push([
+                'connected' => true,
+                'connected_at' => now()->timestamp,
+                'providers' => [],
+                'bridge' => MessageHandler::bridgeInfoFromHello(['bridge_version' => '0.29.0', 'mcp_apps' => ['spec' => '2026-01-26', 'revision' => 1]]),
+            ])
+            ->push(['connected' => false])]);
+
+        $connection = Connection::create(['type' => Connection::TYPE_BRIDGE, 'name' => 'box', 'connection_key' => 'key-1']);
+        $status = app(ConnectionStatus::class);
+
+        expect($status->for($connection)['mcp_apps'])->toBeTrue()
+            ->and($connection->fresh()->last_bridge['mcp_apps'])->toBe(['spec' => '2026-01-26', 'revision' => 1])
+            ->and($status->for($connection->fresh())['mcp_apps'])->toBeTrue();
+    });
+
+    it('reports mcp_apps false for a bridge that never sent it, and for BYOK', function () {
+        Http::fake(['*/api/status' => Http::response([
+            'connected' => true,
+            'providers' => [],
+            'bridge' => MessageHandler::bridgeInfoFromHello(['bridge_version' => '0.26.0']),
+        ])]);
+
+        $bridge = Connection::create(['type' => Connection::TYPE_BRIDGE, 'name' => 'box', 'connection_key' => 'key-2']);
+        $byok = Connection::create(['type' => Connection::TYPE_BYOK, 'name' => 'key']);
+
+        expect(app(ConnectionStatus::class)->for($bridge)['mcp_apps'])->toBeFalse()
+            ->and(app(ConnectionStatus::class)->for($byok)['mcp_apps'])->toBeFalse();
+    });
 });

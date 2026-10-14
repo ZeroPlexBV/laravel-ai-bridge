@@ -567,12 +567,14 @@ class MessageHandler
      * `self_update` is whether the bridge will follow `desired_bridge_version`
      * (0.24.0+); absent or non-boolean is false, which is what every older
      * bridge sends and which is right: it cannot follow one.
+     * `mcp_apps` is the MCP Apps support the bridge announced (0.27+), as
+     * `{spec, revision}`, or null: absent, or not an object naming a spec.
      *
      * Every field is type-checked, because this runs in the serve process's
      * event loop and a TypeError there drops every connected bridge.
      *
      * @param  array<string, mixed>  $message
-     * @return array{bridge_version: string|null, protocol_version: string|null, attachment_limits: array<string, int>|null, capabilities: list<string>, self_update: bool}
+     * @return array{bridge_version: string|null, protocol_version: string|null, attachment_limits: array<string, int>|null, capabilities: list<string>, self_update: bool, mcp_apps: array{spec: string, revision: int|null}|null}
      */
     public static function bridgeInfoFromHello(array $message): array
     {
@@ -604,6 +606,25 @@ class MessageHandler
             'attachment_limits' => $limits,
             'capabilities' => $capabilities,
             'self_update' => ($message['self_update'] ?? null) === true,
+            'mcp_apps' => self::mcpAppsOf($message['mcp_apps'] ?? null),
+        ];
+    }
+
+    /**
+     * The hello's `mcp_apps` reduced to `{spec, revision}`, or null when it is not
+     * an object naming a spec (an older bridge sends none).
+     *
+     * @return array{spec: string, revision: int|null}|null
+     */
+    private static function mcpAppsOf(mixed $value): ?array
+    {
+        if (! is_array($value) || ! is_string($value['spec'] ?? null) || $value['spec'] === '') {
+            return null;
+        }
+
+        return [
+            'spec' => mb_substr($value['spec'], 0, 32),
+            'revision' => is_int($value['revision'] ?? null) ? $value['revision'] : null,
         ];
     }
 

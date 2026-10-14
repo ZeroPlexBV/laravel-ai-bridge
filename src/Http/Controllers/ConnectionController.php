@@ -62,6 +62,8 @@ class ConnectionController extends Controller
                 // Its attachment caps and the optional frames it knows.
                 $data['attachment_limits'] = $status['attachment_limits'] ?? null;
                 $data['capabilities'] = $status['capabilities'] ?? [];
+                // Whether it passes MCP Apps through, so a tool's view can show.
+                $data['mcp_apps'] = $status['mcp_apps'] ?? false;
                 $data['connected'] = $status['connected'];
             }
 
