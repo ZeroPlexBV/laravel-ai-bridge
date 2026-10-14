@@ -1057,15 +1057,12 @@ plain HTML that talks to its host through `postMessage`. Needs `@tetrixdev/ai-br
 newer on the machine and a CLI that reports its call ids (Claude Code); anywhere else the tool
 still runs, it just shows no view. See [PROTOCOL.md](PROTOCOL.md#tools-with-a-view-mcp-apps).
 
-**The AI serves the card; only the person acts in it.** A button in a card is never a tool call.
-It is an **action**: a named browser route of the application, behind the person's own sign-in,
-which the host (the chat) calls for the person. The assistant is never offered an action and has
-no way to call one. Anything that must be the person's own act (confirming a grant, approving a
-payment) therefore lives ONLY as an action, and must not exist as a tool in any form, or the
-assistant could simply call it itself.
+**What happens when the person presses a button in a card is not this package's concern.** The
+host (the chat, `zeroplex/ai`) handles it through its own doorway, behind the person's sign-in;
+it never becomes a tool call and never travels over the bridge. This package only makes the card
+appear: it declares the view, serves its HTML and hands the host the tool's result.
 
-**1. Register the view** (a `ui://` resource the server serves; the HTML is rendered per request)
-and the actions its buttons may trigger, each the name of a POST route of the application:
+**1. Register the view** (a `ui://` resource the server serves; the HTML is rendered per request):
 
 ```php
 use Tetrix\AiBridge\Facades\AiBridge;
@@ -1074,10 +1071,6 @@ AiBridge::views()->register(
     uri: 'ui://studio/grant-request',
     html: fn () => view('grants.card')->render(),
     csp: [],                                   // MCP Apps `_meta.ui.csp`; empty = nothing external
-    actions: [
-        'confirm' => 'grants.confirm',         // route names; resolved by the host, never by the AI
-        'decline' => 'grants.decline',
-    ],
 );
 ```
 
@@ -1111,10 +1104,6 @@ class ShowGrantRequestTool extends AbstractTool
 A `ToolHandler` class gets the same by implementing `Tetrix\AiBridge\Contracts\HasView`
 (`view()`); a closure tool passes `view:` to `registerTool()`. Showing the card is all the tool
 does: it changes nothing.
-
-**3. The action routes are ordinary browser routes.** `views()->register()` refuses an action whose
-route is not a POST route in the `web` middleware group (session and CSRF). Keep it that way: an
-action route must never also accept an API token, because the assistant on a machine may hold one.
 
 ### Listening for Tool Calls
 

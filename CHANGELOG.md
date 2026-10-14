@@ -13,9 +13,8 @@ application switches by changing its `require` and adding the ZeroPlexBV `vcs` r
 
 - **Tools with a view (MCP Apps, ai-bridge 0.27+).** A tool may name a `ui://` view
   (`view()` / `HasView`, `registerTool(view:)`); its definition carries `_meta.ui.resourceUri`
-  to the bridge. Views are registered in `AiBridge::views()` with their HTML, CSP and the
-  **actions** their buttons may trigger (names of the application's own POST browser routes; a
-  button press is never a tool call). The server keeps each such call's full result
+  to the bridge. Views are registered in `AiBridge::views()` with their HTML and CSP. A button
+  press in a view is the host's concern and never a tool call. The server keeps each such call's full result
   (`ToolResult::withView()`) under the CLI's `provider_tool_call_id`, and the stream's
   `tool_result` for that call carries `ui` (`resource_uri`, `tool_name`, `arguments`, `result`),
   also on the recorded message block.

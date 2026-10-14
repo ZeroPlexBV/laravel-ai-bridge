@@ -1727,9 +1727,8 @@ Server                                   Bridge (0.27+)                   CLI
 ```
 
 The server serves `ui://` resources from its own registry. What the person does in a view never
-travels over this WebSocket and is never a tool call: the host turns a button press into a POST to
-one of the application's own browser routes (an *action* the view declared), behind the person's
-sign-in, so the assistant cannot trigger it. Views for tools of MCP servers
+travels over this WebSocket and is never a tool call: the host handles a button press itself,
+behind the person's sign-in, so the assistant cannot trigger it. Views for tools of MCP servers
 configured on the machine (`--mcp-upstreams`, `mcp_request` / `mcp_result`) are not handled by this
 server: it records `mcp_apps` but never sends `mcp_request`.
 
