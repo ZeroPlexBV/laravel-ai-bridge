@@ -200,3 +200,25 @@ it('pairs each frame with its own stream block by provider_tool_call_id, not by 
         ->and($calls['toolu_A']['ui']['arguments'])->toBe(['grant_id' => 1])
         ->and($calls['toolu_B']['ui']['arguments'])->toBe(['grant_id' => 2]);
 });
+
+it('drops a ui too large for the turn from the record whole, never cutting it', function () {
+    $rig = viewRig();
+    $huge = str_repeat('x', 9 * 1024 * 1024);
+
+    streamToolBlock($rig, 0, 'mcp__bridge__show_grant_request', 'toolu_01', '{"grant_id":42}');
+    toolCallFrame($rig, 'show_grant_request', ['grant_id' => 42], 'tc_7', 'toolu_01');
+    // Grow the kept view past the 8 MB a turn's blocks may take.
+    $key = StreamHandler::toolViewKey('toolu_01');
+    $ui = $rig->store->getValue('req-v', $key);
+    $ui['result']['structuredContent']['blob'] = $huge;
+    $rig->store->putValue('req-v', $key, $ui);
+    ($rig->stream)(MessageTypes::TOOL_RESULT, ['tool_call_id' => 'toolu_01', 'result' => 'shown']);
+    ($rig->stream)(MessageTypes::DONE, ['usage' => null]);
+
+    $call = collect(recordedBlocks($rig))->firstWhere('type', 'tool_call');
+
+    expect($call)->not->toHaveKey('ui')
+        ->and($call['ui_dropped_bytes'])->toBeGreaterThan(9 * 1024 * 1024)
+        ->and($call['result'])->toBe('shown')
+        ->and(bufferedToolResults($rig)[0]['ui']['result']['structuredContent']['blob'])->toBe($huge);
+});
