@@ -28,6 +28,7 @@ use Tetrix\AiBridge\Streaming\StreamHandler;
 use Tetrix\AiBridge\Streaming\TurnInputResult;
 use Tetrix\AiBridge\Support\BridgeLog;
 use Tetrix\AiBridge\Tools\ToolRegistry;
+use Tetrix\AiBridge\Tools\ViewRegistry;
 use Tetrix\AiBridge\WebSocket\BridgeConnectionManager;
 
 /**
@@ -109,11 +110,12 @@ class AiBridgeManager
      * @param  string  $description  Human-readable description.
      * @param  array<string, mixed>  $parameters  JSON Schema for parameters.
      * @param  Closure  $handler  The function that executes the tool.
+     * @param  string|null  $view  The `ui://` URI of the tool's view (see views()), or null for none.
      * @return $this
      */
-    public function registerTool(string $name, string $description, array $parameters, Closure $handler): static
+    public function registerTool(string $name, string $description, array $parameters, Closure $handler, ?string $view = null): static
     {
-        $this->toolRegistry->register($name, $description, $parameters, $handler);
+        $this->toolRegistry->register($name, $description, $parameters, $handler, $view);
 
         return $this;
     }
@@ -137,6 +139,14 @@ class AiBridgeManager
     public function tools(): ToolRegistry
     {
         return $this->toolRegistry;
+    }
+
+    /**
+     * The `ui://` views (MCP Apps) this server serves, which tools name by URI.
+     */
+    public function views(): ViewRegistry
+    {
+        return app(ViewRegistry::class);
     }
 
     /**
