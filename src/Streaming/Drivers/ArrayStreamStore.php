@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tetrix\AiBridge\Streaming\Drivers;
 
 use Tetrix\AiBridge\Contracts\MergesStreamMetadata;
+use Tetrix\AiBridge\Contracts\StoresStreamValues;
 use Tetrix\AiBridge\Contracts\StreamStoreContract;
 
 /**
@@ -13,10 +14,23 @@ use Tetrix\AiBridge\Contracts\StreamStoreContract;
  * Not suitable for production: state lives in the PHP process only, so the
  * web process cannot see what the serve process wrote (and vice versa).
  */
-final class ArrayStreamStore implements StreamStoreContract, MergesStreamMetadata
+final class ArrayStreamStore implements StreamStoreContract, MergesStreamMetadata, StoresStreamValues
 {
     /** @var array<string, array{status: string, metadata: array<string, mixed>, events: list<array{index: int, event: string, data: array<string, mixed>}>, aborted: bool}> */
     private array $turns = [];
+
+    /** @var array<string, array<string, array<string, mixed>>> */
+    private array $values = [];
+
+    public function putValue(string $requestId, string $key, array $value): void
+    {
+        $this->values[$requestId][$key] = $value;
+    }
+
+    public function getValue(string $requestId, string $key): ?array
+    {
+        return $this->values[$requestId][$key] ?? null;
+    }
 
     public function start(string $requestId, array $metadata = []): void
     {
@@ -132,7 +146,7 @@ final class ArrayStreamStore implements StreamStoreContract, MergesStreamMetadat
 
     public function cleanup(string $requestId): void
     {
-        unset($this->turns[$requestId]);
+        unset($this->turns[$requestId], $this->values[$requestId]);
     }
 
     /**
@@ -141,5 +155,6 @@ final class ArrayStreamStore implements StreamStoreContract, MergesStreamMetadat
     public function flush(): void
     {
         $this->turns = [];
+        $this->values = [];
     }
 }

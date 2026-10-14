@@ -102,6 +102,23 @@ final class ClockedRedis
         return array_slice($this->values[$key], $start, $stop < 0 ? null : $stop - $start + 1);
     }
 
+    public function hset(string $key, string $field, string $value): int
+    {
+        if (! $this->live($key)) {
+            $this->values[$key] = [];
+        }
+        $new = ! array_key_exists($field, $this->values[$key]);
+        $this->values[$key][$field] = $value;
+
+        return $new ? 1 : 0;
+    }
+
+    public function hget(string $key, string $field): mixed
+    {
+        // phpredis answers a missing field with false.
+        return $this->live($key) ? ($this->values[$key][$field] ?? false) : false;
+    }
+
     public function exists(string $key): int
     {
         return $this->live($key) ? 1 : 0;
@@ -209,4 +226,43 @@ test('a late metadata write to a finished turn does not outlive its status', fun
     $redis->now = 1800;
 
     expect($redis->get('ai-bridge:stream:req-late:meta'))->toBeNull();
+});
+
+test('a kept value lives as long as its turn: renewed by events, shortened at the end, gone at cleanup', function () {
+    $redis = new ClockedRedis;
+    $store = clocked_store($redis);
+
+    $store->start('req-view', []);
+    $store->putValue('req-view', 'tool_view:toolu_01', ['resource_uri' => 'ui://app/card']);
+
+    $redis->now = 3000;
+    $store->appendEvent('req-view', 'block_delta', []);
+    $redis->now = 3000 + 3599;
+
+    expect($store->getValue('req-view', 'tool_view:toolu_01'))->toBe(['resource_uri' => 'ui://app/card'])
+        ->and($store->getValue('req-view', 'tool_view:other'))->toBeNull();
+
+    $store->complete('req-view', 'completed');
+    $redis->now += 1800;
+
+    expect($store->getValue('req-view', 'tool_view:toolu_01'))->toBeNull();
+
+    $store->start('req-gone', []);
+    $store->putValue('req-gone', 'k', ['a' => 1]);
+    $store->cleanup('req-gone');
+
+    expect($store->getValue('req-gone', 'k'))->toBeNull();
+});
+
+test('a value kept for a finished turn does not outlive it', function () {
+    $redis = new ClockedRedis;
+    $store = clocked_store($redis);
+
+    $store->start('req-late', []);
+    $store->complete('req-late', 'completed');
+    $store->putValue('req-late', 'k', ['a' => 1]);
+
+    $redis->now = 1800;
+
+    expect($store->getValue('req-late', 'k'))->toBeNull();
 });

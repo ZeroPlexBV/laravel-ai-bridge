@@ -24,6 +24,8 @@ use Tetrix\AiBridge\Streaming\StreamStoreManager;
  * @method static bool isAborted(string $requestId)
  * @method static void complete(string $requestId, string $status)
  * @method static void cleanup(string $requestId)
+ * @method static void putValue(string $requestId, string $key, array $value)
+ * @method static array|null getValue(string $requestId, string $key)
  * @method static \Tetrix\AiBridge\Contracts\StreamStoreContract driver(?string $driver = null)
  * @method static \Tetrix\AiBridge\Streaming\StreamStoreManager extend(string $driver, \Closure $callback)
  *
