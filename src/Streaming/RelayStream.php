@@ -36,10 +36,13 @@ final class RelayStream implements StreamableProvider
     /**
      * @param  string  $requestId       The relayed request's ID (preserved for event routing).
      * @param  string  $conversationId  The conversation ID, for persistence + StreamCompleted reporting.
+     * @param  string|null  $model  The model the turn was sent with, when it named one; the
+     *                              assistant row records it rather than the conversation's.
      */
     public function __construct(
         string $requestId,
         string $conversationId = '',
+        ?string $model = null,
     ) {
         $this->streamHandler = new StreamHandler($this, $requestId);
         $this->streamHandler->setMode(ProviderMode::Bridge);
@@ -68,7 +71,7 @@ final class RelayStream implements StreamableProvider
             try {
                 $conversation = Conversation::find($conversationId);
                 if ($conversation !== null) {
-                    ConversationRecorder::attach($this->streamHandler, $conversation);
+                    ConversationRecorder::attach($this->streamHandler, $conversation, $model);
                 }
             } catch (\Throwable $e) {
                 Log::warning('AI Bridge: could not attach conversation recorder to relayed stream', [

@@ -178,7 +178,7 @@ Each provider entry may include a `models` array listing available models (popul
 
 If a CLI is not installed, `available` is `false` and the server won't route requests to it.
 
-**What else `hello` says about the bridge**, all optional and all recorded by this package (`ConnectionStatus::for()` → `bridge_version`, `self_update`, `attachment_limits`, `capabilities`; cached on the connection as `last_bridge`):
+**What else `hello` says about the bridge**, all optional and all recorded by this package (`ConnectionStatus::for()` → `bridge_version`, `self_update`, `attachment_limits`, `capabilities`, `effort_levels`; cached on the connection as `last_bridge`):
 
 | Field | Since | Meaning |
 |---|---|---|
@@ -189,6 +189,7 @@ If a CLI is not installed, `available` is `false` and the server won't route req
 | `file_uploads` | 0.18 | `true`: accepts `upload_offer`. See [Streamed uploads](#streamed-uploads-and-downloads). |
 | `file_downloads` | 0.18 | `true`: answers `file_read`. |
 | `app_backends` | 0.21 | `true`: understands `app_call` (Engram app backends; not used by this package). |
+| `effort_levels` | upcoming | `string[]`, e.g. `["low","medium","high","xhigh","max"]`: the values [`options.effort`](#server--bridge-ai_request) takes, passed to Claude as `--effort <level>`. Absent, empty or not a list: the bridge does not honour `options.effort`. Reported as `ConnectionStatus::for()['effort_levels']` (a list of strings, `[]` for none); non-string, empty and duplicate entries are dropped. |
 
 Absent means the bridge predates the field: test the capability, not the version.
 
@@ -721,6 +722,10 @@ When the server needs an AI response (triggered by a user message in the browser
 
 **`options`**: Provider-agnostic generation options. The bridge maps these to CLI-specific flags where supported.
 
+**`options.model`**: The model for this turn. For a persisted conversation this package sends the turn's own `model` option when the caller gives one, else the conversation's stored model.
+
+**`options.effort`**: The thinking level for this turn, a string: one of the bridge's [`hello.effort_levels`](#bridge--server-hello), passed to Claude as `--effort <level>`. Per turn, optional; absent means the CLI's own default. A bridge ignores a value it does not list, and any bridge that predates the field ignores the key, so it is safe to send to every bridge. This package sends a non-empty string of at most 32 characters and drops anything else, and sends it again on a [`session_lost`](#lost-session-recovery-session_lost) re-issue.
+
 **`options.accepts_input`**: `true` to keep the CLI's input open for the whole turn, so a message can reach the assistant while the turn runs. Opt-in, per turn; Claude only. See [Turn Input](#turn-input). Only `true` means yes; absent, `null` and `false` all mean the turn runs as every turn did before.
 
 #### Additive field: `working_dir`
@@ -1128,7 +1133,7 @@ If the server sends a `cli_session_id` the bridge's CLI cannot resume (the sessi
 `session_lost` is recoverable, not fatal. The server:
 
 1. Wipes the dead `cli_session_id` from the conversation.
-2. Silently re-issues the **same** `request_id` as a fresh request (`cli_session_id: null`, full `history` included).
+2. Silently re-issues the **same** `request_id` as a fresh request (`cli_session_id: null`, full `history` included). The per-turn fields the conversation does not hold are sent again as the turn first had them: `options.model`, `options.effort`, `options.accepts_input` and `bridge_prompt`.
 3. The browser keeps streaming on the same request — it never sees the lost session.
 
 The re-issued turn produces its own `done` carrying a new `cli_session_id`, which the server persists. Recovery is attempted once per turn; a second failure surfaces as a normal error.

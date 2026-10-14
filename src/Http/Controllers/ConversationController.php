@@ -11,6 +11,7 @@ use Tetrix\AiBridge\AiBridgeManager;
 use Tetrix\AiBridge\Contracts\StreamStoreContract;
 use Tetrix\AiBridge\Events\ConversationCreated;
 use Tetrix\AiBridge\Models\Conversation;
+use Tetrix\AiBridge\Protocol\AiRequestPayload;
 use Tetrix\AiBridge\Tools\ToolRegistry;
 
 /**
@@ -297,6 +298,22 @@ class ConversationController extends Controller
         // browser cannot nominate what the bridge fetches. See
         // AiBridgeManager::buildAttachmentRefs().
         $options = [];
+
+        // Optional thinking level for THIS turn (Claude's `--effort`). Per turn, not stored
+        // on the conversation; absent or empty sends nothing. Which words a machine honours
+        // is the bridge's to say (ConnectionStatus::for()['effort_levels']), and it ignores
+        // any other, so only the shape is checked here.
+        $effort = $request->input('effort');
+        if ($effort !== null && $effort !== '') {
+            if (AiRequestPayload::normaliseEffort($effort) === null) {
+                return response()->json([
+                    'error' => 'validation_error',
+                    'message' => 'effort must be a string of at most '.AiRequestPayload::MAX_EFFORT_LENGTH.' characters.',
+                ], 422);
+            }
+            $options['effort'] = $effort;
+        }
+
         $attachmentIds = $request->input('attachments');
 
         if (is_array($attachmentIds) && $attachmentIds !== [] && $conversation->mode !== 'bridge') {

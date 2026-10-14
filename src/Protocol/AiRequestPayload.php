@@ -28,6 +28,9 @@ final class AiRequestPayload
     /** The bridge's cap on `bridge_prompt.text`, in bytes (MAX_BRIDGE_PROMPT_BYTES). */
     public const MAX_BRIDGE_PROMPT_BYTES = 8192;
 
+    /** The longest `options.effort` sent; a level is a short word (`low` … `max`). */
+    public const MAX_EFFORT_LENGTH = 32;
+
     /**
      * Build the wire payload.
      *
@@ -81,6 +84,13 @@ final class AiRequestPayload
         // what turns it on, and `false` means the same as absent.
         if (array_key_exists('accepts_input', $options) && $options['accepts_input'] !== true) {
             unset($options['accepts_input']);
+        }
+        // The thinking level (Claude's `--effort`). A non-empty string or
+        // nothing: which words are valid is the bridge's to say (it announces
+        // them as `hello.effort_levels` and ignores any other), so this only
+        // keeps a wrong-typed or empty value off the wire.
+        if (array_key_exists('effort', $options) && self::normaliseEffort($options['effort']) === null) {
+            unset($options['effort']);
         }
         if (! empty($options)) {
             $payload['options'] = $options;
@@ -188,6 +198,49 @@ final class AiRequestPayload
         }
 
         return $hasText ? ['mode' => $mode, 'text' => $text] : ['mode' => $mode];
+    }
+
+    /**
+     * A turn's `options.effort` as it goes on the wire, or null to send none.
+     *
+     * A string of 1 to MAX_EFFORT_LENGTH characters, as given. Anything else
+     * (empty, not a string, too long) means "no thinking level", which is what
+     * absence means on every bridge.
+     */
+    public static function normaliseEffort(mixed $effort): ?string
+    {
+        if (! is_string($effort) || $effort === '' || mb_strlen($effort) > self::MAX_EFFORT_LENGTH) {
+            return null;
+        }
+
+        return $effort;
+    }
+
+    /**
+     * What a re-issue after `session_lost` must send again that the conversation row
+     * does not hold, taken from the payload the turn was first sent with.
+     *
+     * MessageHandler::buildFreshAiRequest() rebuilds a lost turn from the persisted
+     * conversation; these are the per-turn fields it cannot find there. Both send paths
+     * (the PHP-FPM relay and the in-process BridgeStream) record them through this, so a
+     * new per-turn field is added here once and survives a re-issue on either.
+     *
+     * @param  array<string, mixed>  $payload  A payload built by build().
+     * `model` is carried because a turn may name its own (a per-turn switch that is not
+     * stored on the conversation); the re-issue sends the model the turn was sent with.
+     *
+     * @return array{bridge_prompt?: array<string, string>, accepts_input?: true, effort?: string, model?: string}
+     */
+    public static function reissueCarry(array $payload): array
+    {
+        $model = $payload['options']['model'] ?? null;
+
+        return array_filter([
+            'model' => is_string($model) && $model !== '' ? $model : null,
+            'bridge_prompt' => $payload['bridge_prompt'] ?? null,
+            'accepts_input' => ($payload['options']['accepts_input'] ?? null) === true ? true : null,
+            'effort' => self::normaliseEffort($payload['options']['effort'] ?? null),
+        ], static fn ($v) => $v !== null);
     }
 
     /**

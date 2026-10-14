@@ -62,7 +62,15 @@ class ConnectionStatus
      * it announced: `turn_input`, `input_closed`, `file_uploads`,
      * `file_downloads`, `app_backends`. Test a capability, not a version.
      *
-     * @return array{connected: bool, providers: array<int, mixed>, workspaces: array<int, mixed>, posture: array<string, mixed>, bridge_version: string|null, self_update: bool, attachment_limits: array<string, int>|null, capabilities: list<string>}
+     * `effort_levels` is the thinking levels (Claude's `--effort`) the bridge
+     * honours as a turn's `effort` option, e.g. `['low', 'medium', 'high',
+     * 'xhigh', 'max']`. An empty list means it does not honour one: BYOK, a
+     * machine never seen, and every bridge that predates the field. Like
+     * `capabilities` it is kept from the last connection while the machine is
+     * off (check `connected`). A level not in the list is ignored by the
+     * bridge and the turn runs at the CLI's default.
+     *
+     * @return array{connected: bool, providers: array<int, mixed>, workspaces: array<int, mixed>, posture: array<string, mixed>, bridge_version: string|null, self_update: bool, attachment_limits: array<string, int>|null, capabilities: list<string>, effort_levels: list<string>}
      */
     public function for(Connection $connection): array
     {
@@ -109,12 +117,22 @@ class ConnectionStatus
     }
 
     /**
+     * The thinking levels this connection's bridge honours (see for()); empty when none.
+     *
+     * @return list<string>
+     */
+    public function effortLevels(Connection $connection): array
+    {
+        return $this->for($connection)['effort_levels'];
+    }
+
+    /**
      * The bridge-description fields of for(), from a stored or reported `bridge` array.
      *
      * `self_update` is only ever true while connected (see for()).
      *
      * @param  mixed  $bridge
-     * @return array{bridge_version: string|null, self_update: bool, attachment_limits: array<string, int>|null, capabilities: list<string>}
+     * @return array{bridge_version: string|null, self_update: bool, attachment_limits: array<string, int>|null, capabilities: list<string>, effort_levels: list<string>}
      */
     private static function bridgeFields(mixed $bridge, bool $connected): array
     {
@@ -122,12 +140,14 @@ class ConnectionStatus
         $version = $bridge['bridge_version'] ?? null;
         $limits = $bridge['attachment_limits'] ?? null;
         $capabilities = $bridge['capabilities'] ?? [];
+        $effortLevels = $bridge['effort_levels'] ?? [];
 
         return [
             'bridge_version' => is_string($version) && $version !== '' ? $version : null,
             'self_update' => $connected && ($bridge['self_update'] ?? null) === true,
             'attachment_limits' => is_array($limits) && $limits !== [] ? $limits : null,
             'capabilities' => is_array($capabilities) ? array_values(array_filter($capabilities, 'is_string')) : [],
+            'effort_levels' => is_array($effortLevels) ? array_values(array_filter($effortLevels, 'is_string')) : [],
         ];
     }
 
@@ -141,7 +161,7 @@ class ConnectionStatus
      * Query the bridge server for a bridge connection's live status, refreshing the cached
      * capabilities. Falls back to cached providers + connected=false when unreachable.
      *
-     * @return array{connected: bool, providers: array<int, mixed>, workspaces: array<int, mixed>, posture: array<string, mixed>, bridge_version: string|null, self_update: bool, attachment_limits: array<string, int>|null, capabilities: list<string>}
+     * @return array{connected: bool, providers: array<int, mixed>, workspaces: array<int, mixed>, posture: array<string, mixed>, bridge_version: string|null, self_update: bool, attachment_limits: array<string, int>|null, capabilities: list<string>, effort_levels: list<string>}
      */
     private function bridgeLiveStatus(Connection $connection): array
     {

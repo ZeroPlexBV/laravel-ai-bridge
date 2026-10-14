@@ -62,6 +62,8 @@ class ConnectionController extends Controller
                 // Its attachment caps and the optional frames it knows.
                 $data['attachment_limits'] = $status['attachment_limits'] ?? null;
                 $data['capabilities'] = $status['capabilities'] ?? [];
+                // The thinking levels it honours as a turn's `effort`; empty: none.
+                $data['effort_levels'] = $status['effort_levels'] ?? [];
                 $data['connected'] = $status['connected'];
             }
 

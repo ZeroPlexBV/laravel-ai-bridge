@@ -322,7 +322,7 @@ class BridgeConnectionManager
      * @return array<string, mixed>  Empty when not connected. Keys: `bridge_version`
      *                               (?string), `protocol_version` (?string),
      *                               `attachment_limits` (?array), `capabilities` (string[]),
-     *                               `self_update` (bool).
+     *                               `self_update` (bool), `effort_levels` (string[]).
      */
     public function getBridgeInfo(int|string $userId): array
     {
@@ -557,12 +557,25 @@ class BridgeConnectionManager
      * @param  StreamHandler  $handler  The stream handler to dispatch events to.
      * @param  string  $userId  The user ID that owns this request.
      */
-    public function registerPendingRequest(string $requestId, StreamHandler $handler, string $userId = ''): void
+    public function registerPendingRequest(string $requestId, StreamHandler $handler, string $userId = '', array $carry = []): void
     {
         $this->pendingRequests[$requestId] = [
             'stream_handler' => $handler,
             'user_id' => $userId,
+            'carry' => $carry,
         ];
+    }
+
+    /**
+     * The per-turn fields a pending request was sent with that a `session_lost`
+     * re-issue must send again (AiRequestPayload::reissueCarry()). Empty when none
+     * were recorded, or the request is not pending.
+     *
+     * @return array<string, mixed>
+     */
+    public function getPendingRequestCarry(string $requestId): array
+    {
+        return $this->pendingRequests[$requestId]['carry'] ?? [];
     }
 
     /**

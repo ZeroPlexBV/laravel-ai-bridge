@@ -3,7 +3,35 @@
 Release notes for earlier versions are on the GitHub releases page of
 tetrixdev/laravel-ai-bridge. This file starts with 0.16.0-RC1.
 
-## [Unreleased] — to be released as 0.17.0
+## [Unreleased]
+
+### Added
+
+- **Thinking level (`effort`), per turn.** A turn option `effort` (a string, Claude Code's
+  `--effort`: `low` … `max`) is sent to the bridge as `ai_request.options.effort`, beside
+  `options.model`, on the in-process and the PHP-FPM relay paths alike, and again when a turn is
+  re-issued after `session_lost`. Absent, empty or not a string: nothing is sent and the turn runs
+  as before. `POST /ai-bridge/conversations/{id}/stream` takes it as `effort` (422 when it is not
+  a string of at most 32 characters); `StreamController` lets it through its option whitelist.
+- **`hello.effort_levels`.** The levels a bridge honours, recorded with its other hello facts and
+  reported as `ConnectionStatus::for()['effort_levels']` (`list<string>`, `[]` when the bridge
+  does not honour `effort`: BYOK and every bridge that predates the field), also as
+  `ConnectionStatus::effortLevels()` and on `GET /ai-bridge/connections`. Remembered from the
+  last connection while the machine is off, like `capabilities`.
+
+### Changed
+
+- **A per-turn `model` wins over the conversation's stored model.** `streamConversation()` /
+  `startConversationStream()` used to overwrite a caller's `model` option with the
+  conversation's `model` whenever one was stored, so a turn could not switch model without
+  rewriting the conversation. The turn's own `model` is now sent when given, and the stored one
+  otherwise (unchanged when the caller gives none). The conversation row is not changed; the
+  assistant row and the turn's stream metadata record the model the turn ran with, and a
+  `session_lost` re-issue sends it again instead of reverting to the stored one.
+
+No migration, no config change.
+
+## [0.17.0]
 
 The ZeroPlexBV fork (0.16.0-RC1, 0.16.0, 0.16.1 below) merged back into
 tetrixdev/laravel-ai-bridge, together with upstream's own 0.16.0 (the desired bridge
