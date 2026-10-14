@@ -1125,6 +1125,8 @@ class StreamHandler
                 $event->data['tool_name'],
                 $event->data['parameters'] ?? [],
                 $event->data['tool_call_id'] ?? $event->data['call_id'] ?? '',
+                // #11493: a raw tool_call event keeps the CLI's own call id too.
+                is_string($event->data['provider_tool_call_id'] ?? null) ? $event->data['provider_tool_call_id'] : null,
             ),
             MessageTypes::TOOL_RESULT => $this->receiveToolResult($event->data),
             MessageTypes::RATE_LIMIT => $this->dispatchRateLimit(

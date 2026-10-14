@@ -146,6 +146,30 @@ test('a server tool_call carries the CLI\'s own call id when the bridge reports 
     expect($events[1]['data'])->not->toHaveKey('provider_tool_call_id');
 });
 
+test('the direct SSE path carries the CLI\'s own call id on a server tool_call too', function () {
+    // #11493: streamToResponse() / POST /ai-bridge/stream/sse must join a server tool_call
+    // to its tool_result and card exactly as the buffered path does.
+    $sent = [];
+    $handler = new StreamHandler(fakeBufferProvider(), 'rid-sse-tool-id');
+    $wire = new ReflectionMethod(\Tetrix\AiBridge\AiBridgeManager::class, 'wireCallbacks');
+    $wire->invoke(app(\Tetrix\AiBridge\AiBridgeManager::class), $handler, function (array $payload) use (&$sent) {
+        $sent[] = $payload;
+    });
+
+    $handler->dispatchToolCall('show_card', ['x' => 1], 'tc_7', 'toolu_01abc');
+    $handler->dispatchToolCall('search', [], 'tc_8');
+    $handler->dispatchToolCall('search', [], 'tc_9', '');
+    $handler->dispatchEvent(\Tetrix\AiBridge\Protocol\StreamEvent::fromArray(['type' => 'stream', 'request_id' => 'rid-sse-tool-id', 'event' => 'tool_call',
+        'data' => ['tool_name' => 'show_card', 'parameters' => [], 'tool_call_id' => 'tc_10', 'provider_tool_call_id' => 'toolu_02']]));
+
+    expect($sent[0]['event'])->toBe('tool_call')
+        ->and($sent[0]['data']['provider_tool_call_id'])->toBe('toolu_01abc')
+        ->and($sent[0]['data']['tool_call_id'])->toBe('tc_7')
+        ->and($sent[1]['data'])->not->toHaveKey('provider_tool_call_id')
+        ->and($sent[2]['data'])->not->toHaveKey('provider_tool_call_id')
+        ->and($sent[3]['data']['provider_tool_call_id'])->toBe('toolu_02');
+});
+
 test('the buffer carries a tool result, including whether it failed', function () {
     // Without a tool_result handler here, a result could never reach a browser
     // even once the bridge started sending them.

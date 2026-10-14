@@ -85,6 +85,14 @@ class MessageHandler
      */
     private const TURN_INPUT_REASONS = ['turn_not_running', 'turn_ending', 'input_not_open'];
 
+    /**
+     * The largest view a tool call may keep in the stream store, as its JSON (256 KB).
+     *
+     * #11494: the chat refuses to draw a larger `ui` (McpApps::MAX_UI_BYTES in zeroplex/ai), so
+     * storing one only costs the shared store memory for a card nobody will see.
+     */
+    private const MAX_TOOL_VIEW_BYTES = 262144;
+
     public function __construct(
         private readonly BridgeConnectionManager $connectionManager,
         private readonly TokenManager $tokenManager,
@@ -1357,6 +1365,25 @@ class MessageHandler
                 }
 
                 $view = $this->toolRegistry->get($toolName)->view;
+                // #11497: without the CLI's own call id there is nothing to join the view to, so
+                // the call is shown without its card. Expected (Codex, an older bridge), but say so,
+                // so an operator can tell it from "this tool has no view".
+                if ($view !== null && $providerCallId === null) {
+                    Log::debug('AI Bridge: tool view not attached, the bridge reported no provider call id', [
+                        'request_id' => $requestId,
+                        'tool' => $toolName,
+                        'view' => $view,
+                    ]);
+                }
+                // #11489: a view tool whose handle() returns a plain value still gets a card, but one
+                // with only that value as text and no structured content. Easy to miss, so say so.
+                if ($view !== null && ! $result instanceof ToolResult) {
+                    Log::debug('AI Bridge: a tool with a view returned no ToolResult, its view gets text only', [
+                        'request_id' => $requestId,
+                        'tool' => $toolName,
+                        'view' => $view,
+                    ]);
+                }
                 if ($view !== null && $providerCallId !== null) {
                     $this->keepToolView($handler, $providerCallId, [
                         'resource_uri' => $view,
@@ -1416,8 +1443,13 @@ class MessageHandler
     private function keepToolView(StreamHandler $handler, string $providerCallId, array $ui): void
     {
         try {
-            if (json_encode($ui) === false) {
+            $encoded = json_encode($ui, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            if ($encoded === false) {
                 throw new \UnexpectedValueException('the view result is not JSON-serializable: '.json_last_error_msg());
+            }
+            // #11494: a view the host will never draw is not written to the shared stream store.
+            if (strlen($encoded) > self::MAX_TOOL_VIEW_BYTES) {
+                throw new \LengthException('the view result is '.strlen($encoded).' bytes, over the '.self::MAX_TOOL_VIEW_BYTES.' a view may take');
             }
 
             $store = app(StreamStoreContract::class);

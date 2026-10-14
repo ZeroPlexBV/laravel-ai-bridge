@@ -909,7 +909,12 @@ The component is a reference implementation — you are never locked into it.
    Livewire, Vue, React. The stream emits these events (each as an SSE
    `event: <name>` line with a JSON `data:` payload): `block_start`,
    `block_delta` (`{block_type, content}`), `block_stop`, `tool_call`
-   (`{tool_name, parameters}`), `done` (`{usage}`), `error`, `cancelled`.
+   (`{tool_name, parameters, tool_call_id}`, plus `provider_tool_call_id`, the
+   CLI's own id for a server-run call when the bridge reports it), `tool_result`
+   (`{tool_call_id, result}`, plus `is_error`, `parent_tool_use_id` and `ui`
+   when present), `done` (`{usage}`), `error`, `cancelled`. A `tool_result` that
+   carries `ui` is a card to draw: see
+   [Tools with a view (MCP Apps)](#tools-with-a-view-mcp-apps).
 
    The bundled component (`resources/dist/ai-bridge-chat.js`) is the working
    reference for everything a client needs to do: API calls, EventSource
@@ -1101,6 +1106,11 @@ class ShowGrantRequestTool extends AbstractTool
 }
 ```
 
+**Return `ToolResult::withView()`, not a plain array or string.** A tool with a view that returns
+anything else still gets a card, but one with only that value as text and no structured content,
+and nothing fails: the server only logs it at debug level. A `ToolResult::withView()` with an
+empty `structured` looks the same.
+
 A `ToolHandler` class gets the same by implementing `Tetrix\AiBridge\Contracts\HasView`
 (`view()`); a closure tool passes `view:` to `registerTool()`. Showing the card is all the tool
 does: it changes nothing.
@@ -1109,7 +1119,9 @@ does: it changes nothing.
 (`resource_uri`, `tool_name`, `arguments`, `result`), in the stream store and on the recorded
 block; `onToolResult` receives it as a fifth argument (`?array $ui`, null for every other result).
 The host fetches the HTML with `AiBridge::views()->render($ui['resource_uri'])`
-(`['html' => …, 'csp' => […]]`; an unknown URI throws `ViewNotFoundException`). Whether a machine
+(`['html' => …, 'csp' => […]]`; an unknown URI throws `ViewNotFoundException`, which a host
+treats as a call with no view: old history can name a view a later release removed or renamed).
+A view over 256 KB is not kept, so its call shows no card. Whether a machine
 can show views at all is `$status['mcp_apps']` on its connection status (true once its bridge
 announced `mcp_apps` at hello).
 

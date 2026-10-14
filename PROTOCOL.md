@@ -1378,6 +1378,13 @@ bridge sends:
 `result` is the full `CallToolResult` the handler produced, kept on the server because the CLI
 only ever receives its text. A consumer that does not draw views ignores the key.
 
+A view whose JSON is over 256 KB is not kept, so its result carries no `ui`. On a **recorded**
+message block `ui` is kept whole or dropped whole, never cut: once the turn's storage budget is
+spent the block carries `ui_dropped_bytes` (the view's size as JSON) and `ui_dropped_reason`
+instead of `ui`. `ui_dropped_reason` is `too_large` for a view larger than a whole turn's budget,
+and `turn_budget_spent` when earlier blocks of the same turn had already spent it. A consumer
+draws such a block as a call with no view.
+
 ##### Chunked results
 
 A result larger than one frame arrives **in pieces**, keyed by `tool_call_id`:
@@ -1732,6 +1739,15 @@ travels over this WebSocket and is never a tool call: the host handles a button 
 behind the person's sign-in, so the assistant cannot trigger it. Views for tools of MCP servers
 configured on the machine (`--mcp-upstreams`, `mcp_request` / `mcp_result`) are not handled by this
 server: it records `mcp_apps` but never sends `mcp_request`.
+
+**A view that is no longer registered.** History can name a `resource_uri` that a later release
+removed or renamed; `AiBridge::views()->render()` then throws `ViewNotFoundException`. A host
+treats that exactly like a call without a view and draws the call alone.
+
+**When a call shows no view, the stream does not say why.** A missing `provider_tool_call_id`
+(Codex, Gemini, a bridge older than 0.27) only leaves a debug-level line in the server's log
+("tool view not attached"), and a view the server could not keep (over 256 KB, a stream-store
+failure) a warning-level one ("could not keep a tool view"). Nothing else records it.
 
 ### Server → Bridge: `tool_resolve`
 

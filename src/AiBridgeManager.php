@@ -675,16 +675,20 @@ class AiBridgeManager
             $visibleBlockCounter++;
         });
 
-        $stream->onToolCall(function (string $toolName, array $params, string $callId) use ($sink) {
-            $sink([
-                'event' => MessageTypes::TOOL_CALL,
-                'data' => [
-                    'tool_name' => $toolName,
-                    'parameters' => $params,
-                    'tool_call_id' => $callId,
-                    'call_id' => $callId, // Deprecated: use tool_call_id instead
-                ],
-            ]);
+        $stream->onToolCall(function (string $toolName, array $params, string $callId, ?string $providerToolCallId = null) use ($sink) {
+            $data = [
+                'tool_name' => $toolName,
+                'parameters' => $params,
+                'tool_call_id' => $callId,
+                'call_id' => $callId, // Deprecated: use tool_call_id instead
+            ];
+            // #11493: the CLI's own id for this call, as BufferingSink::attach() forwards it,
+            // so a consumer of this sink can join a server tool_call to its tool_result and
+            // card too. Absent when the bridge does not report it.
+            if ($providerToolCallId !== null && $providerToolCallId !== '') {
+                $data['provider_tool_call_id'] = $providerToolCallId;
+            }
+            $sink(['event' => MessageTypes::TOOL_CALL, 'data' => $data]);
         });
 
         // What a tool returned. For a tool that ran on the operator's own

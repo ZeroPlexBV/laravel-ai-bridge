@@ -18,9 +18,11 @@ application switches by changing its `require` and adding the ZeroPlexBV `vcs` r
   (`ToolResult::withView()`) under the CLI's `provider_tool_call_id`, and the stream's
   `tool_result` for that call carries `ui` (`resource_uri`, `tool_name`, `arguments`, `result`),
   also on the recorded message block (kept whole or, past the turn's storage budget, dropped with
-  `ui_dropped_bytes`; never cut). `onToolResult` callbacks receive it as a fifth argument (`?array $ui`), `onToolCall` callbacks
-  the `provider_tool_call_id` as a fourth (`?string`). A view's HTML is rendered with
-  `AiBridge::views()->render($uri)`.
+  `ui_dropped_bytes` and `ui_dropped_reason`, `too_large` or `turn_budget_spent`; never cut). A view
+  over 256 KB is not kept at all. `onToolResult` callbacks receive it as a fifth argument (`?array $ui`), `onToolCall` callbacks
+  the `provider_tool_call_id` as a fourth (`?string`), and the stream's `tool_call` event carries it
+  on the buffered and the direct SSE path (`streamToResponse()`, `POST /ai-bridge/stream/sse`) alike.
+  A view's HTML is rendered with `AiBridge::views()->render($uri)`.
 - **hello `mcp_apps`** recorded in `last_bridge` and reported on the connection status
   (`mcp_apps: bool`, also on `GET /ai-bridge/connections`).
 - **`StoresStreamValues`** (`putValue` / `getValue`): small keyed values kept beside a turn, as long

@@ -672,6 +672,12 @@ final class ConversationRecorder
                 } else {
                     unset($block['ui']);
                     $block['ui_dropped_bytes'] = $uiSize;
+                    // #11496: say which limit was reached, as a truncated result does: a card
+                    // that would never fit a turn, or one that arrived after earlier blocks
+                    // had spent the turn's budget.
+                    $block['ui_dropped_reason'] = $uiSize > self::MAX_TURN_BLOCK_BYTES
+                        ? 'too_large'
+                        : 'turn_budget_spent';
                 }
             }
 

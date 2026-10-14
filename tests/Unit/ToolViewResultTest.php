@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Log;
 use Tetrix\AiBridge\Auth\TokenManager;
 use Tetrix\AiBridge\Contracts\StoresStreamValues;
 use Tetrix\AiBridge\Contracts\StreamStoreContract;
@@ -49,6 +50,7 @@ function viewRig(): object
     );
     $registry->register('show_plain_card', 'A view tool returning a plain array', [], fn () => ['ok' => true], view: 'ui://studio/plain');
     $registry->register('no_view', 'A tool without a view', [], fn () => ToolResult::withView('just text', ['ignored' => true]));
+    $registry->register('show_huge_card', 'A view tool returning more than a view may keep', [], fn () => ToolResult::withView('big', ['blob' => str_repeat('x', 300 * 1024)]), view: 'ui://studio/huge');
 
     $rig = new stdClass();
     $rig->manager = new BridgeConnectionManager();
@@ -219,6 +221,65 @@ it('drops a ui too large for the turn from the record whole, never cutting it', 
 
     expect($call)->not->toHaveKey('ui')
         ->and($call['ui_dropped_bytes'])->toBeGreaterThan(9 * 1024 * 1024)
+        ->and($call['ui_dropped_reason'])->toBe('too_large')
         ->and($call['result'])->toBe('shown')
         ->and(bufferedToolResults($rig)[0]['ui']['result']['structuredContent']['blob'])->toBe($huge);
+});
+
+it('logs why a view tool called without provider_tool_call_id gets no view', function () {
+    // #11497: otherwise indistinguishable, server-side, from a tool that has no view.
+    $rig = viewRig();
+    Log::spy();
+
+    toolCallFrame($rig, 'show_grant_request', ['grant_id' => 42], 'tc_7', null);
+
+    Log::shouldHaveReceived('debug')->withArgs(fn (string $message, array $context = []) => str_contains($message, 'no provider call id')
+        && ($context['tool'] ?? null) === 'show_grant_request')->once();
+});
+
+it('logs that a view tool returning a plain value gives its view text only', function () {
+    // #11489
+    $rig = viewRig();
+    Log::spy();
+
+    toolCallFrame($rig, 'show_plain_card', [], 'tc_2', 'toolu_03');
+    toolCallFrame($rig, 'show_grant_request', ['grant_id' => 42], 'tc_7', 'toolu_01');
+
+    Log::shouldHaveReceived('debug')->withArgs(fn (string $message, array $context = []) => str_contains($message, 'returned no ToolResult'))->once();
+    Log::shouldHaveReceived('debug')->withArgs(fn (string $message, array $context = []) => ($context['tool'] ?? null) === 'show_plain_card')->once();
+});
+
+it('keeps no view larger than a host will draw, and still answers the CLI', function () {
+    // #11494: an oversized view is refused before it reaches the shared stream store.
+    $rig = viewRig();
+    Log::spy();
+
+    $reply = toolCallFrame($rig, 'show_huge_card', [], 'tc_3', 'toolu_04');
+
+    expect($reply['type'])->toBe(MessageTypes::TOOL_RESOLVE)
+        ->and($reply['result'])->toBe('big')
+        ->and($rig->store->getValue('req-v', StreamHandler::toolViewKey('toolu_04')))->toBeNull();
+    Log::shouldHaveReceived('warning')->withArgs(fn (string $message, array $context = []) => $message === 'AI Bridge: could not keep a tool view'
+        && str_contains($context['error'] ?? '', 'over the 262144'))->once();
+});
+
+it('says a ui was dropped because earlier blocks spent the turn, not because it was too large', function () {
+    // #11496: a small card after large tool output must not read as "this card was too big".
+    $rig = viewRig();
+
+    // Nine local results of 1 MB each spend the turn's 8 MB before the card is considered.
+    for ($i = 0; $i < 9; $i++) {
+        streamToolBlock($rig, $i, 'Bash', "toolu_local{$i}", '{"command":"cat"}');
+        ($rig->stream)(MessageTypes::TOOL_RESULT, ['tool_call_id' => "toolu_local{$i}", 'result' => str_repeat('y', 1024 * 1024)]);
+    }
+    streamToolBlock($rig, 9, 'mcp__bridge__show_grant_request', 'toolu_01', '{"grant_id":42}');
+    toolCallFrame($rig, 'show_grant_request', ['grant_id' => 42], 'tc_7', 'toolu_01');
+    ($rig->stream)(MessageTypes::TOOL_RESULT, ['tool_call_id' => 'toolu_01', 'result' => 'shown']);
+    ($rig->stream)(MessageTypes::DONE, ['usage' => null]);
+
+    $call = collect(recordedBlocks($rig))->firstWhere('tool_call_id', 'toolu_01');
+
+    expect($call)->not->toHaveKey('ui')
+        ->and($call['ui_dropped_bytes'])->toBeLessThan(1024)
+        ->and($call['ui_dropped_reason'])->toBe('turn_budget_spent');
 });

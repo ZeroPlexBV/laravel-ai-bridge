@@ -16,6 +16,12 @@ use Tetrix\AiBridge\Streaming\StreamStoreManager;
  * need a non-default driver call `StreamStore::driver('foo')`; apps that
  * want to register their own driver call `StreamStore::extend('foo', …)`.
  *
+ * `putValue` / `getValue` are optional (#11495): they exist only when the active driver
+ * implements {@see \Tetrix\AiBridge\Contracts\StoresStreamValues}. Both bundled drivers do;
+ * a custom driver that does not throws "Call to undefined method" when they are called
+ * here, rather than doing nothing. Check `StreamStore::driver() instanceof StoresStreamValues`
+ * first, as the package itself does.
+ *
  * @method static void start(string $requestId, array $metadata = [])
  * @method static int appendEvent(string $requestId, string $eventName, array $data)
  * @method static array range(string $requestId, int $fromIndex = -1)
@@ -24,8 +30,8 @@ use Tetrix\AiBridge\Streaming\StreamStoreManager;
  * @method static bool isAborted(string $requestId)
  * @method static void complete(string $requestId, string $status)
  * @method static void cleanup(string $requestId)
- * @method static void putValue(string $requestId, string $key, array $value)
- * @method static array|null getValue(string $requestId, string $key)
+ * @method static void putValue(string $requestId, string $key, array $value) Only on a driver implementing StoresStreamValues.
+ * @method static array|null getValue(string $requestId, string $key) Only on a driver implementing StoresStreamValues.
  * @method static \Tetrix\AiBridge\Contracts\StreamStoreContract driver(?string $driver = null)
  * @method static \Tetrix\AiBridge\Streaming\StreamStoreManager extend(string $driver, \Closure $callback)
  *
