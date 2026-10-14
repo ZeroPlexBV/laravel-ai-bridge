@@ -691,13 +691,16 @@ class AiBridgeManager
         // machine this is the only account of it there will ever be — and this
         // sink powers the documented streamToResponse() API, so leaving it
         // unwired meant half the fix reached one consumer and not the other.
-        $stream->onToolResult(function (string $toolCallId, mixed $result, ?bool $isError = null, ?string $parentToolUseId = null) use ($sink) {
+        $stream->onToolResult(function (string $toolCallId, mixed $result, ?bool $isError = null, ?string $parentToolUseId = null, ?array $ui = null) use ($sink) {
             $data = ['tool_call_id' => $toolCallId, 'result' => $result];
             if ($isError !== null) {
                 $data['is_error'] = $isError;
             }
             if ($parentToolUseId !== null) {
                 $data['parent_tool_use_id'] = $parentToolUseId;
+            }
+            if ($ui !== null) {
+                $data['ui'] = $ui;
             }
             $sink(['event' => MessageTypes::TOOL_RESULT, 'data' => $data]);
         });

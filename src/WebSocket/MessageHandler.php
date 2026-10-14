@@ -8,6 +8,7 @@ use Illuminate\Support\Facades\Log;
 use Tetrix\AiBridge\Auth\TokenManager;
 use Tetrix\AiBridge\Auth\TokenValidationException;
 use Tetrix\AiBridge\Contracts\MergesStreamMetadata;
+use Tetrix\AiBridge\Contracts\StoresStreamValues;
 use Tetrix\AiBridge\Contracts\StreamStoreContract;
 use Tetrix\AiBridge\Enums\BlockType;
 use Tetrix\AiBridge\Models\Conversation;
@@ -20,6 +21,7 @@ use Tetrix\AiBridge\Streaming\TurnMarker;
 use Tetrix\AiBridge\Support\BridgeLog;
 use Tetrix\AiBridge\Support\DesiredBridgeVersion;
 use Tetrix\AiBridge\Tools\ToolRegistry;
+use Tetrix\AiBridge\Tools\ToolResult;
 
 /**
  * Handles incoming WebSocket messages from CLI bridge clients.
@@ -1188,7 +1190,19 @@ class MessageHandler
             $data['tool_name'] ?? '',
             $data['parameters'] ?? [],
             $data['tool_call_id'] ?? $data['call_id'] ?? '',
+            self::providerToolCallIdOf($message['provider_tool_call_id'] ?? $data['provider_tool_call_id'] ?? null),
         );
+    }
+
+    /**
+     * The CLI's own id for a call (`toolu_…`), reported on `tool_call` by bridge 0.27+.
+     *
+     * Read defensively: an older bridge sends none, Codex and Gemini report none,
+     * and anything that is not a short non-empty string is treated as none.
+     */
+    private static function providerToolCallIdOf(mixed $value): ?string
+    {
+        return is_string($value) && $value !== '' && strlen($value) <= 256 ? $value : null;
     }
 
     /**
@@ -1221,6 +1235,7 @@ class MessageHandler
             $message['tool_name'] ?? $message['data']['tool_name'] ?? '',
             $message['arguments'] ?? $message['parameters'] ?? $message['data']['parameters'] ?? $message['data']['arguments'] ?? [],
             $message['tool_call_id'] ?? $message['call_id'] ?? $message['data']['tool_call_id'] ?? $message['data']['call_id'] ?? '',
+            self::providerToolCallIdOf($message['provider_tool_call_id'] ?? $message['data']['provider_tool_call_id'] ?? null),
         );
     }
 
@@ -1228,8 +1243,11 @@ class MessageHandler
      * Execute a tool call: dispatch to StreamHandler callbacks, run the tool, return response.
      *
      * Shared implementation for both stream-envelope and top-level tool_call messages.
+     *
+     * `$providerCallId` is the CLI's own id for the call, when the bridge reported
+     * one. A tool with a view has its full result kept under it (see keepToolView()).
      */
-    private function executeToolCall(string $requestId, string $toolName, array $params, string $callId): ?array
+    private function executeToolCall(string $requestId, string $toolName, array $params, string $callId, ?string $providerCallId = null): ?array
     {
         $handler = $this->connectionManager->getPendingRequest($requestId);
 
@@ -1289,7 +1307,7 @@ class MessageHandler
         // non-blocking when the bridge server runs under ReactPHP.
 
         // Dispatch to the StreamHandler's tool call callbacks
-        $handler->dispatchToolCall($toolName, $params, $callId);
+        $handler->dispatchToolCall($toolName, $params, $callId, $providerCallId);
 
         // Execute the tool if registered
         if ($this->toolRegistry->has($toolName)) {
@@ -1317,11 +1335,24 @@ class MessageHandler
                     ];
                 }
 
+                $view = $this->toolRegistry->get($toolName)->view;
+                if ($view !== null && $providerCallId !== null) {
+                    $this->keepToolView($handler, $providerCallId, [
+                        'resource_uri' => $view,
+                        'tool_name' => $toolName,
+                        'arguments' => $params,
+                        'result' => $result instanceof ToolResult
+                            ? $result->toCallToolResult()
+                            : ['content' => [['type' => 'text', 'text' => is_string($result) ? $result : (string) json_encode($result)]]],
+                    ]);
+                }
+
                 return [
                     'type' => MessageTypes::TOOL_RESOLVE,
                     'request_id' => $requestId,
                     'tool_call_id' => $callId,
-                    'result' => $result,
+                    // The CLI reads text only; the rest of a ToolResult is for the view.
+                    'result' => $result instanceof ToolResult ? $result->text : $result,
                 ];
             } catch (\Throwable $e) {
                 // Return a generic message to the client, log the full exception server-side.
@@ -1350,6 +1381,38 @@ class MessageHandler
             'tool_call_id' => $callId,
             'error' => "Tool '{$toolName}' is not registered.",
         ];
+    }
+
+    /**
+     * Keep a view's full result in the stream store under the CLI's call id, for the
+     * stream's `tool_result` of that call to carry as `ui` (StreamHandler joins them).
+     *
+     * Failures are logged, never thrown: the tool already ran and its text still goes
+     * to the CLI; the worst case is a call shown without its view.
+     *
+     * @param  array{resource_uri: string, tool_name: string, arguments: array<string, mixed>, result: array<string, mixed>}  $ui
+     */
+    private function keepToolView(StreamHandler $handler, string $providerCallId, array $ui): void
+    {
+        try {
+            if (json_encode($ui) === false) {
+                throw new \UnexpectedValueException('the view result is not JSON-serializable: '.json_last_error_msg());
+            }
+
+            $store = app(StreamStoreContract::class);
+            if (! $store instanceof StoresStreamValues) {
+                return;
+            }
+
+            $store->putValue($handler->requestId, StreamHandler::toolViewKey($providerCallId), $ui);
+            $handler->expectToolView($providerCallId);
+        } catch (\Throwable $e) {
+            Log::warning('AI Bridge: could not keep a tool view', [
+                'request_id' => $handler->requestId,
+                'tool' => $ui['tool_name'],
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     /**
