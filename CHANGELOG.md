@@ -3,6 +3,25 @@
 Release notes for earlier versions are on the GitHub releases page of
 tetrixdev/laravel-ai-bridge. This file starts with 0.16.0-RC1.
 
+## [Unreleased] — to be released as 0.18.0 (ZeroPlex fork)
+
+From here the package is the ZeroPlex fork, published as **`zeroplex/laravel-ai-bridge`**. It
+`replace`s `tetrixdev/laravel-ai-bridge` and keeps the `Tetrix\AiBridge` namespace, so an
+application switches by changing its `require` and adding the ZeroPlexBV `vcs` repository.
+
+### Added
+
+- **Tools with a view (MCP Apps, ai-bridge 0.27+).** A tool may name a `ui://` view
+  (`view()` / `HasView`, `registerTool(view:)`) and a `visibility`. Its definition carries
+  `_meta.ui` to the bridge; a tool without `"model"` visibility is not offered to the AI.
+  Views are served from `AiBridge::views()`. The server keeps each such call's full result
+  (`ToolResult::withView()`) under the CLI's `provider_tool_call_id`, and the stream's
+  `tool_result` for that call carries `ui` (`resource_uri`, `tool_name`, `arguments`, `result`),
+  also on the recorded message block.
+- **`AiBridge::tools()->callFromView()`**: runs a view's call as the signed-in person
+  (`ToolContext::origin()` `view`, `actor()`), refused unless the tool's visibility includes `app`.
+- **hello `mcp_apps`** recorded in `last_bridge` and reported on the connection status.
+
 ## [Unreleased] — to be released as 0.17.0
 
 The ZeroPlexBV fork (0.16.0-RC1, 0.16.0, 0.16.1 below) merged back into

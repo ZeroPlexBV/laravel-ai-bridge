@@ -18,8 +18,14 @@ Laravel AI Bridge provides a unified streaming pipeline: **provider -> normalize
 ## Installation
 
 ```bash
-composer require tetrixdev/laravel-ai-bridge
+composer require zeroplex/laravel-ai-bridge
 ```
+
+> **This is the ZeroPlex fork** of [tetrixdev/laravel-ai-bridge](https://github.com/tetrixdev/laravel-ai-bridge),
+> published as `zeroplex/laravel-ai-bridge` from 0.18.0. It `replace`s the original, keeps its PHP
+> namespace (`Tetrix\AiBridge`) so changes can still be offered back upstream, and adds what
+> ZeroPlex needs first, starting with [tools with a view](#tools-with-a-view-mcp-apps). Install it
+> from the ZeroPlexBV GitHub repository (a `vcs` repository entry), not from Packagist.
 
 Publish the config file:
 
@@ -1042,6 +1048,70 @@ class LookupCharacterTool implements ToolHandler
 // Register it
 AiBridge::registerToolHandler(new LookupCharacterTool());
 ```
+
+### Tools with a view (MCP Apps)
+
+A tool can name an interactive **view** that the chat draws next to its call: a card with the
+tool's result and, for example, a Confirm button. It follows the MCP Apps standard, so the view is
+plain HTML that talks to its host through `postMessage`. Needs `@tetrixdev/ai-bridge` 0.27.0 or
+newer on the machine and a CLI that reports its call ids (Claude Code); anywhere else the tool
+still runs, it just shows no view. See [PROTOCOL.md](PROTOCOL.md#tools-with-a-view-mcp-apps).
+
+**1. Register the view** (a `ui://` resource the server serves; the HTML is rendered per request):
+
+```php
+use Tetrix\AiBridge\Facades\AiBridge;
+
+AiBridge::views()->register(
+    uri: 'ui://studio/grant-request',
+    html: fn () => view('grants.card')->render(),
+    csp: [],            // MCP Apps `_meta.ui.csp`: connectDomains, resourceDomains, …; empty = nothing external
+);
+```
+
+**2. Give the tool the view, and return a result for both readers.** The model gets the text; the
+view gets the structured content too.
+
+```php
+use Tetrix\AiBridge\Tools\AbstractTool;
+use Tetrix\AiBridge\Tools\ToolResult;
+
+class ShowGrantRequestTool extends AbstractTool
+{
+    public function name(): string { return 'show_grant_request'; }
+    public function description(): string { return 'Show the person a grant request to confirm'; }
+    public function view(): ?string { return 'ui://studio/grant-request'; }   // null = no view (default)
+    public function visibility(): array { return ['model', 'app']; }         // default
+
+    protected function defineParameters(): array { /* grant_id */ }
+
+    public function handle(array $params): mixed
+    {
+        $grant = GrantRequest::findOrFail($params['grant_id']);
+
+        return ToolResult::withView(
+            text: "Grant request {$grant->id} is waiting for the person to confirm.",
+            structured: $grant->toCardData(),
+        );
+    }
+}
+```
+
+A `ToolHandler` class gets the same by implementing `Tetrix\AiBridge\Contracts\HasView`
+(`view()`, `visibility()`); a closure tool passes `view:` and `visibility:` to `registerTool()`.
+
+**3. Calls from the view run as the person, never as the AI.** The application's browser route
+(behind the person's own sign-in) hands a view's `tools/call` to
+
+```php
+$result = AiBridge::tools()->callFromView($conversation, 'confirm_grant', $arguments, $request->user());
+```
+
+which refuses a tool whose visibility lacks `"app"` or that the conversation's `allowed_tools`
+excludes, and runs it with `ToolContext::origin()` = `'view'` and `ToolContext::actor()` = that
+person. A call from the AI over the WebSocket has `origin()` = `'model'` and no actor. A tool that
+must only ever be the person's act checks `origin()`; a tool with visibility `['app']` is never
+offered to the AI at all.
 
 ### Listening for Tool Calls
 
