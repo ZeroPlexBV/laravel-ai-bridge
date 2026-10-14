@@ -1057,7 +1057,15 @@ plain HTML that talks to its host through `postMessage`. Needs `@tetrixdev/ai-br
 newer on the machine and a CLI that reports its call ids (Claude Code); anywhere else the tool
 still runs, it just shows no view. See [PROTOCOL.md](PROTOCOL.md#tools-with-a-view-mcp-apps).
 
-**1. Register the view** (a `ui://` resource the server serves; the HTML is rendered per request):
+**The AI serves the card; only the person acts in it.** A button in a card is never a tool call.
+It is an **action**: a named browser route of the application, behind the person's own sign-in,
+which the host (the chat) calls for the person. The assistant is never offered an action and has
+no way to call one. Anything that must be the person's own act (confirming a grant, approving a
+payment) therefore lives ONLY as an action, and must not exist as a tool in any form, or the
+assistant could simply call it itself.
+
+**1. Register the view** (a `ui://` resource the server serves; the HTML is rendered per request)
+and the actions its buttons may trigger, each the name of a POST route of the application:
 
 ```php
 use Tetrix\AiBridge\Facades\AiBridge;
@@ -1065,7 +1073,11 @@ use Tetrix\AiBridge\Facades\AiBridge;
 AiBridge::views()->register(
     uri: 'ui://studio/grant-request',
     html: fn () => view('grants.card')->render(),
-    csp: [],            // MCP Apps `_meta.ui.csp`: connectDomains, resourceDomains, …; empty = nothing external
+    csp: [],                                   // MCP Apps `_meta.ui.csp`; empty = nothing external
+    actions: [
+        'confirm' => 'grants.confirm',         // route names; resolved by the host, never by the AI
+        'decline' => 'grants.decline',
+    ],
 );
 ```
 
@@ -1081,7 +1093,6 @@ class ShowGrantRequestTool extends AbstractTool
     public function name(): string { return 'show_grant_request'; }
     public function description(): string { return 'Show the person a grant request to confirm'; }
     public function view(): ?string { return 'ui://studio/grant-request'; }   // null = no view (default)
-    public function visibility(): array { return ['model', 'app']; }         // default
 
     protected function defineParameters(): array { /* grant_id */ }
 
@@ -1090,7 +1101,7 @@ class ShowGrantRequestTool extends AbstractTool
         $grant = GrantRequest::findOrFail($params['grant_id']);
 
         return ToolResult::withView(
-            text: "Grant request {$grant->id} is waiting for the person to confirm.",
+            text: "Grant request {$grant->id} is shown to the person.",
             structured: $grant->toCardData(),
         );
     }
@@ -1098,20 +1109,12 @@ class ShowGrantRequestTool extends AbstractTool
 ```
 
 A `ToolHandler` class gets the same by implementing `Tetrix\AiBridge\Contracts\HasView`
-(`view()`, `visibility()`); a closure tool passes `view:` and `visibility:` to `registerTool()`.
+(`view()`); a closure tool passes `view:` to `registerTool()`. Showing the card is all the tool
+does: it changes nothing.
 
-**3. Calls from the view run as the person, never as the AI.** The application's browser route
-(behind the person's own sign-in) hands a view's `tools/call` to
-
-```php
-$result = AiBridge::tools()->callFromView($conversation, 'confirm_grant', $arguments, $request->user());
-```
-
-which refuses a tool whose visibility lacks `"app"` or that the conversation's `allowed_tools`
-excludes, and runs it with `ToolContext::origin()` = `'view'` and `ToolContext::actor()` = that
-person. A call from the AI over the WebSocket has `origin()` = `'model'` and no actor. A tool that
-must only ever be the person's act checks `origin()`; a tool with visibility `['app']` is never
-offered to the AI at all.
+**3. The action routes are ordinary browser routes.** `views()->register()` refuses an action whose
+route is not a POST route in the `web` middleware group (session and CSRF). Keep it that way: an
+action route must never also accept an API token, because the assistant on a machine may hold one.
 
 ### Listening for Tool Calls
 

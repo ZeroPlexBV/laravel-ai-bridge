@@ -1706,11 +1706,9 @@ the bridge only carries two things through, and needs to be 0.27.0 or newer to d
      "name": "show_grant_request",
      "description": "Show the person a grant request to confirm",
      "parameters": { "type": "object", "properties": { "grant_id": { "type": "integer", "description": "The grant request" } } },
-     "_meta": { "ui": { "resourceUri": "ui://studio/grant-request", "visibility": ["model", "app"] } }
+     "_meta": { "ui": { "resourceUri": "ui://studio/grant-request" } }
    }
    ```
-   `visibility` defaults to `["model", "app"]`. A tool whose visibility lacks `"model"` is
-   **never sent to the bridge**: only the view may call it, through the application (below).
 2. **`provider_tool_call_id` on `tool_call`.** The CLI's own id for the call (`toolu_…` for
    Claude Code), the same id the stream's `tool_call` block and `tool_result` carry. It is how the
    server joins the call it executes to the call it streams. Codex and Gemini report none; a call
@@ -1728,8 +1726,10 @@ Server                                   Bridge (0.27+)                   CLI
   │  write it to the stream store WITH `ui`  │                                │
 ```
 
-The server serves `ui://` resources from its own registry and runs a view's `tools/call` itself, as
-the signed-in person in the browser, never over this WebSocket. Views for tools of MCP servers
+The server serves `ui://` resources from its own registry. What the person does in a view never
+travels over this WebSocket and is never a tool call: the host turns a button press into a POST to
+one of the application's own browser routes (an *action* the view declared), behind the person's
+sign-in, so the assistant cannot trigger it. Views for tools of MCP servers
 configured on the machine (`--mcp-upstreams`, `mcp_request` / `mcp_result`) are not handled by this
 server: it records `mcp_apps` but never sends `mcp_request`.
 
