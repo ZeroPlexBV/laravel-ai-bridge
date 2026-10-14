@@ -1,6 +1,6 @@
 # Laravel AI Bridge
 
-[![Latest Version on Packagist](https://img.shields.io/packagist/v/tetrixdev/laravel-ai-bridge.svg)](https://packagist.org/packages/tetrixdev/laravel-ai-bridge)
+[![Latest version](https://img.shields.io/github/v/tag/ZeroPlexBV/laravel-ai-bridge?label=version)](https://github.com/ZeroPlexBV/laravel-ai-bridge/tags)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![PHP 8.2+](https://img.shields.io/badge/PHP-8.2%2B-blue.svg)](https://php.net)
 [![Laravel 12+](https://img.shields.io/badge/Laravel-12%2B-red.svg)](https://laravel.com)
