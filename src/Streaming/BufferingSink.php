@@ -105,12 +105,19 @@ final class BufferingSink
             $append($event->event, $event->data);
         });
 
-        $handler->onToolCall(function (string $name, array $params, string $callId) use ($append): void {
-            $append(MessageTypes::TOOL_CALL, [
+        $handler->onToolCall(function (string $name, array $params, string $callId, ?string $providerToolCallId = null) use ($append): void {
+            $data = [
                 'tool_name' => $name,
                 'parameters' => $params,
                 'tool_call_id' => $callId,
-            ]);
+            ];
+            // The CLI's own id for this call (ai-bridge 0.27+): the id the stream's tool_call
+            // block already carries, so a host can tell this is the SAME call it is drawing,
+            // not a second one. Absent when the bridge does not report it.
+            if ($providerToolCallId !== null && $providerToolCallId !== '') {
+                $data['provider_tool_call_id'] = $providerToolCallId;
+            }
+            $append(MessageTypes::TOOL_CALL, $data);
         });
 
         // Without this the browser could never see a tool result at all: the

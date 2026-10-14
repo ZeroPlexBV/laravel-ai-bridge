@@ -131,6 +131,21 @@ test('attach() buffers tool_call as a single event', function () {
     ]);
 });
 
+test('a server tool_call carries the CLI\'s own call id when the bridge reports it', function () {
+    // Without it a host sees the stream's tool_call block (toolu_…) and this frame as two calls,
+    // and draws the one call twice.
+    $store = new ArrayStreamStore();
+    $handler = new StreamHandler(fakeBufferProvider(), 'rid-tool-id');
+    BufferingSink::attach($handler, $store);
+
+    $handler->dispatchToolCall('show_card', ['x' => 1], 'tc_7', 'toolu_01abc');
+    $handler->dispatchToolCall('search', [], 'tc_8');
+
+    $events = $store->range('rid-tool-id');
+    expect($events[0]['data']['provider_tool_call_id'])->toBe('toolu_01abc');
+    expect($events[1]['data'])->not->toHaveKey('provider_tool_call_id');
+});
+
 test('the buffer carries a tool result, including whether it failed', function () {
     // Without a tool_result handler here, a result could never reach a browser
     // even once the bridge started sending them.
