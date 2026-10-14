@@ -873,7 +873,7 @@ Eloquent `deleting` event on `Tetrix\AiBridge\Models\Connection`.
 | `GET /ai-bridge/streams/{rid}/status` | Status snapshot of an in-flight or recently-completed turn |
 | `GET /ai-bridge/streams/{rid}/events` | SSE tail of the per-turn event buffer; resumes by `Last-Event-ID` |
 | `POST /ai-bridge/streams/{rid}/abort` | Cancel an in-flight turn. Sets a flag; the WebSocket process acts on it at the turn's next event, or at the next heartbeat when the turn has gone quiet — so a stop takes effect within the heartbeat interval (30s by default) at worst. **Stopping the CLI itself needs `@tetrixdev/ai-bridge` 0.11.0 or newer**: older bridges ignore `cancel`, so the chat ends the turn but the CLI runs on to the end on the operator's machine |
-| `GET /ai-bridge/connections` | List connections with their advertised providers/models + live `connected` flag, plus the `bridge_version` a connected bridge runs and whether it will follow `bridge.desired_version` (`self_update`) |
+| `GET /ai-bridge/connections` | List connections with their advertised providers/models + live `connected` flag, plus the `bridge_version` a connected bridge runs and whether it will follow `bridge.desired_version` (`self_update`), and for a bridge whether it passes MCP Apps through (`mcp_apps`) |
 | `POST /ai-bridge/connections` | Register a CLI bridge or BYOK connection |
 | `PATCH /ai-bridge/connections/{id}` | Rename a connection |
 | `POST /ai-bridge/connections/{id}/regenerate` | Rotate a bridge's token (revokes the old one, disconnects any live bridge) |
@@ -1104,6 +1104,14 @@ class ShowGrantRequestTool extends AbstractTool
 A `ToolHandler` class gets the same by implementing `Tetrix\AiBridge\Contracts\HasView`
 (`view()`); a closure tool passes `view:` to `registerTool()`. Showing the card is all the tool
 does: it changes nothing.
+
+**3. The host draws it.** The stream's `tool_result` for such a call carries `ui`
+(`resource_uri`, `tool_name`, `arguments`, `result`), in the stream store and on the recorded
+block; `onToolResult` receives it as a fifth argument (`?array $ui`, null for every other result).
+The host fetches the HTML with `AiBridge::views()->render($ui['resource_uri'])`
+(`['html' => …, 'csp' => […]]`; an unknown URI throws `ViewNotFoundException`). Whether a machine
+can show views at all is `$status['mcp_apps']` on its connection status (true once its bridge
+announced `mcp_apps` at hello).
 
 ### Listening for Tool Calls
 

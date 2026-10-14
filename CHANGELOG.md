@@ -17,8 +17,20 @@ application switches by changing its `require` and adding the ZeroPlexBV `vcs` r
   press in a view is the host's concern and never a tool call. The server keeps each such call's full result
   (`ToolResult::withView()`) under the CLI's `provider_tool_call_id`, and the stream's
   `tool_result` for that call carries `ui` (`resource_uri`, `tool_name`, `arguments`, `result`),
-  also on the recorded message block.
-- **hello `mcp_apps`** recorded in `last_bridge` and reported on the connection status.
+  also on the recorded message block (kept whole or, past the turn's storage budget, dropped with
+  `ui_dropped_bytes`; never cut). `onToolResult` callbacks receive it as a fifth argument (`?array $ui`), `onToolCall` callbacks
+  the `provider_tool_call_id` as a fourth (`?string`). A view's HTML is rendered with
+  `AiBridge::views()->render($uri)`.
+- **hello `mcp_apps`** recorded in `last_bridge` and reported on the connection status
+  (`mcp_apps: bool`, also on `GET /ai-bridge/connections`).
+- **`StoresStreamValues`** (`putValue` / `getValue`): small keyed values kept beside a turn, as long
+  as the turn lives. Both bundled stream stores implement it; a custom driver that does not simply
+  shows no views.
+
+### Changed
+
+- The recorder pairs a `tool_call` frame with its stream block by `provider_tool_call_id` when the
+  bridge reports one, and by tool name only as a fallback.
 
 ## [Unreleased] — to be released as 0.17.0
 

@@ -1359,8 +1359,9 @@ What a tool returned. Emitted for **both** kinds of tool call:
 `is_error` is the authoritative failure signal, and is **absent when the provider did not report one** — absent never means "succeeded". Do not infer failure from the text: a tool legitimately printing `Error: no matches` is indistinguishable from one that failed. (For historical reasons the Codex and Gemini adapters additionally prefix `Error: ` onto a failed result; that prefix is not a substitute for the field.)
 
 `ui` is present only on the result of a call to a server tool **with a view** (see
-[Tools with a view](#tools-with-a-view-mcp-apps)), and only on the event the **server** writes to
-its own stream store and records on the message, never on a frame the bridge sends:
+[Tools with a view](#tools-with-a-view-mcp-apps)), and only on the events the **server** itself
+emits (its stream store, `streamToResponse()`) and records on the message, never on a frame the
+bridge sends:
 
 ```json
 "ui": {
