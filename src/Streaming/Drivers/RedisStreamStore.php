@@ -7,6 +7,7 @@ namespace Tetrix\AiBridge\Streaming\Drivers;
 use Illuminate\Contracts\Redis\Factory as RedisFactory;
 use Illuminate\Redis\Connections\Connection;
 use Tetrix\AiBridge\Contracts\MergesStreamMetadata;
+use Tetrix\AiBridge\Contracts\StoresStreamValues;
 use Tetrix\AiBridge\Contracts\StreamStoreContract;
 
 /**
@@ -17,13 +18,14 @@ use Tetrix\AiBridge\Contracts\StreamStoreContract;
  *   {prefix}:{rid}:meta      — JSON metadata (conversation_id, started_at, ...)
  *   {prefix}:{rid}:status    — string: streaming|completed|failed|cancelled
  *   {prefix}:{rid}:abort     — exists ⇒ aborted
+ *   {prefix}:{rid}:values    — Redis hash of JSON values (putValue/getValue)
  *
  * TTLs:
  *   While status=streaming, each touch resets TTL to $streamingTtl.
  *   On complete(), TTL is shortened to $completedTtl so a recent reload can
  *   still replay but the entry doesn't linger.
  */
-final class RedisStreamStore implements StreamStoreContract, MergesStreamMetadata
+final class RedisStreamStore implements StreamStoreContract, MergesStreamMetadata, StoresStreamValues
 {
     public function __construct(
         private readonly RedisFactory $redis,
@@ -79,6 +81,33 @@ final class RedisStreamStore implements StreamStoreContract, MergesStreamMetadat
         );
     }
 
+    public function putValue(string $requestId, string $key, array $value): void
+    {
+        $conn = $this->conn();
+        $valuesKey = $this->key($requestId, 'values');
+
+        $conn->hset($valuesKey, $key, json_encode($value, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+
+        // As long as the turn: a finished turn's short life, a running (or not yet
+        // started) one's long one, renewed by appendEvent() while it streams.
+        $status = $conn->get($this->key($requestId, 'status'));
+        $conn->expire($valuesKey, $status === null || $status === 'streaming' ? $this->streamingTtl : $this->completedTtl);
+    }
+
+    public function getValue(string $requestId, string $key): ?array
+    {
+        $raw = $this->conn()->hget($this->key($requestId, 'values'), $key);
+
+        // phpredis answers a missing field with false, predis with null.
+        if (! is_string($raw)) {
+            return null;
+        }
+
+        $decoded = json_decode($raw, true);
+
+        return is_array($decoded) ? $decoded : null;
+    }
+
     public function appendEvent(string $requestId, string $eventName, array $data): int
     {
         $conn = $this->conn();
@@ -108,6 +137,7 @@ final class RedisStreamStore implements StreamStoreContract, MergesStreamMetadat
         if ($conn->get($statusKey) === 'streaming') {
             $conn->expire($statusKey, $this->streamingTtl);
             $conn->expire($this->key($requestId, 'meta'), $this->streamingTtl);
+            $conn->expire($this->key($requestId, 'values'), $this->streamingTtl);
         }
 
         return $newLength - 1;
@@ -182,6 +212,7 @@ final class RedisStreamStore implements StreamStoreContract, MergesStreamMetadat
         $conn->set($this->key($requestId, 'status'), $status, 'EX', $this->completedTtl);
         $conn->expire($this->key($requestId, 'events'), $this->completedTtl);
         $conn->expire($this->key($requestId, 'meta'), $this->completedTtl);
+        $conn->expire($this->key($requestId, 'values'), $this->completedTtl);
 
         // The stop belongs to the turn that was stopped, and that turn is over.
         //
@@ -208,6 +239,7 @@ final class RedisStreamStore implements StreamStoreContract, MergesStreamMetadat
             $this->key($requestId, 'meta'),
             $this->key($requestId, 'status'),
             $this->key($requestId, 'abort'),
+            $this->key($requestId, 'values'),
         );
     }
 

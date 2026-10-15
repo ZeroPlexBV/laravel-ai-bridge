@@ -3,6 +3,37 @@
 Release notes for earlier versions are on the GitHub releases page of
 tetrixdev/laravel-ai-bridge. This file starts with 0.16.0-RC1.
 
+## [Unreleased] — to be released as 0.18.0 (ZeroPlex fork)
+
+From here the package is the ZeroPlex fork, published as **`zeroplex/laravel-ai-bridge`**. It
+`replace`s `tetrixdev/laravel-ai-bridge` and keeps the `Tetrix\AiBridge` namespace, so an
+application switches by changing its `require` and adding the ZeroPlexBV `vcs` repository.
+
+### Added
+
+- **Tools with a view (MCP Apps, ai-bridge 0.27+).** A tool may name a `ui://` view
+  (`view()` / `HasView`, `registerTool(view:)`); its definition carries `_meta.ui.resourceUri`
+  to the bridge. Views are registered in `AiBridge::views()` with their HTML and CSP. A button
+  press in a view is the host's concern and never a tool call. The server keeps each such call's full result
+  (`ToolResult::withView()`) under the CLI's `provider_tool_call_id`, and the stream's
+  `tool_result` for that call carries `ui` (`resource_uri`, `tool_name`, `arguments`, `result`),
+  also on the recorded message block (kept whole or, past the turn's storage budget, dropped with
+  `ui_dropped_bytes` and `ui_dropped_reason`, `too_large` or `turn_budget_spent`; never cut). A view
+  over 256 KB is not kept at all. `onToolResult` callbacks receive it as a fifth argument (`?array $ui`), `onToolCall` callbacks
+  the `provider_tool_call_id` as a fourth (`?string`), and the stream's `tool_call` event carries it
+  on the buffered and the direct SSE path (`streamToResponse()`, `POST /ai-bridge/stream/sse`) alike.
+  A view's HTML is rendered with `AiBridge::views()->render($uri)`.
+- **hello `mcp_apps`** recorded in `last_bridge` and reported on the connection status
+  (`mcp_apps: bool`, also on `GET /ai-bridge/connections`).
+- **`StoresStreamValues`** (`putValue` / `getValue`): small keyed values kept beside a turn, as long
+  as the turn lives. Both bundled stream stores implement it; a custom driver that does not simply
+  shows no views.
+
+### Changed
+
+- The recorder pairs a `tool_call` frame with its stream block by `provider_tool_call_id` when the
+  bridge reports one, and by tool name only as a fallback.
+
 ## [Unreleased] — to be released as 0.17.0
 
 The ZeroPlexBV fork (0.16.0-RC1, 0.16.0, 0.16.1 below) merged back into
