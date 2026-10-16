@@ -3,7 +3,7 @@
 Release notes for earlier versions are on the GitHub releases page of
 tetrixdev/laravel-ai-bridge. This file starts with 0.16.0-RC1.
 
-## [Unreleased] — to be released as 0.21.0
+## [0.21.0] — 2026-10-16
 
 Hardens the upstream routes added in 0.19 (decision 0009).
 
