@@ -67,6 +67,9 @@ class AiBridgeManager
      *   - 'temperature': Sampling temperature.
      *   - 'max_tokens': Maximum tokens in response.
      *   - 'model': Override the configured model.
+     *   - 'effort': The thinking level for this turn (bridge mode; Claude's `--effort`, e.g.
+     *     'low', 'medium', 'high', 'xhigh', 'max'). Sent as `options.effort`; absent sends
+     *     nothing. Which levels a machine honours: ConnectionStatus::for()['effort_levels'].
      *   - 'api_key': Override API key for BYOK (server-side only, stripped from HTTP input by StreamController).
      *   - 'mode': ProviderMode enum instance (server-side only, stripped from HTTP input by StreamController).
      *   - 'user_id': User ID for bridge mode (server-side only, stripped from HTTP input by StreamController).
@@ -432,7 +435,10 @@ class AiBridgeManager
      * assistant turn is written when the stream completes.
      *
      * @param  array<string, mixed>  $options  Extra options (rarely needed —
-     *   provider/model/mode/system_prompt come from the conversation).
+     *   provider/model/mode/system_prompt come from the conversation). Per-turn
+     *   ones pass through, e.g. 'effort' (see stream()). A 'model' given here is
+     *   for THIS turn and wins over the conversation's stored model, which it
+     *   does not change; without one the stored model is used.
      */
     public function streamConversation(Conversation $conversation, string $message, array $options = []): StreamHandler
     {
@@ -453,8 +459,14 @@ class AiBridgeManager
         if (! empty($conversation->system_prompt)) {
             $options['system_prompt'] = $conversation->system_prompt;
         }
-        if (! empty($conversation->model)) {
-            $options['model'] = $conversation->model;
+        // A per-turn model wins over the stored one, so a caller can switch
+        // model for one turn without rewriting the conversation. Without one,
+        // the conversation's model is used as before.
+        $turnModel = self::turnModel($options, $conversation);
+        if ($turnModel !== null) {
+            $options['model'] = $turnModel;
+        } else {
+            unset($options['model']);
         }
 
         $connection = $conversation->connection;
@@ -493,9 +505,26 @@ class AiBridgeManager
 
         $handler = $this->buildStream((string) $conversation->id, $message, $options);
 
-        ConversationRecorder::attach($handler, $conversation);
+        // Recorded against the model this turn actually asked for.
+        ConversationRecorder::attach($handler, $conversation, $turnModel);
 
         return $handler;
+    }
+
+    /**
+     * The model a conversation turn runs on: the turn's own `model` option when it
+     * names one, else the conversation's stored model, else null.
+     *
+     * @param  array<string, mixed>  $options
+     */
+    private static function turnModel(array $options, Conversation $conversation): ?string
+    {
+        $model = $options['model'] ?? null;
+        if (is_string($model) && $model !== '') {
+            return $model;
+        }
+
+        return ! empty($conversation->model) ? (string) $conversation->model : null;
     }
 
     /**
@@ -559,7 +588,7 @@ class AiBridgeManager
             'conversation_id' => (string) $conversation->id,
             'started_at' => now()->toIso8601String(),
             'provider' => $conversation->provider,
-            'model' => $conversation->model,
+            'model' => self::turnModel($options, $conversation),
         ]);
 
         // Mark the conversation as actively streaming so a fresh page-load can

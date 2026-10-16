@@ -378,6 +378,7 @@ What each machine runs comes back on its status:
 $status = app(ConnectionStatus::class)->for($connection);
 $status['bridge_version'];  // '0.24.1'; what it ran last time while offline; null if never reported
 $status['self_update'];     // true only if this bridge is connected and will follow the desired version
+$status['effort_levels'];   // thinking levels it honours as a turn's `effort` (Claude only); [] when none
 ```
 
 `self_update` is `false` for a bridge started by hand, one whose operator opted
@@ -1326,6 +1327,39 @@ next turn. The same moment is in the turn's stream metadata (`input_open` =>
 false, `input_closed_reason`), on `onInputClosed` of a `StreamHandler`, and
 fired in the serve process as `Tetrix\AiBridge\Events\TurnInputClosed`
 (`userId`, `requestId`, `reason`).
+
+### Thinking level (`effort`)
+
+A bridge turn can name how hard Claude thinks, Claude Code's `--effort`. Pass it
+per turn as `effort`; it is not stored on the conversation. It applies to Claude
+conversations only (ai-bridge 0.32.0+): Codex and Gemini ignore it, so offer a
+level picker only where the provider is Claude:
+
+```php
+$requestId = AiBridge::startConversationStream($conversation, $message, ['effort' => 'high']);
+```
+
+It reaches the bridge as `ai_request.options.effort`, beside `options.model`,
+and is sent again if the turn is re-issued after a lost CLI session. Without it
+nothing is sent and the CLI runs at its own default. The conversation route
+takes it too: `POST /ai-bridge/conversations/{id}/stream` with `effort`.
+
+Which levels a machine honours it says itself, at `hello` (ai-bridge with
+`effort_levels`):
+
+```php
+$levels = app(ConnectionStatus::class)->for($connection)['effort_levels'];
+// ['low', 'medium', 'high', 'xhigh', 'max']; [] when the bridge does not honour effort
+```
+
+An empty list means the machine ignores the option (every bridge older than the
+field, and BYOK). A level not in the list is ignored by the bridge, and the turn
+runs at the default. Like `capabilities`, the list is remembered from the last
+connection while the machine is off; check `connected`.
+
+A `model` passed the same way is also for that turn only, and wins over the
+conversation's stored `model` without changing it. The assistant row and the
+turn's stream metadata record the model the turn ran with.
 
 ### What the turn cost
 

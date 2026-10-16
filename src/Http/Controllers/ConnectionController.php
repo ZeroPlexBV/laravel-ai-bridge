@@ -62,6 +62,8 @@ class ConnectionController extends Controller
                 // Its attachment caps and the optional frames it knows.
                 $data['attachment_limits'] = $status['attachment_limits'] ?? null;
                 $data['capabilities'] = $status['capabilities'] ?? [];
+                // The thinking levels it honours as a turn's `effort`; empty: none.
+                $data['effort_levels'] = $status['effort_levels'] ?? [];
                 // Whether it passes MCP Apps through, so a tool's view can show.
                 $data['mcp_apps'] = $status['mcp_apps'] ?? false;
                 // Whether it can sign in to OAuth upstream MCP servers, and how its

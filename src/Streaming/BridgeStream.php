@@ -149,6 +149,9 @@ class BridgeStream implements StreamableProvider
                 'temperature' => $this->options['temperature'] ?? null,
                 'max_tokens' => $this->options['max_tokens'] ?? null,
                 'model' => $this->options['model'] ?? null,
+                // The thinking level (Claude's `--effort`), per turn. Absent
+                // sends nothing and the CLI runs at its own default.
+                'effort' => $this->options['effort'] ?? null,
                 // Keep the turn's input open so a message can reach it while
                 // it runs (AiBridge::sendTurnInput). Opt-in per turn; the
                 // bridge confirms it with `input_open` on the ack.
@@ -211,6 +214,9 @@ class BridgeStream implements StreamableProvider
                 $this->streamHandler->requestId,
                 $this->streamHandler,
                 (string) $this->userId,
+                // What a session_lost re-issue must send again; the relay
+                // path records the same through registerRelayedRequest().
+                AiRequestPayload::reissueCarry($payload),
             );
 
             return;

@@ -1094,10 +1094,12 @@ class BridgeWebSocketServer
         // stream events from the bridge can be verified and buffered for the
         // browser's SSE tail. Register BEFORE sending so a fast bridge reply
         // cannot race ahead of the registration.
-        $this->messageHandler->registerRelayedRequest($requestId, $userId, (string) $conversationId, array_filter([
-            'bridge_prompt' => $payload['bridge_prompt'] ?? null,
-            'accepts_input' => ($payload['options']['accepts_input'] ?? null) === true ? true : null,
-        ], static fn ($v) => $v !== null));
+        $this->messageHandler->registerRelayedRequest(
+            $requestId,
+            $userId,
+            (string) $conversationId,
+            AiRequestPayload::reissueCarry($payload),
+        );
 
         $sent = $this->connectionManager->sendToUser($userId, $payload);
 

@@ -65,6 +65,7 @@ it('records bridge_version, attachment_limits and capabilities from a pre-authen
             'attachment_limits' => ['max_file_bytes' => 52428800, 'max_total_bytes' => 104857600, 'max_count' => 10],
             'capabilities' => ['turn_input', 'file_uploads', 'file_downloads', 'app_backends'],
             'self_update' => false,
+            'effort_levels' => [],
             'mcp_apps' => null,
             'mcp_upstream_auth' => null,
         ])
@@ -99,6 +100,7 @@ it('reads an old bridge hello as no capabilities, and drops fields of the wrong 
         'attachment_limits' => ['max_count' => 3],
         'capabilities' => [],
         'self_update' => false,
+        'effort_levels' => [],
         'mcp_apps' => null,
         'mcp_upstream_auth' => null,
     ]);

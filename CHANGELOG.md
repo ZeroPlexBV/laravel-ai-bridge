@@ -3,6 +3,38 @@
 Release notes for earlier versions are on the GitHub releases page of
 tetrixdev/laravel-ai-bridge. This file starts with 0.16.0-RC1.
 
+## [Unreleased] — to be released as 0.20.0
+
+### Added
+
+- **Thinking level (`effort`), per turn.** A turn option `effort` (a string, Claude Code's
+  `--effort`: `low` … `max`) is sent to the bridge as `ai_request.options.effort`, beside
+  `options.model`, on the in-process and the PHP-FPM relay paths alike, and again when a turn is
+  re-issued after `session_lost`. Absent, empty or not a string: nothing is sent and the turn runs
+  as before. `POST /ai-bridge/conversations/{id}/stream` takes it as `effort` (422 unless it is
+  1 to 16 lowercase letters); `StreamController` lets it through its option whitelist. Claude
+  conversations only: the bridge (ai-bridge 0.32.0+) passes it to Claude Code as `--effort`, and
+  Codex and Gemini ignore it.
+- **`hello.effort_levels`.** The levels a bridge honours, recorded with its other hello facts and
+  reported as `ConnectionStatus::for()['effort_levels']` (`list<string>`, `[]` when the bridge
+  does not honour `effort`: BYOK and every bridge that predates the field), also as
+  `ConnectionStatus::effortLevels()` and on `GET /ai-bridge/connections`. Remembered from the
+  last connection while the machine is off, like `capabilities`.
+
+### Changed
+
+- **Behaviour change: a per-turn `model` now wins over the conversation's stored model.** A caller
+  that passes `model` in a turn's options while the conversation has a stored `model` now gets the
+  turn's model, where it used to get the stored one. `streamConversation()` /
+  `startConversationStream()` used to overwrite a caller's `model` option with the
+  conversation's `model` whenever one was stored, so a turn could not switch model without
+  rewriting the conversation. The turn's own `model` is now sent when given, and the stored one
+  otherwise (unchanged when the caller gives none). The conversation row is not changed; the
+  assistant row and the turn's stream metadata record the model the turn ran with, and a
+  `session_lost` re-issue sends it again instead of reverting to the stored one.
+
+No migration, no config change.
+
 ## [Unreleased] — to be released as 0.19.0
 
 Upstream MCP Apps and OAuth sign-in for the MCP servers a bridge connects to

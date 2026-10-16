@@ -176,7 +176,7 @@ final class ConversationRecorder
     /**
      * Attach recording callbacks to a StreamHandler for the given conversation.
      */
-    public static function attach(StreamHandler $handler, Conversation $conversation): void
+    public static function attach(StreamHandler $handler, Conversation $conversation, ?string $model = null): void
     {
         /** @var array<int, array<string, mixed>> $blocks */
         $blocks = [];
@@ -418,14 +418,14 @@ final class ConversationRecorder
 
             $blocks[] = $block;
         });
-        $handler->onDone(function (?array $usage) use (&$blocks, &$current, &$inStreamToolCall, &$pendingFrames, $conversation, $handler) {
+        $handler->onDone(function (?array $usage) use (&$blocks, &$current, &$inStreamToolCall, &$pendingFrames, $conversation, $handler, $model) {
             $inStreamToolCall = false;
             self::flushCurrent($blocks, $current, $pendingFrames);
-            self::persist($conversation, $blocks, $usage, false);
+            self::persist($conversation, $blocks, $usage, false, $model);
             self::clearStreamingRequestId($conversation, $handler->requestId);
         });
 
-        $persistPartial = function () use (&$blocks, &$current, &$inStreamToolCall, &$pendingFrames, $conversation, $handler) {
+        $persistPartial = function () use (&$blocks, &$current, &$inStreamToolCall, &$pendingFrames, $conversation, $handler, $model) {
             // A truncated stream may have left $inStreamToolCall set without a
             // matching block_stop. Clearing it isn't strictly necessary here
             // (this is a terminal — no more events arrive), but resetting
@@ -434,7 +434,7 @@ final class ConversationRecorder
             $inStreamToolCall = false;
             self::flushCurrent($blocks, $current, $pendingFrames);
             if (config('ai-bridge.persistence.persist_partial_on_error', true) && self::hasContent($blocks)) {
-                self::persist($conversation, $blocks, null, true);
+                self::persist($conversation, $blocks, null, true, $model);
             }
             self::clearStreamingRequestId($conversation, $handler->requestId);
         };
@@ -905,7 +905,7 @@ final class ConversationRecorder
      * calls are cancelled against their frames — at the end, when both
      * orderings have arrived, rather than on arrival when only one has.
      */
-    private static function persist(Conversation $conversation, array $blocks, ?array $usage, bool $incomplete): void
+    private static function persist(Conversation $conversation, array $blocks, ?array $usage, bool $incomplete, ?string $model = null): void
     {
         $blocks = self::capForStorage(self::reconcileToolCalls($blocks));
 
@@ -920,7 +920,9 @@ final class ConversationRecorder
             $conversation->appendMessage(Message::ROLE_ASSISTANT, $text, [
                 'blocks' => $blocks,
                 'provider' => $conversation->provider,
-                'model' => $conversation->model,
+                // The turn's own model when it named one (a per-turn switch), else the
+                // conversation's.
+                'model' => $model ?? $conversation->model,
                 'usage' => $usage,
                 'incomplete' => $incomplete,
             ]);

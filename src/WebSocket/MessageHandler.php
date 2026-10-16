@@ -47,7 +47,8 @@ class MessageHandler
 
     /**
      * Per-request fields of a relayed turn that buildFreshAiRequest() cannot rebuild from
-     * the conversation (`bridge_prompt`, `options.accepts_input`), by request id.
+     * the conversation (`bridge_prompt`, `options.accepts_input`, `options.effort`,
+     * `options.model`), by request id. See AiRequestPayload::reissueCarry().
      *
      * @var array<string, array<string, mixed>>
      */
@@ -156,7 +157,8 @@ class MessageHandler
      */
     public function registerRelayedRequest(string $requestId, string $userId, string $conversationId, array $carry = []): void
     {
-        $relay = new RelayStream($requestId, $conversationId);
+        $model = $carry['model'] ?? null;
+        $relay = new RelayStream($requestId, $conversationId, is_string($model) && $model !== '' ? $model : null);
 
         // What a re-issue after `session_lost` must send again that the conversation row
         // does not hold: the turn's `bridge_prompt` and whether its input is open.
@@ -587,6 +589,10 @@ class MessageHandler
      * `self_update` is whether the bridge will follow `desired_bridge_version`
      * (0.24.0+); absent or non-boolean is false, which is what every older
      * bridge sends and which is right: it cannot follow one.
+     * `effort_levels` is the thinking levels the bridge passes on from
+     * `options.effort` (Claude's `--effort`, e.g. `low` … `max`); empty from a
+     * bridge that does not honour the option, which is every bridge that
+     * predates it.
      * `mcp_apps` is the MCP Apps support the bridge announced (0.27+), as
      * `{spec, revision}`, or null: absent, or not an object naming a spec.
      * `mcp_upstream_auth` is `{revision}` when the bridge implements OAuth sign-in to its
@@ -596,7 +602,7 @@ class MessageHandler
      * event loop and a TypeError there drops every connected bridge.
      *
      * @param  array<string, mixed>  $message
-     * @return array{bridge_version: string|null, protocol_version: string|null, attachment_limits: array<string, int>|null, capabilities: list<string>, self_update: bool, mcp_apps: array{spec: string, revision: int|null}|null, mcp_upstream_auth: array{revision: int|null}|null}
+     * @return array{bridge_version: string|null, protocol_version: string|null, attachment_limits: array<string, int>|null, capabilities: list<string>, self_update: bool, mcp_apps: array{spec: string, revision: int|null}|null, mcp_upstream_auth: array{revision: int|null}|null, effort_levels: list<string>}
      */
     public static function bridgeInfoFromHello(array $message): array
     {
@@ -628,6 +634,7 @@ class MessageHandler
             'attachment_limits' => $limits,
             'capabilities' => $capabilities,
             'self_update' => ($message['self_update'] ?? null) === true,
+            'effort_levels' => self::effortLevelsFromHello($message['effort_levels'] ?? null),
             'mcp_apps' => self::mcpAppsOf($message['mcp_apps'] ?? null),
             'mcp_upstream_auth' => self::mcpUpstreamAuthOf($message['mcp_upstream_auth'] ?? null),
         ];
@@ -664,6 +671,38 @@ class MessageHandler
             'spec' => mb_substr($value['spec'], 0, 32),
             'revision' => is_int($value['revision'] ?? null) ? $value['revision'] : null,
         ];
+    }
+
+    /** The most `effort_levels` kept from a hello; the bridge sends five. */
+    private const MAX_EFFORT_LEVELS = 16;
+
+    /**
+     * `hello.effort_levels`, reduced to a list of distinct non-empty strings.
+     *
+     * Anything that is not a list (absent, a string, an object) is an empty list,
+     * which means "this bridge does not honour `options.effort`". Entries that are
+     * not usable levels are dropped rather than failing the handshake.
+     *
+     * @return list<string>
+     */
+    private static function effortLevelsFromHello(mixed $raw): array
+    {
+        if (! is_array($raw) || ! array_is_list($raw)) {
+            return [];
+        }
+
+        $levels = [];
+        foreach ($raw as $level) {
+            $level = AiRequestPayload::normaliseEffort($level);
+            if ($level !== null && ! in_array($level, $levels, true)) {
+                $levels[] = $level;
+            }
+            if (count($levels) >= self::MAX_EFFORT_LEVELS) {
+                break;
+            }
+        }
+
+        return $levels;
     }
 
     /**
@@ -1734,7 +1773,10 @@ class MessageHandler
         $conversation->save();
 
         $userId = (string) $this->connectionManager->getUserIdByConnectionId($connectionId);
-        $payload = $this->buildFreshAiRequest($conversation, $requestId, $this->requestCarry[$requestId] ?? []);
+        // A relayed turn's carry is held here; a turn sent in this process by
+        // BridgeStream recorded its own with the pending request.
+        $carry = $this->requestCarry[$requestId] ?? $this->connectionManager->getPendingRequestCarry($requestId);
+        $payload = $this->buildFreshAiRequest($conversation, $requestId, $carry);
 
         BridgeLog::info('session_lost — wiped cli_session_id, re-issuing as a fresh session', [
             'request_id' => $requestId,
@@ -1779,10 +1821,14 @@ class MessageHandler
             'message' => is_array($current) ? (string) ($current['content'] ?? '') : '',
             'system_prompt' => $conversation->system_prompt ?: null,
             'options' => [
-                'model' => $conversation->model ?: null,
+                // The model the turn was sent with: a per-turn switch is not on the
+                // conversation row, and the re-issue must not quietly revert it.
+                'model' => $carry['model'] ?? ($conversation->model ?: null),
                 // Asked for on the original turn; without it the re-issue runs with its
                 // input closed while the stream metadata still says it is open.
                 'accepts_input' => ($carry['accepts_input'] ?? null) === true ? true : null,
+                // The turn's thinking level: a per-turn option, not on the conversation row.
+                'effort' => $carry['effort'] ?? null,
             ],
             'bridge_prompt' => $carry['bridge_prompt'] ?? null,
             'cli_session_id' => null,

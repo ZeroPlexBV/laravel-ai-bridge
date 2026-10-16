@@ -127,7 +127,7 @@ class StreamController extends Controller
      * future are blocked by default unless the developer explicitly permits them.
      *
      * Permitted client-controllable options (non-managed mode):
-     *   temperature, max_tokens, model, messages, stream_options
+     *   temperature, max_tokens, model, effort, messages, stream_options
      *
      * In managed mode, the application controls AI behavior and cost, so only
      * non-cost, non-behavior options pass through (currently none beyond the base set).
@@ -159,7 +159,7 @@ class StreamController extends Controller
 
         // Whitelist of client-permitted option keys. Any key not listed here is
         // silently dropped.
-        $allowed = ['temperature', 'max_tokens', 'model', 'messages', 'stream_options'];
+        $allowed = ['temperature', 'max_tokens', 'model', 'effort', 'messages', 'stream_options'];
 
         return array_intersect_key($raw, array_flip($allowed));
     }
