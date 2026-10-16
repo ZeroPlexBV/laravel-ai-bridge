@@ -66,8 +66,15 @@ class ConnectionStatus
      * `_meta` reaches the CLI, and it reports the CLI's call ids), so a server
      * tool's view can be shown. True only when the last hello carried a valid
      * `mcp_apps` object; like `capabilities`, kept while the machine is off.
+     * It is also what AiBridge::mcpRequest() needs.
      *
-     * @return array{connected: bool, providers: array<int, mixed>, workspaces: array<int, mixed>, posture: array<string, mixed>, bridge_version: string|null, self_update: bool, attachment_limits: array<string, int>|null, capabilities: list<string>, mcp_apps: bool}
+     * `mcp_upstream_auth` is whether the bridge can sign in to OAuth upstream MCP
+     * servers through this application (`hello.mcp_upstream_auth`). `upstream_status`
+     * is the bridge's last `upstream_status` list: each `{server, transport, origin,
+     * auth, state, tools, error}`. Both kept while the machine is off, like
+     * `capabilities`; check `connected`.
+     *
+     * @return array{connected: bool, providers: array<int, mixed>, workspaces: array<int, mixed>, posture: array<string, mixed>, bridge_version: string|null, self_update: bool, attachment_limits: array<string, int>|null, capabilities: list<string>, mcp_apps: bool, mcp_upstream_auth: bool, upstream_status: list<array<string, mixed>>}
      */
     public function for(Connection $connection): array
     {
@@ -119,7 +126,7 @@ class ConnectionStatus
      * `self_update` is only ever true while connected (see for()).
      *
      * @param  mixed  $bridge
-     * @return array{bridge_version: string|null, self_update: bool, attachment_limits: array<string, int>|null, capabilities: list<string>, mcp_apps: bool}
+     * @return array{bridge_version: string|null, self_update: bool, attachment_limits: array<string, int>|null, capabilities: list<string>, mcp_apps: bool, mcp_upstream_auth: bool, upstream_status: list<array<string, mixed>>}
      */
     private static function bridgeFields(mixed $bridge, bool $connected): array
     {
@@ -134,6 +141,8 @@ class ConnectionStatus
             'attachment_limits' => is_array($limits) && $limits !== [] ? $limits : null,
             'capabilities' => is_array($capabilities) ? array_values(array_filter($capabilities, 'is_string')) : [],
             'mcp_apps' => is_array($bridge['mcp_apps'] ?? null) && is_string($bridge['mcp_apps']['spec'] ?? null) && $bridge['mcp_apps']['spec'] !== '',
+            'mcp_upstream_auth' => is_array($bridge['mcp_upstream_auth'] ?? null),
+            'upstream_status' => is_array($bridge['upstream_status'] ?? null) ? array_values(array_filter($bridge['upstream_status'], 'is_array')) : [],
         ];
     }
 
@@ -147,7 +156,7 @@ class ConnectionStatus
      * Query the bridge server for a bridge connection's live status, refreshing the cached
      * capabilities. Falls back to cached providers + connected=false when unreachable.
      *
-     * @return array{connected: bool, providers: array<int, mixed>, workspaces: array<int, mixed>, posture: array<string, mixed>, bridge_version: string|null, self_update: bool, attachment_limits: array<string, int>|null, capabilities: list<string>, mcp_apps: bool}
+     * @return array{connected: bool, providers: array<int, mixed>, workspaces: array<int, mixed>, posture: array<string, mixed>, bridge_version: string|null, self_update: bool, attachment_limits: array<string, int>|null, capabilities: list<string>, mcp_apps: bool, mcp_upstream_auth: bool, upstream_status: list<array<string, mixed>>}
      */
     private function bridgeLiveStatus(Connection $connection): array
     {
@@ -216,6 +225,15 @@ class ConnectionStatus
                 $bridge = $connected && is_array($reportedBridge)
                     ? $reportedBridge
                     : ($connection->last_bridge ?? []);
+                // The upstream list rides beside `bridge` because it changes mid-connection.
+                // Kept in last_bridge so it survives the machine going off; absent from a
+                // serve process that predates it, which must not blank what was stored.
+                $reportedUpstreams = $response->json('upstream_status');
+                if ($connected && is_array($bridge)) {
+                    $bridge['upstream_status'] = is_array($reportedUpstreams)
+                        ? $reportedUpstreams
+                        : (($connection->last_bridge ?? [])['upstream_status'] ?? []);
+                }
                 $connectedAt = $response->json('connected_at');
 
                 $connection->forceFill([

@@ -83,6 +83,20 @@ class BridgeConnectionManager
     private array $pendingTurnInputs = [];
 
     /**
+     * Other exchanges waiting on one answer from a bridge, keyed by what the answer will
+     * name: `mcp:<id>` (an mcp_request), `auth:<user>:<state>` (an upstream_auth_code) and
+     * `auth-start:<user>:<server>` (an upstream_auth_start). Several waiters may share a key (two
+     * people pressing "Connect" at once): one answer finishes them all.
+     *
+     * The same authorization rule as `pendingUsage`: only the user the exchange was
+     * started for may answer it, and a bridge that goes away fails it at once with
+     * `gone_answer`, rather than leaving the HTTP response open until its timeout.
+     *
+     * @var array<string, list<array{user_id: string, on_answer: callable(array<string, mixed>): void, gone_answer: array<string, mixed>}>>
+     */
+    private array $pendingExchanges = [];
+
+    /**
      * Turns failed because their user's bridge went away, by request id => user id.
      *
      * Kept briefly (the newest DROPPED_MEMORY entries) so the account a bridge replays after
@@ -735,6 +749,187 @@ class BridgeConnectionManager
     }
 
     /**
+     * Note that an exchange is out (an mcp_request, an upstream sign-in step), and how to
+     * finish when its answer comes back. See `pendingExchanges`.
+     *
+     * @param  callable(array<string, mixed>): void  $onAnswer
+     * @param  array<string, mixed>  $goneAnswer  What the waiter is told when the bridge drops first.
+     * @return bool  True when this is the first waiter on the key, so the frame still has to be sent.
+     */
+    public function registerPendingExchange(string $key, string $userId, callable $onAnswer, array $goneAnswer): bool
+    {
+        $first = ! isset($this->pendingExchanges[$key]);
+
+        $this->pendingExchanges[$key][] = [
+            'user_id' => $userId,
+            'on_answer' => $onAnswer,
+            'gone_answer' => $goneAnswer,
+        ];
+
+        return $first;
+    }
+
+    /** Whether anything is waiting on this key. */
+    public function hasPendingExchange(string $key): bool
+    {
+        return isset($this->pendingExchanges[$key]);
+    }
+
+    /**
+     * Hand an answer to everyone waiting on a key for this user, and forget them.
+     *
+     * Waiters registered for a different user are left in place and the attempt logged:
+     * an id or a state is a secret, and secrets leak, so it is no authorization.
+     *
+     * @param  array<string, mixed>  $answer
+     * @return bool  True when at least one waiter was answered.
+     */
+    public function resolvePendingExchange(string $key, string $userId, array $answer): bool
+    {
+        $waiters = $this->pendingExchanges[$key] ?? [];
+        $answered = [];
+        $kept = [];
+
+        foreach ($waiters as $waiter) {
+            if ($waiter['user_id'] === $userId) {
+                $answered[] = $waiter;
+            } else {
+                $kept[] = $waiter;
+            }
+        }
+
+        if ($answered === []) {
+            if ($waiters !== []) {
+                Log::warning('AI Bridge: an answer for another user\'s exchange — refused', [
+                    'key' => $key,
+                    'answering_user' => $userId,
+                ]);
+            }
+
+            return false;
+        }
+
+        if ($kept === []) {
+            unset($this->pendingExchanges[$key]);
+        } else {
+            $this->pendingExchanges[$key] = $kept;
+        }
+
+        foreach ($answered as $waiter) {
+            try {
+                ($waiter['on_answer'])($answer);
+            } catch (\Throwable $e) {
+                Log::warning('AI Bridge: an exchange waiter failed', ['key' => $key, 'error' => $e->getMessage()]);
+            }
+        }
+
+        return true;
+    }
+
+    /** Give up on one waiter (its timeout fired); the others on the key stay. */
+    public function forgetPendingExchange(string $key, callable $onAnswer): void
+    {
+        $waiters = array_values(array_filter(
+            $this->pendingExchanges[$key] ?? [],
+            static fn (array $w): bool => $w['on_answer'] !== $onAnswer,
+        ));
+
+        if ($waiters === []) {
+            unset($this->pendingExchanges[$key]);
+        } else {
+            $this->pendingExchanges[$key] = $waiters;
+        }
+    }
+
+    /** Answer every exchange outstanding for a user whose bridge has gone, with its gone answer. */
+    private function failPendingExchangesForUser(string $userId): void
+    {
+        foreach ($this->pendingExchanges as $key => $waiters) {
+            $kept = [];
+            foreach ($waiters as $waiter) {
+                if ($waiter['user_id'] !== $userId) {
+                    $kept[] = $waiter;
+
+                    continue;
+                }
+                try {
+                    ($waiter['on_answer'])($waiter['gone_answer']);
+                } catch (\Throwable) {
+                    // One waiter must not stop the others being told.
+                }
+            }
+
+            if ($kept === []) {
+                unset($this->pendingExchanges[$key]);
+            } else {
+                $this->pendingExchanges[$key] = $kept;
+            }
+        }
+    }
+
+    /**
+     * Store the latest `upstream_status` list the bridge sent (already checked).
+     *
+     * @param  list<array<string, mixed>>  $upstreams
+     * @return bool  True when it differs from what was stored before.
+     */
+    public function setUpstreams(int|string $userId, array $upstreams): bool
+    {
+        $userId = (string) $userId;
+
+        if (! isset($this->connections[$userId])) {
+            return false;
+        }
+
+        $changed = ($this->connections[$userId]['upstreams'] ?? null) !== $upstreams;
+        $this->connections[$userId]['upstreams'] = $upstreams;
+
+        return $changed;
+    }
+
+    /**
+     * The upstream MCP servers this user's bridge last reported (`upstream_status`).
+     *
+     * @return list<array<string, mixed>>  Empty when not connected or never reported.
+     */
+    public function getUpstreams(int|string $userId): array
+    {
+        return $this->connections[(string) $userId]['upstreams'] ?? [];
+    }
+
+    /**
+     * The ai_bridge_connections id this user's bridge connected as, or null.
+     *
+     * The token's `cid` claim when it carries one (a managed connection); otherwise the
+     * row whose connection_key is the user id, looked up once per connection.
+     */
+    public function getConnectionRowId(int|string $userId): ?int
+    {
+        $userId = (string) $userId;
+
+        if (! isset($this->connections[$userId])) {
+            return null;
+        }
+
+        if (array_key_exists('row_id', $this->connections[$userId])) {
+            return $this->connections[$userId]['row_id'];
+        }
+
+        $rowId = $this->connections[$userId]['token_cid'] ?? null;
+
+        if ($rowId === null) {
+            try {
+                $found = \Tetrix\AiBridge\Models\Connection::query()->where('connection_key', $userId)->value('id');
+                $rowId = is_numeric($found) ? (int) $found : null;
+            } catch (\Throwable) {
+                $rowId = null;
+            }
+        }
+
+        return $this->connections[$userId]['row_id'] = $rowId;
+    }
+
+    /**
      * Get the StreamHandler for a pending request.
      */
     public function getPendingRequest(string $requestId): ?StreamHandler
@@ -903,5 +1098,6 @@ class BridgeConnectionManager
         // by an HTTP response rather than a stream handler — so it needs its own sweep.
         $this->failPendingUsageForUser($userId);
         $this->failPendingTurnInputsForUser($userId);
+        $this->failPendingExchangesForUser($userId);
     }
 }

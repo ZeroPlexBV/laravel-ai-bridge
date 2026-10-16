@@ -91,13 +91,21 @@ class MessageHandler
      * #11494: the chat refuses to draw a larger `ui` (McpApps::MAX_UI_BYTES in zeroplex/ai), so
      * storing one only costs the shared store memory for a card nobody will see.
      */
-    private const MAX_TOOL_VIEW_BYTES = 262144;
+    private const MAX_TOOL_VIEW_BYTES = StreamHandler::MAX_TOOL_VIEW_BYTES;
 
     public function __construct(
         private readonly BridgeConnectionManager $connectionManager,
         private readonly TokenManager $tokenManager,
         private readonly ToolRegistry $toolRegistry,
     ) {}
+
+    private ?\Tetrix\AiBridge\Upstreams\UpstreamFrames $upstreamFrames = null;
+
+    /** The frames about upstream MCP servers: mcp_result, upstream_status, upstream_auth_*. */
+    private function upstreamFrames(): \Tetrix\AiBridge\Upstreams\UpstreamFrames
+    {
+        return $this->upstreamFrames ??= new \Tetrix\AiBridge\Upstreams\UpstreamFrames($this->connectionManager);
+    }
 
     /** Where `upload_done` and `file_read_result` go. Set by the serve process. */
     private ?\Tetrix\AiBridge\Transfers\TransferHub $transferHub = null;
@@ -213,6 +221,10 @@ class MessageHandler
             MessageTypes::USAGE_RESULT => $this->handleUsageResult($connectionId, $message),
             MessageTypes::TURN_INPUT_ACK => $this->handleTurnInputAck($connectionId, $message),
             MessageTypes::UPLOAD_DONE, MessageTypes::FILE_READ_RESULT => $this->handleTransferAnswer($connectionId, $type, $message),
+            MessageTypes::MCP_RESULT => $this->upstreamFrames()->mcpResult($connectionId, $message),
+            MessageTypes::UPSTREAM_STATUS => $this->upstreamFrames()->status($connectionId, $message),
+            MessageTypes::UPSTREAM_AUTH_REQUIRED => $this->upstreamFrames()->authRequired($connectionId, $message),
+            MessageTypes::UPSTREAM_AUTH_RESULT => $this->upstreamFrames()->authResult($connectionId, $message),
             MessageTypes::STREAM => $this->handleStreamEnvelope($connectionId, $message),
             MessageTypes::TOOL_CALL => $this->handleToolCall($connectionId, $message),
             MessageTypes::ERROR => $this->handleError($connectionId, $message),
@@ -577,12 +589,14 @@ class MessageHandler
      * bridge sends and which is right: it cannot follow one.
      * `mcp_apps` is the MCP Apps support the bridge announced (0.27+), as
      * `{spec, revision}`, or null: absent, or not an object naming a spec.
+     * `mcp_upstream_auth` is `{revision}` when the bridge implements OAuth sign-in to its
+     * upstream MCP servers (the `upstream_auth_*` frames), or null.
      *
      * Every field is type-checked, because this runs in the serve process's
      * event loop and a TypeError there drops every connected bridge.
      *
      * @param  array<string, mixed>  $message
-     * @return array{bridge_version: string|null, protocol_version: string|null, attachment_limits: array<string, int>|null, capabilities: list<string>, self_update: bool, mcp_apps: array{spec: string, revision: int|null}|null}
+     * @return array{bridge_version: string|null, protocol_version: string|null, attachment_limits: array<string, int>|null, capabilities: list<string>, self_update: bool, mcp_apps: array{spec: string, revision: int|null}|null, mcp_upstream_auth: array{revision: int|null}|null}
      */
     public static function bridgeInfoFromHello(array $message): array
     {
@@ -615,7 +629,23 @@ class MessageHandler
             'capabilities' => $capabilities,
             'self_update' => ($message['self_update'] ?? null) === true,
             'mcp_apps' => self::mcpAppsOf($message['mcp_apps'] ?? null),
+            'mcp_upstream_auth' => self::mcpUpstreamAuthOf($message['mcp_upstream_auth'] ?? null),
         ];
+    }
+
+    /**
+     * The hello's `mcp_upstream_auth` reduced to `{revision}`, or null when it is not an
+     * object (an older bridge sends none, and must not be sent the upstream_auth_* frames).
+     *
+     * @return array{revision: int|null}|null
+     */
+    private static function mcpUpstreamAuthOf(mixed $value): ?array
+    {
+        if (! is_array($value) || array_is_list($value) && $value !== []) {
+            return null;
+        }
+
+        return ['revision' => is_int($value['revision'] ?? null) ? $value['revision'] : null];
     }
 
     /**
@@ -696,6 +726,14 @@ class MessageHandler
         $desiredVersion = DesiredBridgeVersion::resolve();
         if ($desiredVersion !== null) {
             $welcome['desired_bridge_version'] = $desiredVersion;
+        }
+
+        // Where an authorization server sends the person back after signing in to one of
+        // the bridge's upstream MCP servers. Absent when switched off: the bridge then
+        // reports its OAuth upstreams `needs_auth` with `no_redirect_uri`.
+        $redirectUri = \Tetrix\AiBridge\Upstreams\UpstreamOAuth::redirectUri();
+        if ($redirectUri !== null) {
+            $welcome['upstream_oauth'] = ['redirect_uri' => $redirectUri];
         }
 
         $refreshedToken = $this->maybeRefreshToken($userId);
@@ -1039,6 +1077,16 @@ class MessageHandler
         // the relayed event already gets false.
         if ($eventType === MessageTypes::INPUT_CLOSED) {
             $this->markInputClosed($requestId, $message['data'] ?? null);
+        }
+
+        // An upstream tool's view (`tool_result.ui`, it names a `server`) is stamped with
+        // the connection that streamed it, so a later mcp_request goes to the bridge that
+        // made the call. Whatever the bridge itself put there is replaced, never trusted.
+        if ($eventType === MessageTypes::TOOL_RESULT && is_array($message['data']['ui'] ?? null)) {
+            $senderUserId = $this->connectionManager->getUserIdByConnectionId($connectionId);
+            $message['data']['ui']['connection_id'] = $senderUserId !== null
+                ? $this->connectionManager->getConnectionRowId($senderUserId)
+                : null;
         }
 
         $event = StreamEvent::fromArray($message);

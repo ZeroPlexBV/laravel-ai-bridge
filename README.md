@@ -1120,6 +1120,100 @@ A view over 256 KB is not kept, so its call shows no card. Whether a machine
 can show views at all is `$status['mcp_apps']` on its connection status (true once its bridge
 announced `mcp_apps` at hello).
 
+### Tools from the machine's own MCP servers (upstream MCP Apps and sign-in)
+
+A bridge started with `--mcp-upstreams` offers the CLI tools of MCP servers on the operator's
+side (see ai-bridge's `docs/mcp-upstreams.md`). They run on the machine, never here, but this
+package carries what a host needs to draw their views and to sign in to the ones that use
+OAuth. Needs a bridge that announces `mcp_apps` (views) and `mcp_upstream_auth` (sign-in) at
+hello; pairs with ai-bridge PR #60. Drawing the card, asking the person's consent for a view's
+CSP or permissions, and what a button means stay with the host. See
+[PROTOCOL.md](PROTOCOL.md#upstream-mcp-apps-and-oauth-sign-in).
+
+**Views.** An upstream tool's `tool_result` carries `ui` like a server tool's, plus `server`
+(the upstream's name) and `connection_id` (the connection whose bridge made the call): on the
+stream event, the recorded block and `onToolResult`'s fifth argument, under the same 256 KB
+and turn-budget rules. A view's own requests go back through that bridge:
+
+```php
+use Tetrix\AiBridge\Facades\AiBridge;
+use Tetrix\AiBridge\Upstreams\McpRequestFailed;
+
+$connection = AiBridge::connectionsQuery($request)->findOrFail($ui['connection_id']);
+
+try {
+    // $toolCallId: the tool_call_id of the result whose view is asking.
+    $html = AiBridge::mcpRequest($connection, $ui['server'], 'resources/read', ['uri' => $ui['resource_uri']], toolCallId: $toolCallId);
+    $again = AiBridge::mcpRequest($connection, $ui['server'], 'tools/call', ['name' => 'refresh', 'arguments' => ['city' => 'Utrecht']], toolCallId: $toolCallId);
+} catch (McpRequestFailed $e) {
+    // $e->errorCode: unknown_server, unavailable, timeout, refused, unsupported, upstream_error,
+    // or invalid_request, unknown_view, not_connected, mcp_apps_unsupported, unreachable
+}
+```
+
+**Pin the request to the view.** Take `server` from the view's own `ui.server`, never from what
+the view's frame asks for, and pass the call's `tool_call_id`: the request is then refused
+(`refused`) unless `server` is the one recorded for that view on that connection, or
+(`unknown_view`) when no such view was recorded there. Without `tool_call_id`, any server and
+any tool the upstream lets views call are reachable by whoever can call the API. A bridge
+connected without an `ai_bridge_connections` row (under a user id rather than a connection key)
+gives its views `connection_id: null`; such views cannot be relayed through the route.
+
+Only `resources/read` of a `ui://` uri and `tools/call` are relayed; anything else is refused
+before it leaves this server. It works from a web worker or a job (it reaches the serve process
+over its internal API, like `sendTurnInput()`), waits up to `ai-bridge.server.mcp_request_timeout`
+(65 s), and fires `Tetrix\AiBridge\Events\McpRequestRelayed` (user, connection, server, method,
+tool or uri, outcome) for an audit trail. The same is `POST /ai-bridge/connections/{id}/mcp`
+(`{server, method, params, tool_call_id}`), throttled to 30 a minute.
+
+> **CSRF: these JSON routes have none of their own.** Like every route under
+> `ai-bridge.route_middleware` they run in the `api` group, which does not check a CSRF token.
+> With session-cookie auth (`['auth']` and a browser) a hostile page could POST to
+> `…/mcp` or `…/sign-in` as the signed-in person. Use Sanctum's stateful SPA auth
+> (`auth:sanctum`, which checks the XSRF token for first-party requests), a token in a header,
+> or add CSRF-checking middleware to `ai-bridge.route_middleware`; or do not expose them and
+> call `AiBridge::mcpRequest()` / `AiBridge::upstreams()` from your own CSRF-protected routes.
+
+**Sign-in.** When an upstream needs the person to sign in, the bridge sends an authorization URL;
+the package keeps it as a pending sign-in and fires `UpstreamAuthRequired` (in the serve process)
+so the host can show a "Connect kaizen" card. The person opens the URL in their browser, signs in
+at the upstream, and is sent back to the package's callback route
+(`ai-bridge.upstream-oauth.callback`, `/ai-bridge/upstream-oauth/callback`, behind `web` + `auth`),
+which checks the sign-in is theirs, hands the one-time code to their bridge, waits for the result
+and shows "Connected — you can close this tab" (view `ai-bridge::upstream-oauth.result`, publish
+`ai-bridge-views` to change it). `UpstreamAuthCompleted` says how it ended. The bridge keeps and
+refreshes the tokens; this application never sees one.
+
+```php
+$upstreams = AiBridge::upstreams();
+
+$upstreams->status($connection);              // connected, mcp_apps, mcp_upstream_auth, upstreams[], pending[]
+$upstreams->pending($connection);             // [{connection_id, server, authorization_url, expires_at, reason}]
+$upstreams->startSignIn($connection, 'kaizen'); // ['ok' => true, 'authorization_url' => …] or ['ok' => false, 'code' => …]
+$upstreams->forget($connection, 'kaizen');    // the bridge forgets the tokens; true when sent
+```
+
+| JSON route (behind `route_middleware`) | Name |
+|---|---|
+| `GET /ai-bridge/connections/{id}/upstreams` | `ai-bridge.upstreams.index` |
+| `GET /ai-bridge/connections/{id}/upstreams/pending` | `ai-bridge.upstreams.pending` |
+| `POST /ai-bridge/connections/{id}/upstreams/{server}/sign-in` | `ai-bridge.upstreams.sign-in` |
+| `DELETE /ai-bridge/connections/{id}/upstreams/{server}/sign-in` | `ai-bridge.upstreams.forget` |
+| `POST /ai-bridge/connections/{id}/mcp` | `ai-bridge.upstreams.mcp` |
+
+Each upstream is `{server, transport, origin, auth, state, tools, error}` (`state`: `connecting`,
+`connected`, `needs_auth`, `unavailable`); the list is also on `ConnectionStatus::for()` as
+`upstream_status`, next to `mcp_upstream_auth`, and `UpstreamStatusChanged` fires when it changes.
+
+Two things to get right:
+
+- **The cache must be shared.** The serve process writes pending sign-ins and the web process
+  reads them (`ai-bridge.upstream_oauth.cache_store`, default the default store): Redis or the
+  database, not `array`.
+- **`APP_URL` must be the address browsers use** (or set `AI_BRIDGE_UPSTREAM_OAUTH_REDIRECT_URI`).
+  The callback URL is sent to bridges in `welcome` and registered with the authorization server,
+  character for character. `AI_BRIDGE_UPSTREAM_OAUTH=false` switches the route and the URL off.
+
 ### Listening for Tool Calls
 
 ```php

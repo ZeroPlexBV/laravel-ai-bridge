@@ -416,6 +416,10 @@ class BridgeWebSocketServer
     //   POST /api/disconnect — Forcibly drop a user's bridge connection
     //   POST /api/upload     — Stream a browser's file to the user's machine (TransferHub)
     //   POST /api/file-read  — Stream a file from the user's machine (TransferHub)
+    //   POST /api/mcp        — Relay a view's mcp_request to the user's bridge, await mcp_result
+    //   POST /api/upstream/auth-start  — Ask the bridge to start an upstream OAuth sign-in
+    //   POST /api/upstream/auth-code   — Pass an OAuth redirect's code on, await the result
+    //   POST /api/upstream/auth-forget — Have the bridge forget an upstream's tokens
     //   GET  /api/status     — Check connected users
     //   GET  /api/health     — Health check
     // -------------------------------------------------------------------------
@@ -578,6 +582,10 @@ class BridgeWebSocketServer
             $method === 'GET' && $path === '/api/usage' => $this->apiUsage($tcpConnection, $request, $decoded),
             $method === 'POST' && $path === '/api/disconnect' => $this->apiDisconnect($tcpConnection, $decoded),
             $method === 'POST' && $path === '/api/file-read' => $this->apiFileRead($tcpConnection, $request, $decoded),
+            $method === 'POST' && $path === '/api/mcp' => $this->apiMcp($tcpConnection, $request, $decoded),
+            $method === 'POST' && $path === '/api/upstream/auth-start' => $this->apiUpstreamAuthStart($tcpConnection, $request, $decoded),
+            $method === 'POST' && $path === '/api/upstream/auth-code' => $this->apiUpstreamAuthCode($tcpConnection, $request, $decoded),
+            $method === 'POST' && $path === '/api/upstream/auth-forget' => $this->apiUpstreamAuthForget($tcpConnection, $request, $decoded),
             default => $this->httpResponse($tcpConnection, 404, [
                 'error' => 'not_found',
                 'message' => "Unknown endpoint: {$method} {$path}",
@@ -916,6 +924,8 @@ class BridgeWebSocketServer
             // release reported them; both read from the one `bridge` record.
             $response['bridge_version'] = $this->connectionManager->getBridgeVersion($userId);
             $response['self_update'] = $this->connectionManager->getSelfUpdate($userId);
+            // The upstream MCP servers the bridge last reported (`upstream_status`).
+            $response['upstream_status'] = $this->connectionManager->getUpstreams($userId);
         }
 
         $this->httpResponse($tcpConnection, 200, $response);
@@ -1108,6 +1118,249 @@ class BridgeWebSocketServer
         ]);
     }
 
+    // -------------------------------------------------------------------------
+    // Upstream MCP servers: mcp_request relay and OAuth sign-in
+    // -------------------------------------------------------------------------
+
+    /**
+     * POST /api/mcp — Relay a view's request to an upstream MCP server through this user's
+     * bridge, and answer with its `mcp_result`.
+     *
+     * Body `{server, method, params}`. Only `resources/read` of a `ui://` uri and
+     * `tools/call` are relayed; anything else is refused here (400 `unsupported` /
+     * `refused`) without reaching the bridge, as is a bridge whose hello had no
+     * `mcp_apps` (409 `mcp_apps_unsupported`): it would log the frame and never answer.
+     *
+     * Answers 200 `{ok: true, result}` or `{ok: false, code, error}` with the bridge's code;
+     * 504 `timeout` after `ai-bridge.server.mcp_request_timeout` seconds.
+     */
+    private function apiMcp(ConnectionInterface $tcpConnection, RequestInterface $request, object $decoded): void
+    {
+        $userId = $this->bridgeFor($tcpConnection, $decoded, 'mcp_apps');
+        if ($userId === null) {
+            return;
+        }
+
+        $body = json_decode((string) $request->getBody(), true);
+        $server = \Tetrix\AiBridge\Upstreams\UpstreamFrames::serverOf(is_array($body) ? ($body['server'] ?? null) : null);
+        $method = is_array($body) ? ($body['method'] ?? null) : null;
+        $params = is_array($body) ? ($body['params'] ?? null) : null;
+
+        $refusal = \Tetrix\AiBridge\Upstreams\UpstreamClient::refusalFor($server, $method, $params);
+        if ($refusal !== null) {
+            $this->httpResponse($tcpConnection, 400, ['ok' => false] + $refusal);
+
+            return;
+        }
+
+        $id = 'mcp-'.bin2hex(random_bytes(8));
+
+        $this->awaitBridge($tcpConnection, $userId, 'mcp:'.$id, [
+            'type' => MessageTypes::MCP_REQUEST,
+            'id' => $id,
+            'server' => $server,
+            'method' => $method,
+            'params' => (object) $params,
+        ], (float) config('ai-bridge.server.mcp_request_timeout', 65), [
+            'ok' => false,
+            'code' => 'timeout',
+            'error' => 'The bridge did not answer in time.',
+        ]);
+    }
+
+    /**
+     * POST /api/upstream/auth-start — The person asked to (re)connect an upstream.
+     *
+     * Body `{server}`. Sends `upstream_auth_start` and answers with the sign-in the bridge
+     * opens (`{ok: true, authorization_url, expires_at, reason}`), or its failure
+     * (`{ok: false, code, error}`), or 504 `no_answer` after
+     * `ai-bridge.upstream_oauth.start_timeout` seconds. Two starts for one upstream of the
+     * same bridge at once share one frame and one answer.
+     */
+    private function apiUpstreamAuthStart(ConnectionInterface $tcpConnection, RequestInterface $request, object $decoded): void
+    {
+        $server = $this->upstreamServerOf($tcpConnection, $request);
+        $userId = $server === null ? null : $this->bridgeFor($tcpConnection, $decoded, 'mcp_upstream_auth');
+        if ($userId === null) {
+            return;
+        }
+
+        // Keyed by user as well as server: two people's bridges may both have a "kaizen".
+        $this->awaitBridge($tcpConnection, $userId, 'auth-start:'.$userId.':'.$server, [
+            'type' => MessageTypes::UPSTREAM_AUTH_START,
+            'server' => $server,
+        ], (float) config('ai-bridge.upstream_oauth.start_timeout', 20), [
+            'ok' => false,
+            'code' => 'no_answer',
+            'error' => 'The bridge did not answer in time.',
+        ]);
+    }
+
+    /**
+     * POST /api/upstream/auth-code — Pass an OAuth redirect's query parameters to the bridge.
+     *
+     * Body `{server, state, code?, iss?, error?, error_description?}`, which the web process
+     * sends only after checking the state is pending and the signed-in person's. Answers
+     * with the bridge's `upstream_auth_result` (`{ok, code?, error?}`), or 504 `timeout`
+     * after `ai-bridge.upstream_oauth.callback_timeout` seconds.
+     */
+    private function apiUpstreamAuthCode(ConnectionInterface $tcpConnection, RequestInterface $request, object $decoded): void
+    {
+        $body = json_decode((string) $request->getBody(), true);
+        $server = \Tetrix\AiBridge\Upstreams\UpstreamFrames::serverOf(is_array($body) ? ($body['server'] ?? null) : null);
+        $state = is_array($body) ? ($body['state'] ?? null) : null;
+
+        if ($server === null || ! is_string($state) || $state === '' || strlen($state) > 512) {
+            $this->httpResponse($tcpConnection, 400, ['ok' => false, 'code' => 'invalid_request', 'error' => 'Body must carry string "server" and "state".']);
+
+            return;
+        }
+
+        $frame = ['type' => MessageTypes::UPSTREAM_AUTH_CODE, 'server' => $server, 'state' => $state];
+        foreach (['code', 'iss', 'error', 'error_description'] as $field) {
+            if (is_string($body[$field] ?? null) && $body[$field] !== '') {
+                $frame[$field] = mb_substr($body[$field], 0, 4096);
+            }
+        }
+
+        if (! isset($frame['code']) && ! isset($frame['error'])) {
+            $this->httpResponse($tcpConnection, 400, ['ok' => false, 'code' => 'invalid_request', 'error' => 'Either "code" or "error" is required.']);
+
+            return;
+        }
+
+        $userId = $this->bridgeFor($tcpConnection, $decoded, 'mcp_upstream_auth');
+        if ($userId === null) {
+            return;
+        }
+
+        $this->awaitBridge($tcpConnection, $userId, 'auth:'.$userId.':'.$state, $frame, (float) config('ai-bridge.upstream_oauth.callback_timeout', 15), [
+            'ok' => false,
+            'code' => 'timeout',
+            'error' => 'The bridge did not report the result in time. The sign-in may still complete.',
+        ]);
+    }
+
+    /**
+     * POST /api/upstream/auth-forget — Have the bridge forget an upstream's tokens.
+     *
+     * Body `{server}`. Nothing is answered by the bridge but a new `upstream_status`, so
+     * this answers `{sent: true}` as soon as the frame is written.
+     */
+    private function apiUpstreamAuthForget(ConnectionInterface $tcpConnection, RequestInterface $request, object $decoded): void
+    {
+        $server = $this->upstreamServerOf($tcpConnection, $request);
+        $userId = $server === null ? null : $this->bridgeFor($tcpConnection, $decoded, 'mcp_upstream_auth');
+        if ($userId === null) {
+            return;
+        }
+
+        $sent = $this->connectionManager->sendToUser($userId, [
+            'type' => MessageTypes::UPSTREAM_AUTH_FORGET,
+            'server' => $server,
+        ]);
+
+        $this->httpResponse($tcpConnection, $sent ? 200 : 502, $sent
+            ? ['sent' => true]
+            : ['sent' => false, 'code' => 'send_failed', 'error' => 'Could not write to the bridge.']);
+    }
+
+    /**
+     * The `server` of an upstream request's body, or null after answering 400.
+     */
+    private function upstreamServerOf(ConnectionInterface $tcpConnection, RequestInterface $request): ?string
+    {
+        $body = json_decode((string) $request->getBody(), true);
+        $server = \Tetrix\AiBridge\Upstreams\UpstreamFrames::serverOf(is_array($body) ? ($body['server'] ?? null) : null);
+
+        if ($server === null) {
+            $this->httpResponse($tcpConnection, 400, ['ok' => false, 'code' => 'invalid_request', 'error' => 'Body must carry a string "server".']);
+        }
+
+        return $server;
+    }
+
+    /**
+     * The token's user, when its bridge is connected and announced `$needs` at hello;
+     * otherwise null after answering (400, 404 `not_connected`, 409 `<needs>_unsupported`).
+     */
+    private function bridgeFor(ConnectionInterface $tcpConnection, object $decoded, string $needs): ?string
+    {
+        $userId = (string) ($decoded->sub ?? '');
+
+        if ($userId === '') {
+            $this->httpResponse($tcpConnection, 400, ['ok' => false, 'code' => 'missing_subject', 'error' => 'Token is missing the "sub" claim.']);
+
+            return null;
+        }
+
+        if (! $this->connectionManager->hasConnection($userId)) {
+            $this->httpResponse($tcpConnection, 404, ['ok' => false, 'code' => 'not_connected', 'error' => 'No bridge is connected for this connection.']);
+
+            return null;
+        }
+
+        if (! is_array($this->connectionManager->getBridgeInfo($userId)[$needs] ?? null)) {
+            $this->httpResponse($tcpConnection, 409, [
+                'ok' => false,
+                'code' => $needs.'_unsupported',
+                'error' => 'This bridge does not announce '.$needs.'; it needs updating.',
+            ]);
+
+            return null;
+        }
+
+        return $userId;
+    }
+
+    /**
+     * Send a frame and hold the HTTP response open until the bridge answers under `$key`,
+     * the bridge drops (404 `not_connected`), or `$timeout` seconds pass (504 with
+     * `$timeoutAnswer`). A second waiter on a key already out is not sent again.
+     *
+     * Registered BEFORE sending, as apiRequestInput() does: a bridge on the same host can
+     * answer before sendToUser() has returned.
+     *
+     * @param  array<string, mixed>  $frame
+     * @param  array<string, mixed>  $timeoutAnswer
+     */
+    private function awaitBridge(ConnectionInterface $tcpConnection, string $userId, string $key, array $frame, float $timeout, array $timeoutAnswer): void
+    {
+        $answered = false;
+        $respond = function (array $answer) use (&$answered, $tcpConnection): void {
+            if ($answered) {
+                return;
+            }
+            $answered = true;
+            $status = is_int($answer['_status'] ?? null) ? $answer['_status'] : 200;
+            unset($answer['_status']);
+            $this->httpResponse($tcpConnection, $status, $answer);
+        };
+
+        $first = $this->connectionManager->registerPendingExchange($key, $userId, $respond, [
+            'ok' => false,
+            'code' => 'not_connected',
+            'error' => 'The bridge disconnected before it answered.',
+            '_status' => 404,
+        ]);
+
+        if ($first && ! $this->connectionManager->sendToUser($userId, $frame)) {
+            $this->connectionManager->forgetPendingExchange($key, $respond);
+            $respond(['ok' => false, 'code' => 'send_failed', 'error' => 'Could not write to the bridge.', '_status' => 502]);
+
+            return;
+        }
+
+        if ($answered) {
+            return;
+        }
+
+        $this->loop?->addTimer($timeout, function () use ($key, $respond, $timeoutAnswer): void {
+            $this->connectionManager->forgetPendingExchange($key, $respond);
+            $respond($timeoutAnswer + ['_status' => 504]);
+        });
+    }
+
     /**
      * Send an HTTP JSON response on the TCP connection and close it.
      *
@@ -1117,7 +1370,7 @@ class BridgeWebSocketServer
     {
         // 413 is included so the buffer-overflow guard in handleTcpConnection()
         // can use httpResponse() consistently.
-        $statusTexts = [200 => 'OK', 400 => 'Bad Request', 401 => 'Unauthorized', 403 => 'Forbidden', 404 => 'Not Found', 413 => 'Payload Too Large', 500 => 'Internal Server Error', 504 => 'Gateway Timeout'];
+        $statusTexts = [200 => 'OK', 400 => 'Bad Request', 401 => 'Unauthorized', 403 => 'Forbidden', 404 => 'Not Found', 409 => 'Conflict', 413 => 'Payload Too Large', 500 => 'Internal Server Error', 502 => 'Bad Gateway', 504 => 'Gateway Timeout'];
         $statusText = $statusTexts[$statusCode] ?? 'Unknown';
 
         $json = json_encode($data, JSON_UNESCAPED_SLASHES);
