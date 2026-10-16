@@ -193,6 +193,26 @@ describe('POST /api/upstream/*', function () {
             ->and($out->responses[0]['body'])->toMatchArray(['ok' => true, 'server' => 'kaizen', 'reason' => 'requested']);
     });
 
+    it('sends each person\'s start to their own bridge, even for the same upstream name', function () {
+        $rig = serveRig();
+        $rig->manager->addConnection('key-2', 'conn-2', 'socket-2');
+        ($rig->from)('conn-2', ['type' => 'hello', 'version' => '0.1', 'providers' => [], 'mcp_upstream_auth' => ['revision' => 1]]);
+        $rig->sent = [];
+
+        $one = servePost($rig, '/api/upstream/auth-start', ['server' => 'kaizen'], 'key-1');
+        $two = servePost($rig, '/api/upstream/auth-start', ['server' => 'kaizen'], 'key-2');
+
+        expect($rig->sent)->toHaveCount(2);
+
+        ($rig->from)('conn-2', ['type' => MessageTypes::UPSTREAM_AUTH_RESULT, 'server' => 'kaizen', 'state' => null, 'ok' => false, 'code' => 'not_oauth']);
+        expect($one->responses)->toBe([])
+            ->and($two->responses[0]['body']['code'])->toBe('not_oauth');
+
+        ($rig->from)('conn-1', ['type' => MessageTypes::UPSTREAM_AUTH_RESULT, 'server' => 'kaizen', 'state' => null, 'ok' => false, 'code' => 'discovery_failed']);
+        expect($one->responses[0]['body']['code'])->toBe('discovery_failed')
+            ->and($two->responses)->toHaveCount(1);
+    });
+
     it('passes on a start the bridge refused', function () {
         $rig = serveRig();
         $rig->answer = fn () => ($rig->from)('conn-1', ['type' => MessageTypes::UPSTREAM_AUTH_RESULT, 'server' => 'weather', 'state' => null, 'ok' => false, 'code' => 'not_oauth', 'error' => 'weather does not use OAuth.']);

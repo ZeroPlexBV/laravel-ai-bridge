@@ -232,8 +232,8 @@ describe('answers handed to whoever waits', function () {
     it('routes upstream_auth_result by state, and a stateless failure to the waiting start', function () {
         $rig = upstreamRig();
         $got = [];
-        $rig->manager->registerPendingExchange('auth:'.STATE_A, 'key-1', function (array $a) use (&$got) { $got['code'] = $a; }, []);
-        $rig->manager->registerPendingExchange('auth-start:kaizen', 'key-1', function (array $a) use (&$got) { $got['start'] = $a; }, []);
+        $rig->manager->registerPendingExchange('auth:key-1:'.STATE_A, 'key-1', function (array $a) use (&$got) { $got['code'] = $a; }, []);
+        $rig->manager->registerPendingExchange('auth-start:key-1:kaizen', 'key-1', function (array $a) use (&$got) { $got['start'] = $a; }, []);
 
         ($rig->send)(['type' => MessageTypes::UPSTREAM_AUTH_RESULT, 'server' => 'kaizen', 'state' => STATE_A, 'ok' => true]);
         ($rig->send)(['type' => MessageTypes::UPSTREAM_AUTH_RESULT, 'server' => 'kaizen', 'state' => null, 'ok' => false, 'code' => 'discovery_failed', 'error' => 'No metadata.']);
@@ -261,7 +261,7 @@ describe('answers handed to whoever waits', function () {
     it('turns an unknown auth code into failed', function () {
         $rig = upstreamRig();
         $got = null;
-        $rig->manager->registerPendingExchange('auth:'.STATE_A, 'key-1', function (array $a) use (&$got) { $got = $a; }, []);
+        $rig->manager->registerPendingExchange('auth:key-1:'.STATE_A, 'key-1', function (array $a) use (&$got) { $got = $a; }, []);
 
         ($rig->send)(['type' => MessageTypes::UPSTREAM_AUTH_RESULT, 'server' => 'kaizen', 'state' => STATE_A, 'ok' => 'yes', 'code' => 'brand_new']);
 
@@ -271,7 +271,7 @@ describe('answers handed to whoever waits', function () {
     it('answers a waiting start with the sign-in the bridge opened', function () {
         $rig = upstreamRig();
         $got = null;
-        $rig->manager->registerPendingExchange('auth-start:kaizen', 'key-1', function (array $a) use (&$got) { $got = $a; }, []);
+        $rig->manager->registerPendingExchange('auth-start:key-1:kaizen', 'key-1', function (array $a) use (&$got) { $got = $a; }, []);
 
         ($rig->send)(requiredFrame(['reason' => 'requested']));
 

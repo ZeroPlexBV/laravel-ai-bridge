@@ -1174,8 +1174,8 @@ class BridgeWebSocketServer
      * Body `{server}`. Sends `upstream_auth_start` and answers with the sign-in the bridge
      * opens (`{ok: true, authorization_url, expires_at, reason}`), or its failure
      * (`{ok: false, code, error}`), or 504 `no_answer` after
-     * `ai-bridge.upstream_oauth.start_timeout` seconds. Two starts for one upstream at once
-     * share one frame and one answer.
+     * `ai-bridge.upstream_oauth.start_timeout` seconds. Two starts for one upstream of the
+     * same bridge at once share one frame and one answer.
      */
     private function apiUpstreamAuthStart(ConnectionInterface $tcpConnection, RequestInterface $request, object $decoded): void
     {
@@ -1185,7 +1185,8 @@ class BridgeWebSocketServer
             return;
         }
 
-        $this->awaitBridge($tcpConnection, $userId, 'auth-start:'.$server, [
+        // Keyed by user as well as server: two people's bridges may both have a "kaizen".
+        $this->awaitBridge($tcpConnection, $userId, 'auth-start:'.$userId.':'.$server, [
             'type' => MessageTypes::UPSTREAM_AUTH_START,
             'server' => $server,
         ], (float) config('ai-bridge.upstream_oauth.start_timeout', 20), [
@@ -1233,7 +1234,7 @@ class BridgeWebSocketServer
             return;
         }
 
-        $this->awaitBridge($tcpConnection, $userId, 'auth:'.$state, $frame, (float) config('ai-bridge.upstream_oauth.callback_timeout', 15), [
+        $this->awaitBridge($tcpConnection, $userId, 'auth:'.$userId.':'.$state, $frame, (float) config('ai-bridge.upstream_oauth.callback_timeout', 15), [
             'ok' => false,
             'code' => 'timeout',
             'error' => 'The bridge did not report the result in time. The sign-in may still complete.',

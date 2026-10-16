@@ -134,7 +134,7 @@ final class UpstreamFrames
             ]);
         }
 
-        $this->connections->resolvePendingExchange('auth-start:'.$server, $userId, [
+        $this->connections->resolvePendingExchange('auth-start:'.$userId.':'.$server, $userId, [
             'ok' => true,
             'server' => $server,
             'authorization_url' => $record['authorization_url'],
@@ -181,7 +181,7 @@ final class UpstreamFrames
         }
 
         if (is_string($state) && $state !== '' && strlen($state) <= 512) {
-            $this->connections->resolvePendingExchange('auth:'.$state, $userId, $answer);
+            $this->connections->resolvePendingExchange('auth:'.$userId.':'.$state, $userId, $answer);
 
             return null;
         }
@@ -190,7 +190,7 @@ final class UpstreamFrames
         // (discovery or registration failing at the first prompt after connecting), which
         // nobody is waiting for. Either way a sign-in failed, so it is announced here; with a
         // state the callback announces it, with the signed-in person.
-        $this->connections->resolvePendingExchange('auth-start:'.$server, $userId, $answer);
+        $this->connections->resolvePendingExchange('auth-start:'.$userId.':'.$server, $userId, $answer);
 
         if (! $ok) {
             try {

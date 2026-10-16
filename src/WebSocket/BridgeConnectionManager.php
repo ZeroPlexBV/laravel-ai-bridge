@@ -84,8 +84,8 @@ class BridgeConnectionManager
 
     /**
      * Other exchanges waiting on one answer from a bridge, keyed by what the answer will
-     * name: `mcp:<id>` (an mcp_request), `auth:<state>` (an upstream_auth_code) and
-     * `auth-start:<server>` (an upstream_auth_start). Several waiters may share a key (two
+     * name: `mcp:<id>` (an mcp_request), `auth:<user>:<state>` (an upstream_auth_code) and
+     * `auth-start:<user>:<server>` (an upstream_auth_start). Several waiters may share a key (two
      * people pressing "Connect" at once): one answer finishes them all.
      *
      * The same authorization rule as `pendingUsage`: only the user the exchange was
