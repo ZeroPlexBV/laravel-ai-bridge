@@ -119,6 +119,18 @@ class StreamHandler
      */
     private const MAX_OPEN_RESULT_BUFFERS = 64;
 
+    /**
+     * The largest view a tool call may carry, as its JSON (256 KB), whether the server built
+     * it or a bridge sent it for an upstream tool.
+     *
+     * #11494: the chat refuses to draw a larger `ui` (McpApps::MAX_UI_BYTES in zeroplex/ai), so
+     * keeping one only costs memory for a card nobody will see.
+     */
+    public const MAX_TOOL_VIEW_BYTES = 262144;
+
+    /** The most upstream views held at once, waiting for their result to be dispatched. */
+    private const MAX_UPSTREAM_VIEWS = 64;
+
     /** Bytes held across every open buffer, so the aggregate can be checked. */
     private int $toolResultBytes = 0;
 
@@ -188,6 +200,16 @@ class StreamHandler
      * @var array<string, true>
      */
     private array $expectedViews = [];
+
+    /**
+     * Views a bridge sent on the first `tool_result` of a call to an upstream tool
+     * (`tool_result.ui` naming a `server`), by call id, until that result is dispatched.
+     * They win over a server-built view for the same id: a bridge-sent view is never
+     * overwritten by the server's path.
+     *
+     * @var array<string, array<string, mixed>>
+     */
+    private array $upstreamViews = [];
 
     public readonly string $requestId;
 
@@ -603,6 +625,13 @@ class StreamHandler
      */
     private function takeToolView(string $toolCallId): ?array
     {
+        if (isset($this->upstreamViews[$toolCallId])) {
+            $ui = $this->upstreamViews[$toolCallId];
+            unset($this->upstreamViews[$toolCallId], $this->expectedViews[$toolCallId]);
+
+            return $ui;
+        }
+
         if (! isset($this->expectedViews[$toolCallId])) {
             return null;
         }
@@ -624,6 +653,56 @@ class StreamHandler
 
             return null;
         }
+    }
+
+    /**
+     * Keep the view a bridge sent with an upstream tool's result, when it is one.
+     *
+     * Checked here because it arrives from a machine: an array naming its `server`,
+     * `tool_name` and a `ui://` `resource_uri`, with `arguments` and `result` objects, at most
+     * MAX_TOOL_VIEW_BYTES as JSON. Anything else is dropped with a log line, and the result
+     * itself still goes through. `connection_id` is the one MessageHandler stamped.
+     */
+    private function keepUpstreamView(string $toolCallId, mixed $ui): void
+    {
+        $valid = is_array($ui)
+            && is_string($ui['server'] ?? null) && $ui['server'] !== '' && strlen($ui['server']) <= 128
+            && is_string($ui['tool_name'] ?? null) && $ui['tool_name'] !== ''
+            && is_string($ui['resource_uri'] ?? null) && str_starts_with(strtolower($ui['resource_uri']), 'ui://')
+            && is_array($ui['arguments'] ?? [])
+            && is_array($ui['result'] ?? null);
+
+        if (! $valid) {
+            Log::warning('AI Bridge: a tool_result carried a ui that is not an upstream view, dropped', [
+                'request_id' => $this->requestId,
+                'tool_call_id' => $toolCallId,
+            ]);
+
+            return;
+        }
+
+        $view = [
+            'server' => $ui['server'],
+            'tool_name' => $ui['tool_name'],
+            'resource_uri' => $ui['resource_uri'],
+            'arguments' => $ui['arguments'] ?? [],
+            'result' => $ui['result'],
+            'connection_id' => is_int($ui['connection_id'] ?? null) ? $ui['connection_id'] : null,
+        ];
+
+        $size = strlen((string) json_encode($view, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        if ($size > self::MAX_TOOL_VIEW_BYTES || count($this->upstreamViews) >= self::MAX_UPSTREAM_VIEWS) {
+            Log::warning('AI Bridge: an upstream tool view was not kept', [
+                'request_id' => $this->requestId,
+                'tool_call_id' => $toolCallId,
+                'bytes' => $size,
+                'reason' => $size > self::MAX_TOOL_VIEW_BYTES ? 'too_large' : 'too_many',
+            ]);
+
+            return;
+        }
+
+        $this->upstreamViews[$toolCallId] = $view;
     }
 
     /** The stream-store key a view's result is kept under, per CLI call id. */
@@ -813,6 +892,11 @@ class StreamHandler
         $toolCallId = (string) ($data['tool_call_id'] ?? $data['call_id'] ?? '');
         $isError = is_bool($data['is_error'] ?? null) ? $data['is_error'] : null;
         $parent = self::parentOf($data);
+
+        // An upstream tool's view rides on the first frame of its result only.
+        if (array_key_exists('ui', $data) && $toolCallId !== '' && ! isset($this->upstreamViews[$toolCallId])) {
+            $this->keepUpstreamView($toolCallId, $data['ui']);
+        }
 
         if (! is_int($data['chunk_index'] ?? null)) {
             // An unchunked result supersedes anything half-assembled for the

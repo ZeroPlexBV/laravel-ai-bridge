@@ -30,6 +30,8 @@ use Tetrix\AiBridge\WebSocket\BridgeConnectionManager;
  * @method static ToolRegistry tools()
  * @method static ViewRegistry views()
  * @method static BridgeConnectionManager connections()
+ * @method static \Tetrix\AiBridge\Upstreams\UpstreamClient upstreams()
+ * @method static array mcpRequest(\Tetrix\AiBridge\Models\Connection $connection, string $server, string $method, array $params = [], ?int $timeout = null)
  * @method static bool hasBridge(int|string $userId)
  * @method static TurnInputResult sendTurnInput(string $requestId, string $messageId, string|array $content, int|string|null $userId = null)
  * @method static bool inputOpen(string $requestId)

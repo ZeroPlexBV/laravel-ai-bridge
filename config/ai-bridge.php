@@ -148,6 +148,11 @@ return [
         // bridge answers at once — it only writes to the CLI's input — so this is short.
         'turn_input_timeout' => env('AI_BRIDGE_TURN_INPUT_TIMEOUT', 5), // seconds
 
+        // How long the serve process waits for a bridge's `mcp_result` to a view's request
+        // relayed with AiBridge::mcpRequest() before answering `timeout`. Above the bridge's
+        // own per-upstream timeout (60 s by default), so the bridge's answer normally wins.
+        'mcp_request_timeout' => env('AI_BRIDGE_MCP_REQUEST_TIMEOUT', 65), // seconds
+
         // URL for internal relay requests (PHP-FPM → bridge server communication).
         // Override to use HTTPS if the bridge server is behind a TLS-terminating proxy.
         // Security: When running the bridge server on a separate host, use HTTPS to
@@ -184,6 +189,49 @@ return [
         // attachment store, the default) or 'device' (kept on the machine; the
         // `attachment` event carries `file_id` for MachineFiles::download()).
         'handed_back' => env('AI_BRIDGE_HANDED_BACK', 'server'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | OAuth sign-in to a bridge's upstream MCP servers (bridge `mcp_upstream_auth`)
+    |--------------------------------------------------------------------------
+    |
+    | A bridge started with `--mcp-upstreams` may use MCP servers that need OAuth.
+    | The person signs in in their own browser; the authorization server sends the
+    | browser back to this application's callback route, which passes the one-time
+    | code to the bridge over its WebSocket. Only the bridge holds the PKCE verifier
+    | and the tokens; this application never sees a token.
+    |
+    | - 'enabled': registers the callback route and sends its URL to bridges as
+    |   `welcome.upstream_oauth.redirect_uri`. false: neither, and the bridge
+    |   reports its OAuth upstreams `needs_auth` with `no_redirect_uri`.
+    | - 'path': where the callback route answers (name: ai-bridge.upstream-oauth.callback).
+    | - 'middleware': the callback's middleware. It must start a session and sign
+    |   the person in, because a sign-in is only finished by the person it belongs
+    |   to (a connection the connections resolver gives them).
+    | - 'redirect_uri': the absolute callback URL, when the serve process cannot
+    |   build it from APP_URL (it is what bridges register with the authorization
+    |   server, so it must be what people's browsers reach).
+    | - 'callback_timeout': how long the callback waits for the bridge to report the
+    |   code exchanged (seconds).
+    | - 'start_timeout': how long AiBridge::upstreams()->startSignIn() waits for the
+    |   bridge to open a sign-in; it does discovery and client registration first.
+    | - 'cache_store': the cache store pending sign-ins are kept in. The serve
+    |   process writes and the web process reads it, so it must be shared: not
+    |   'array'. null = the default store.
+    | - 'view': the Blade view the callback renders.
+    |
+    */
+
+    'upstream_oauth' => [
+        'enabled' => env('AI_BRIDGE_UPSTREAM_OAUTH', true),
+        'path' => env('AI_BRIDGE_UPSTREAM_OAUTH_PATH', '/ai-bridge/upstream-oauth/callback'),
+        'middleware' => ['web', 'auth'],
+        'redirect_uri' => env('AI_BRIDGE_UPSTREAM_OAUTH_REDIRECT_URI'),
+        'callback_timeout' => env('AI_BRIDGE_UPSTREAM_OAUTH_CALLBACK_TIMEOUT', 15), // seconds
+        'start_timeout' => env('AI_BRIDGE_UPSTREAM_OAUTH_START_TIMEOUT', 20), // seconds
+        'cache_store' => env('AI_BRIDGE_UPSTREAM_OAUTH_CACHE_STORE'),
+        'view' => 'ai-bridge::upstream-oauth.result',
     ],
 
     /*

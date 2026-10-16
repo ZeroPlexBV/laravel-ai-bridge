@@ -8,6 +8,9 @@ use Tetrix\AiBridge\Http\Controllers\ConnectionController;
 use Tetrix\AiBridge\Http\Controllers\ConversationController;
 use Tetrix\AiBridge\Http\Controllers\StreamController;
 use Tetrix\AiBridge\Http\Controllers\StreamEventsController;
+use Tetrix\AiBridge\Http\Controllers\UpstreamController;
+use Tetrix\AiBridge\Http\Controllers\UpstreamOAuthCallbackController;
+use Tetrix\AiBridge\Upstreams\UpstreamOAuth;
 
 // Static assets for the chat Web Component — public (no auth): the component JS.
 // Kept outside the auth-gated group below.
@@ -90,6 +93,26 @@ Route::middleware($middleware)->prefix('ai-bridge')->group(function () {
         Route::patch('/connections/{id}', [ConnectionController::class, 'update']);
         Route::post('/connections/{id}/regenerate', [ConnectionController::class, 'regenerate']);
         Route::delete('/connections/{id}', [ConnectionController::class, 'destroy']);
+
+        // A bridge's upstream MCP servers (`--mcp-upstreams`): their status, the OAuth
+        // sign-ins waiting on the person, starting one, and forgetting an upstream's tokens.
+        Route::get('/connections/{id}/upstreams', [UpstreamController::class, 'index'])
+            ->name('ai-bridge.upstreams.index');
+        Route::get('/connections/{id}/upstreams/pending', [UpstreamController::class, 'pending'])
+            ->name('ai-bridge.upstreams.pending');
+        Route::post('/connections/{id}/upstreams/{server}/sign-in', [UpstreamController::class, 'signIn'])
+            ->where('server', '[A-Za-z0-9._-]+')
+            ->name('ai-bridge.upstreams.sign-in');
+        Route::delete('/connections/{id}/upstreams/{server}/sign-in', [UpstreamController::class, 'forget'])
+            ->where('server', '[A-Za-z0-9._-]+')
+            ->name('ai-bridge.upstreams.forget');
+    });
+
+    // A view's request to an upstream MCP server, relayed through the bridge that made
+    // the call (`mcp_request`). Held open while the upstream answers, so throttled apart.
+    Route::middleware('throttle:120,1')->group(function () {
+        Route::post('/connections/{id}/mcp', [UpstreamController::class, 'mcp'])
+            ->name('ai-bridge.upstreams.mcp');
     });
 
     // Conversation streaming — throttle:30,1 (30 messages per minute). Each call
@@ -114,3 +137,23 @@ Route::middleware($middleware)->prefix('ai-bridge')->group(function () {
             ->where('requestId', '[A-Za-z0-9_-]+');
     });
 });
+
+/*
+|--------------------------------------------------------------------------
+| OAuth callback for a bridge's upstream MCP servers
+|--------------------------------------------------------------------------
+|
+| Where an authorization server sends the person's browser back after they
+| signed in to an upstream MCP server. A browser page, so it runs under the
+| session middleware ('web' + 'auth' by default), not the API group above.
+| Off when ai-bridge.upstream_oauth.enabled is false.
+|
+*/
+if (UpstreamOAuth::enabled()) {
+    Route::middleware([...(array) config('ai-bridge.upstream_oauth.middleware', ['web', 'auth']), 'throttle:30,1'])
+        ->get(
+            '/'.ltrim((string) config('ai-bridge.upstream_oauth.path', '/ai-bridge/upstream-oauth/callback'), '/'),
+            UpstreamOAuthCallbackController::class,
+        )
+        ->name(UpstreamOAuth::CALLBACK_ROUTE);
+}

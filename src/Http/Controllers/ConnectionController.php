@@ -64,6 +64,10 @@ class ConnectionController extends Controller
                 $data['capabilities'] = $status['capabilities'] ?? [];
                 // Whether it passes MCP Apps through, so a tool's view can show.
                 $data['mcp_apps'] = $status['mcp_apps'] ?? false;
+                // Whether it can sign in to OAuth upstream MCP servers, and how its
+                // upstreams are (see GET /ai-bridge/connections/{id}/upstreams).
+                $data['mcp_upstream_auth'] = $status['mcp_upstream_auth'] ?? false;
+                $data['upstream_status'] = $status['upstream_status'] ?? [];
                 $data['connected'] = $status['connected'];
             }
 

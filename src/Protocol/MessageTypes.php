@@ -259,6 +259,43 @@ final class MessageTypes
     /** Bridge → server: whether it has the file, its size, and the range it will send. */
     public const FILE_READ_RESULT = 'file_read_result';
 
+    /*
+     * MCP Apps from upstream MCP servers (bridge 0.27+, `hello.mcp_apps`). A view
+     * drawn by the host asks its upstream server for something through the bridge
+     * that made the call. See PROTOCOL.md "Upstream MCP Apps and OAuth sign-in".
+     */
+
+    /** Server → bridge: a view's `resources/read` (ui:// only) or `tools/call`, relayed. */
+    public const MCP_REQUEST = 'mcp_request';
+
+    /** Bridge → server: exactly one per `mcp_request`, same `id`: `result`, or `error` + `code`. */
+    public const MCP_RESULT = 'mcp_result';
+
+    /*
+     * OAuth sign-in to `--mcp-upstreams` servers (`hello.mcp_upstream_auth`). The
+     * person signs in in their browser; the authorization server redirects to this
+     * application, which passes the one-time code to the bridge. Tokens never leave
+     * the bridge.
+     */
+
+    /** Bridge → server: the complete list of upstreams with their state, sent on every change. */
+    public const UPSTREAM_STATUS = 'upstream_status';
+
+    /** Bridge → server: an upstream needs the person to sign in; carries the authorization URL. */
+    public const UPSTREAM_AUTH_REQUIRED = 'upstream_auth_required';
+
+    /** Server → bridge: the person asked to (re)connect an upstream. */
+    public const UPSTREAM_AUTH_START = 'upstream_auth_start';
+
+    /** Server → bridge: the redirect's query parameters (`code`/`iss`, or `error`), passed on. */
+    public const UPSTREAM_AUTH_CODE = 'upstream_auth_code';
+
+    /** Bridge → server: how a sign-in ended (one per `upstream_auth_code`), or why a start failed. */
+    public const UPSTREAM_AUTH_RESULT = 'upstream_auth_result';
+
+    /** Server → bridge: forget this upstream's tokens on this bridge. */
+    public const UPSTREAM_AUTH_FORGET = 'upstream_auth_forget';
+
     /** Stream event: the entire AI response is complete. */
     public const DONE = 'done';
 
@@ -324,6 +361,14 @@ final class MessageTypes
             self::FILE_READ,
             self::FILE_READ_CANCEL,
             self::FILE_READ_RESULT,
+            self::MCP_REQUEST,
+            self::MCP_RESULT,
+            self::UPSTREAM_STATUS,
+            self::UPSTREAM_AUTH_REQUIRED,
+            self::UPSTREAM_AUTH_START,
+            self::UPSTREAM_AUTH_CODE,
+            self::UPSTREAM_AUTH_RESULT,
+            self::UPSTREAM_AUTH_FORGET,
             self::DONE,
             self::ERROR,
             self::CANCEL,
@@ -366,6 +411,10 @@ final class MessageTypes
             self::TURN_INPUT_ACK,
             self::UPLOAD_DONE,
             self::FILE_READ_RESULT,
+            self::MCP_RESULT,
+            self::UPSTREAM_STATUS,
+            self::UPSTREAM_AUTH_REQUIRED,
+            self::UPSTREAM_AUTH_RESULT,
             self::STREAM,
             self::TOOL_CALL,
             self::ERROR,
@@ -406,6 +455,10 @@ final class MessageTypes
             self::UPLOAD_ABORT,
             self::FILE_READ,
             self::FILE_READ_CANCEL,
+            self::MCP_REQUEST,
+            self::UPSTREAM_AUTH_START,
+            self::UPSTREAM_AUTH_CODE,
+            self::UPSTREAM_AUTH_FORGET,
             self::CANCEL,
         ];
     }
