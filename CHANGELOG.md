@@ -14,13 +14,15 @@ Upstream MCP Apps and OAuth sign-in for the MCP servers a bridge connects to
   view) is kept on the stream event, the recorded block and `onToolResult`'s fifth argument,
   under the same 256 KB and turn-budget rules as a server-built view, from the first frame of
   the call only, and stamped with `connection_id` (the connection that streamed it). A
-  server-built view never overwrites it.
+  bridge-sent `ui` on a server tool's call is ignored.
 - **`AiBridge::mcpRequest($connection, $server, $method, $params)`** (also
   `AiBridge::upstreams()->mcpRequest()`, `POST /ai-bridge/connections/{id}/mcp`): relays a
   view's `resources/read` (`ui://` only) or `tools/call` to the bridge as `mcp_request` and
   returns the `mcp_result`, or throws `Upstreams\McpRequestFailed` with its code. Works from
   any process through the serve process's new `POST /api/mcp`; refuses other methods locally
-  and bridges without `hello.mcp_apps`. Event `McpRequestRelayed` per request.
+  and bridges without `hello.mcp_apps`. An optional `tool_call_id` holds the request to that
+  call's view: a server other than the view's is refused (`refused`), an unrecorded view is
+  `unknown_view`. Event `McpRequestRelayed` per request.
 - **OAuth sign-in to upstreams** (bridge `hello.mcp_upstream_auth`): `welcome.upstream_oauth`
   with the callback URL; `upstream_status` recorded (`ConnectionStatus`: `mcp_upstream_auth`,
   `upstream_status`); `upstream_auth_required` kept as a pending sign-in in the cache; the
@@ -32,7 +34,7 @@ Upstream MCP Apps and OAuth sign-in for the MCP servers a bridge connects to
   `.pending`, `.sign-in`, `.forget`. Events `UpstreamAuthRequired`, `UpstreamAuthCompleted`,
   `UpstreamStatusChanged`.
 - Config: `ai-bridge.upstream_oauth.*` (`enabled`, `path`, `middleware`, `redirect_uri`,
-  `callback_timeout`, `start_timeout`, `cache_store`, `view`) and
+  `callback_timeout`, `start_timeout`, `cache_store`, `view`, `view_ttl`) and
   `ai-bridge.server.mcp_request_timeout`. Serve-process endpoints `POST /api/mcp`,
   `/api/upstream/auth-start`, `/api/upstream/auth-code`, `/api/upstream/auth-forget`;
   `/api/status` reports `upstream_status`.
@@ -44,6 +46,9 @@ Upstream MCP Apps and OAuth sign-in for the MCP servers a bridge connects to
 - The callback URL is built from `APP_URL`; set it to the public address, or set
   `AI_BRIDGE_UPSTREAM_OAUTH_REDIRECT_URI`. `AI_BRIDGE_UPSTREAM_OAUTH=false` turns it off.
 - `GET /ai-bridge/connections` adds `mcp_upstream_auth` and `upstream_status` for a bridge.
+- The new JSON routes, like the existing ones, check no CSRF token: with session-cookie auth,
+  add CSRF protection (Sanctum stateful auth, or middleware) or call the PHP API from your own
+  routes. `ai-bridge:serve` warns when the sign-in cache store is `array`.
 
 ## [Unreleased] — to be released as 0.18.0
 

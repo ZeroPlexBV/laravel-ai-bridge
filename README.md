@@ -1142,20 +1142,37 @@ use Tetrix\AiBridge\Upstreams\McpRequestFailed;
 $connection = AiBridge::connectionsQuery($request)->findOrFail($ui['connection_id']);
 
 try {
-    $html = AiBridge::mcpRequest($connection, $ui['server'], 'resources/read', ['uri' => $ui['resource_uri']]);
-    $again = AiBridge::mcpRequest($connection, $ui['server'], 'tools/call', ['name' => 'refresh', 'arguments' => ['city' => 'Utrecht']]);
+    // $toolCallId: the tool_call_id of the result whose view is asking.
+    $html = AiBridge::mcpRequest($connection, $ui['server'], 'resources/read', ['uri' => $ui['resource_uri']], toolCallId: $toolCallId);
+    $again = AiBridge::mcpRequest($connection, $ui['server'], 'tools/call', ['name' => 'refresh', 'arguments' => ['city' => 'Utrecht']], toolCallId: $toolCallId);
 } catch (McpRequestFailed $e) {
     // $e->errorCode: unknown_server, unavailable, timeout, refused, unsupported, upstream_error,
-    // or invalid_request, not_connected, mcp_apps_unsupported, unreachable
+    // or invalid_request, unknown_view, not_connected, mcp_apps_unsupported, unreachable
 }
 ```
+
+**Pin the request to the view.** Take `server` from the view's own `ui.server`, never from what
+the view's frame asks for, and pass the call's `tool_call_id`: the request is then refused
+(`refused`) unless `server` is the one recorded for that view on that connection, or
+(`unknown_view`) when no such view was recorded there. Without `tool_call_id`, any server and
+any tool the upstream lets views call are reachable by whoever can call the API. A bridge
+connected without an `ai_bridge_connections` row (under a user id rather than a connection key)
+gives its views `connection_id: null`; such views cannot be relayed through the route.
 
 Only `resources/read` of a `ui://` uri and `tools/call` are relayed; anything else is refused
 before it leaves this server. It works from a web worker or a job (it reaches the serve process
 over its internal API, like `sendTurnInput()`), waits up to `ai-bridge.server.mcp_request_timeout`
 (65 s), and fires `Tetrix\AiBridge\Events\McpRequestRelayed` (user, connection, server, method,
 tool or uri, outcome) for an audit trail. The same is `POST /ai-bridge/connections/{id}/mcp`
-(`{server, method, params}`).
+(`{server, method, params, tool_call_id}`), throttled to 30 a minute.
+
+> **CSRF: these JSON routes have none of their own.** Like every route under
+> `ai-bridge.route_middleware` they run in the `api` group, which does not check a CSRF token.
+> With session-cookie auth (`['auth']` and a browser) a hostile page could POST to
+> `…/mcp` or `…/sign-in` as the signed-in person. Use Sanctum's stateful SPA auth
+> (`auth:sanctum`, which checks the XSRF token for first-party requests), a token in a header,
+> or add CSRF-checking middleware to `ai-bridge.route_middleware`; or do not expose them and
+> call `AiBridge::mcpRequest()` / `AiBridge::upstreams()` from your own CSRF-protected routes.
 
 **Sign-in.** When an upstream needs the person to sign in, the bridge sends an authorization URL;
 the package keeps it as a pending sign-in and fires `UpstreamAuthRequired` (in the serve process)

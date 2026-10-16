@@ -1814,7 +1814,9 @@ with ai-bridge PR #60.
           "arguments": { "city": "Utrecht" }, "result": { "content": [ ... ], "structuredContent": { ... } } } } }
 ```
 
-Taken from the **first** `tool_result` frame of a call only. Kept when it names a `server`,
+Taken from the **first** `tool_result` frame of a call only (a `ui` on a later frame is
+ignored even when the first had none), and never for a call whose view the server keeps
+itself (a server tool's call). Kept when it names a `server`,
 a `tool_name`, a `ui://` `resource_uri`, and has object `arguments` and `result`, and is at
 most 256 KB as JSON; otherwise dropped with a log line (the result still goes through). The
 server adds **`connection_id`**: the `ai_bridge_connections` id of the bridge that streamed it
@@ -1875,7 +1877,9 @@ malformed (state under 16 or over 512 characters, a non-http(s) URL, an unreadab
 
 `upstream_auth_code` carries the redirect's `code`, `iss`, `error` and `error_description`
 as they came, and is only sent after the callback checked the state (below). Two
-`upstream_auth_start` for one upstream while the first is unanswered share one frame.
+`upstream_auth_start` for one upstream of the same bridge while the first is unanswered
+share one frame. The callback claims the pending sign-in atomically (a cache lock) before
+forwarding, so a state is forwarded at most once.
 
 ### Bridge → Server: `upstream_auth_result`
 
@@ -1930,11 +1934,17 @@ timeout fires (**504**). A bridge without the needed hello field: **409**
 - `pending($connection)`: `[{connection_id, server, authorization_url, expires_at, reason}]`
 - `startSignIn($connection, $server)`: the start's answer
 - `forget($connection, $server)`: bool, and drops the upstream's pending sign-in
-- `mcpRequest($connection, $server, $method, $params, $timeout = null)`: the result, or
-  throws `McpRequestFailed` (`errorCode`: the bridge's code, or `invalid_request`,
-  `not_connected`, `mcp_apps_unsupported`, `unreachable`); fires `McpRequestRelayed` (user,
-  connection, server, method, tool name or uri, outcome, duration) every time. Also
-  `AiBridge::mcpRequest()`.
+- `mcpRequest($connection, $server, $method, $params, $timeout = null, $toolCallId = null)`:
+  the result, or throws `McpRequestFailed` (`errorCode`: the bridge's code, or
+  `invalid_request`, `unknown_view`, `not_connected`, `mcp_apps_unsupported`, `unreachable`);
+  fires `McpRequestRelayed` (user, connection, server, method, tool name or uri, outcome,
+  duration) every time. Also `AiBridge::mcpRequest()`. With `$toolCallId` the request is
+  held to that call's view: refused (`refused`) unless `$server` is the server its `ui`
+  named on this connection, `unknown_view` when none was recorded (looked up in the cache,
+  kept `ai-bridge.upstream_oauth.view_ttl`, then in the connection's recorded blocks). A
+  host takes `server` from the view's `ui.server` and passes `tool_call_id`. Views of a
+  bridge with no connection row carry `connection_id: null` and cannot be relayed through
+  the route.
 
 Beside the connection routes, behind `ai-bridge.route_middleware` and the connections
 resolver:
@@ -1945,7 +1955,11 @@ resolver:
 | `GET /ai-bridge/connections/{id}/upstreams/pending` | `ai-bridge.upstreams.pending` |
 | `POST /ai-bridge/connections/{id}/upstreams/{server}/sign-in` | `ai-bridge.upstreams.sign-in` |
 | `DELETE /ai-bridge/connections/{id}/upstreams/{server}/sign-in` | `ai-bridge.upstreams.forget` |
-| `POST /ai-bridge/connections/{id}/mcp` (`{server, method, params}`) | `ai-bridge.upstreams.mcp` |
+| `POST /ai-bridge/connections/{id}/mcp` (`{server, method, params, tool_call_id?}`, 30/min) | `ai-bridge.upstreams.mcp` |
+
+These run in the `api` group and check no CSRF token of their own; a host using session
+cookies must add CSRF protection (Sanctum stateful auth, or middleware) or call the PHP API
+from its own protected routes.
 
 Drawing the card, asking the person's consent for a view's CSP or permissions, and what a
 button means stay with the host.
