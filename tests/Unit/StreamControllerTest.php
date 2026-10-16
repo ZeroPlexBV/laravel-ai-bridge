@@ -429,3 +429,34 @@ test('managed mode strips all client options (ARCH-009)', function () {
     // In managed mode, sanitizeOptions() returns [] for everything
     expect($capturedOptions)->toBe([]);
 });
+
+test('the option whitelist lets a per-turn effort through, and managed mode still drops it', function (string $mode, bool $kept) {
+    config(['ai-bridge.mode' => $mode]);
+
+    $capturedOptions = null;
+    $manager = Mockery::mock(AiBridgeManager::class);
+    $manager->shouldReceive('mode')->byDefault()->andReturn(ProviderMode::from($mode));
+    $manager->shouldReceive('streamToResponse')
+        ->once()
+        ->withArgs(function ($convId, $msg, $options) use (&$capturedOptions) {
+            $capturedOptions = $options;
+            return true;
+        })
+        ->andReturn(new \Symfony\Component\HttpFoundation\StreamedResponse());
+
+    (new StreamController($manager))->sse(makeRequest([
+        'message' => 'Hello',
+        'options' => ['effort' => 'high', 'reasoning_effort' => 'max'],
+    ]));
+
+    expect($capturedOptions)->not->toHaveKey('reasoning_effort');
+    if ($kept) {
+        expect($capturedOptions['effort'] ?? null)->toBe('high');
+    } else {
+        expect($capturedOptions)->not->toHaveKey('effort');
+    }
+})->with([
+    'bridge' => ['bridge', true],
+    'byok' => ['byok', true],
+    'managed' => ['managed', false],
+]);

@@ -297,10 +297,15 @@ final class ConversationRecorder
             }
             $pendingFrames = [];
         });
-        $handler->onToolCall(function (string $name, array $params, string $callId) use (&$blocks, &$current, &$pendingFrames) {
+        $handler->onToolCall(function (string $name, array $params, string $callId, ?string $providerToolCallId = null) use (&$blocks, &$current, &$pendingFrames) {
             $frame = ['type' => 'tool_call', 'tool_name' => $name]
                 + self::capParameters($params)
                 + ['tool_call_id' => $callId, '_from_frame' => true];
+            // The CLI's own id for the call, which is the id its stream block
+            // carries: reconcileToolCalls() pairs the two on it exactly.
+            if ($providerToolCallId !== null) {
+                $frame['_provider_tool_call_id'] = $providerToolCallId;
+            }
 
             // Behind the block still open, not in front of it — and WAITING for
             // it, not closing it. A frame is recorded the moment it arrives
@@ -317,7 +322,7 @@ final class ConversationRecorder
 
             $blocks[] = $frame;
         });
-        $handler->onToolResult(function (string $callId, mixed $result, ?bool $isError = null) use (&$blocks, &$current, &$pendingFrames) {
+        $handler->onToolResult(function (string $callId, mixed $result, ?bool $isError = null, ?string $parentToolUseId = null, ?array $ui = null) use (&$blocks, &$current, &$pendingFrames) {
             // Attach to the call it belongs to, wherever that call currently
             // is. There are three places, and each was found by a divergence
             // against the chat component rather than by reading:
@@ -345,6 +350,10 @@ final class ConversationRecorder
                 if ($isError !== null) {
                     $current['is_error'] = $isError;
                 }
+                // A server tool's view travels with its result.
+                if ($ui !== null) {
+                    $current['ui'] = $ui;
+                }
 
                 return;
             }
@@ -361,6 +370,9 @@ final class ConversationRecorder
                 if ($isError !== null) {
                     $blocks[$i]['is_error'] = $isError;
                 }
+                if ($ui !== null) {
+                    $blocks[$i]['ui'] = $ui;
+                }
 
                 return;
             }
@@ -375,6 +387,9 @@ final class ConversationRecorder
                     if ($isError !== null) {
                         $pendingFrames[$i]['is_error'] = $isError;
                     }
+                    if ($ui !== null) {
+                        $pendingFrames[$i]['ui'] = $ui;
+                    }
 
                     return;
                 }
@@ -386,6 +401,9 @@ final class ConversationRecorder
             // and a failure that reported nothing is not a success.
             if ($isError !== null) {
                 $block['is_error'] = $isError;
+            }
+            if ($ui !== null) {
+                $block['ui'] = $ui;
             }
 
             // Behind the block still open, for the same reason a tool_call
@@ -645,6 +663,24 @@ final class ConversationRecorder
                 break;
             }
 
+            // A view is drawn whole or not at all, so it is kept whole or dropped,
+            // never cut, and charged against the same row budget as everything else.
+            if (array_key_exists('ui', $block)) {
+                $uiSize = strlen(json_encode($block['ui'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '');
+                if ($uiSize <= max(0, $remaining)) {
+                    $remaining -= $uiSize;
+                } else {
+                    unset($block['ui']);
+                    $block['ui_dropped_bytes'] = $uiSize;
+                    // #11496: say which limit was reached, as a truncated result does: a card
+                    // that would never fit a turn, or one that arrived after earlier blocks
+                    // had spent the turn's budget.
+                    $block['ui_dropped_reason'] = $uiSize > self::MAX_TURN_BLOCK_BYTES
+                        ? 'too_large'
+                        : 'turn_budget_spent';
+                }
+            }
+
             if (! array_key_exists('result', $block) || $block['result'] === null) {
                 return $block;
             }
@@ -737,6 +773,11 @@ final class ConversationRecorder
                 continue;
             }
 
+            // The frame that names the CLI's own call id (bridge 0.27+) pairs
+            // exactly with the stream block carrying that id. Only without one
+            // does the name decide, which is a guess under parallel calls.
+            $exactCandidate = self::exactStreamBlock($blocks, $block, $claimed);
+
             foreach ($blocks as $candidate => $streamBlock) {
                 if (($streamBlock['type'] ?? '') !== 'tool_call' || ! ($streamBlock['_from_stream'] ?? false)) {
                     continue;
@@ -744,7 +785,10 @@ final class ConversationRecorder
                 if (isset($claimed[$candidate])) {
                     continue;
                 }
-                if (! self::describesSameCall((string) ($streamBlock['tool_name'] ?? ''), (string) ($block['tool_name'] ?? ''))) {
+                if ($exactCandidate !== null && $candidate !== $exactCandidate) {
+                    continue;
+                }
+                if ($exactCandidate === null && ! self::describesSameCall((string) ($streamBlock['tool_name'] ?? ''), (string) ($block['tool_name'] ?? ''))) {
                     continue;
                 }
 
@@ -765,6 +809,9 @@ final class ConversationRecorder
                     if (array_key_exists('is_error', $block)) {
                         $blocks[$candidate]['is_error'] = $block['is_error'];
                     }
+                    if (array_key_exists('ui', $block)) {
+                        $blocks[$candidate]['ui'] = $block['ui'];
+                    }
                 }
 
                 // The block is USUALLY richer — it has the id results are keyed
@@ -781,7 +828,7 @@ final class ConversationRecorder
                     // data, which is the thing this whole area is careful about.
                     $frameHasArguments = ($block['parameters'] ?? []) !== [] || isset($block['parameters_raw']);
 
-                    if ($frameHasArguments && self::isUnambiguous($blocks, (string) ($block['tool_name'] ?? ''))) {
+                    if ($frameHasArguments && ($exactCandidate !== null || self::isUnambiguous($blocks, (string) ($block['tool_name'] ?? '')))) {
                         unset($blocks[$candidate]['parameters_raw'], $blocks[$candidate]['parameters_truncated_bytes']);
                         $blocks[$candidate] = $blocks[$candidate] + ['parameters' => []];
                         $blocks[$candidate]['parameters'] = $block['parameters'] ?? [];
@@ -806,6 +853,9 @@ final class ConversationRecorder
                     if (array_key_exists('is_error', $block)) {
                         $orphaned['is_error'] = $block['is_error'];
                     }
+                    if (array_key_exists('ui', $block)) {
+                        $orphaned['ui'] = $block['ui'];
+                    }
                     $blocks[$index] = $orphaned;
 
                     break;
@@ -817,10 +867,35 @@ final class ConversationRecorder
         }
 
         return array_values(array_map(static function (array $block): array {
-            unset($block['_from_stream'], $block['_from_frame']);
+            unset($block['_from_stream'], $block['_from_frame'], $block['_provider_tool_call_id']);
 
             return $block;
         }, $blocks));
+    }
+
+    /**
+     * The unclaimed stream block whose id is the frame's `provider_tool_call_id`, if any.
+     *
+     * @param  array<int, array<string, mixed>>  $blocks
+     * @param  array<string, mixed>  $frame
+     * @param  array<int, true>  $claimed
+     */
+    private static function exactStreamBlock(array $blocks, array $frame, array $claimed): ?int
+    {
+        $providerId = $frame['_provider_tool_call_id'] ?? null;
+        if (! is_string($providerId)) {
+            return null;
+        }
+
+        foreach ($blocks as $candidate => $streamBlock) {
+            if (($streamBlock['_from_stream'] ?? false)
+                && ! isset($claimed[$candidate])
+                && ($streamBlock['tool_call_id'] ?? null) === $providerId) {
+                return $candidate;
+            }
+        }
+
+        return null;
     }
 
     /**

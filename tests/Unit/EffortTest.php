@@ -178,6 +178,11 @@ test('the conversation route takes a per-turn effort and refuses a malformed one
 
     expect($ok->getStatusCode())->toBe(200)
         ->and($bad->getStatusCode())->toBe(422);
+
+    foreach (['HIGH', 'high ', 'x-high', 'high; rm -rf /', str_repeat('a', 17), 3] as $malformed) {
+        $response = $controller->stream(Request::create('/x', 'POST', ['message' => 'go', 'effort' => $malformed]), $conversation->id);
+        expect($response->getStatusCode())->toBe(422, 'effort '.var_export($malformed, true));
+    }
 });
 
 // ── re-issue after session_lost ───────────────────────────────────────

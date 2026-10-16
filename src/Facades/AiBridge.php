@@ -14,6 +14,7 @@ use Tetrix\AiBridge\Models\Conversation;
 use Tetrix\AiBridge\Streaming\StreamHandler;
 use Tetrix\AiBridge\Streaming\TurnInputResult;
 use Tetrix\AiBridge\Tools\ToolRegistry;
+use Tetrix\AiBridge\Tools\ViewRegistry;
 use Tetrix\AiBridge\WebSocket\BridgeConnectionManager;
 
 /**
@@ -24,10 +25,13 @@ use Tetrix\AiBridge\WebSocket\BridgeConnectionManager;
  * @method static StreamHandler streamConversation(Conversation $conversation, string $message, array $options = [])
  * @method static StreamedResponse streamConversationToResponse(Conversation $conversation, string $message, array $options = [])
  * @method static string startConversationStream(Conversation $conversation, string $message, array $options = [])
- * @method static AiBridgeManager registerTool(string $name, string $description, array $parameters, Closure $handler)
+ * @method static AiBridgeManager registerTool(string $name, string $description, array $parameters, Closure $handler, ?string $view = null)
  * @method static AiBridgeManager registerToolHandler(ToolHandler $handler)
  * @method static ToolRegistry tools()
+ * @method static ViewRegistry views()
  * @method static BridgeConnectionManager connections()
+ * @method static \Tetrix\AiBridge\Upstreams\UpstreamClient upstreams()
+ * @method static array mcpRequest(\Tetrix\AiBridge\Models\Connection $connection, string $server, string $method, array $params = [], ?int $timeout = null, ?string $toolCallId = null)
  * @method static bool hasBridge(int|string $userId)
  * @method static TurnInputResult sendTurnInput(string $requestId, string $messageId, string|array $content, int|string|null $userId = null)
  * @method static bool inputOpen(string $requestId)

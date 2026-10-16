@@ -17,6 +17,7 @@ Specification for the WebSocket protocol between `@tetrixdev/ai-bridge` (npm, cl
 - [Conversation Continuity](#conversation-continuity)
 - [Streaming Events](#streaming-events)
 - [Tool Calls](#tool-calls)
+- [Upstream MCP Apps and OAuth sign-in](#upstream-mcp-apps-and-oauth-sign-in)
 - [Heartbeat](#heartbeat)
 - [Error Handling](#error-handling)
 - [Provider Reference](#provider-reference)
@@ -189,7 +190,7 @@ If a CLI is not installed, `available` is `false` and the server won't route req
 | `file_uploads` | 0.18 | `true`: accepts `upload_offer`. See [Streamed uploads](#streamed-uploads-and-downloads). |
 | `file_downloads` | 0.18 | `true`: answers `file_read`. |
 | `app_backends` | 0.21 | `true`: understands `app_call` (Engram app backends; not used by this package). |
-| `effort_levels` | upcoming | `string[]`, e.g. `["low","medium","high","xhigh","max"]`: the values [`options.effort`](#server--bridge-ai_request) takes, passed to Claude as `--effort <level>`. Absent, empty or not a list: the bridge does not honour `options.effort`. Reported as `ConnectionStatus::for()['effort_levels']` (a list of strings, `[]` for none); non-string, empty and duplicate entries are dropped. |
+| `effort_levels` | 0.32 | `string[]`, e.g. `["low","medium","high","xhigh","max"]`: the values [`options.effort`](#server--bridge-ai_request) takes, passed to Claude as `--effort <level>`. Claude conversations only: Codex and Gemini ignore `options.effort`, whatever this list says. Absent, empty or not a list: the bridge does not honour `options.effort`. Reported as `ConnectionStatus::for()['effort_levels']` (a list of strings, `[]` for none); non-string, empty and duplicate entries are dropped. |
 
 Absent means the bridge predates the field: test the capability, not the version.
 
@@ -240,6 +241,19 @@ The field is **omitted entirely** when the operator allowed nothing, so "this br
 | `self_update` | `true` only when this bridge will actually follow [`desired_bridge_version`](#desired_bridge_version): it runs as a managed service and its operator has not opted out. Sent by 0.24.0 and newer. |
 
 The server records both per connection, in the same `bridge` record as the fields above, and reports them on the connection status (`bridge_version`, `self_update`). `bridge_version` is kept from the last connection while the machine is off (check `connected`); `self_update` is live only, `false` whenever the bridge is not connected. An absent or non-boolean `self_update` is `false` — a bridge older than 0.24.0 never sends it, and cannot update itself anyway. An older server ignores the field.
+
+#### Additive field: `mcp_apps` (ai-bridge 0.27+)
+
+```json
+{ "type": "hello", "bridge_version": "0.29.0", "mcp_apps": { "spec": "2026-01-26", "revision": 1 } }
+```
+
+Present when the bridge passes MCP Apps through: it copies a tool definition's `_meta` into the
+CLI's tool list and reports the CLI's own call id on every `tool_call` (see
+[Tools with a view](#tools-with-a-view-mcp-apps)). The server records it per connection in the
+same `bridge` record as `bridge_version` (`last_bridge.mcp_apps`) and reports `mcp_apps: true|false`
+on the connection status. Absent means the bridge is older than 0.27.0: the server then attaches no
+view to that machine's tool results and never sends `mcp_request`.
 
 ### Bridge → Server: `providers_update`
 
@@ -724,7 +738,7 @@ When the server needs an AI response (triggered by a user message in the browser
 
 **`options.model`**: The model for this turn. For a persisted conversation this package sends the turn's own `model` option when the caller gives one, else the conversation's stored model.
 
-**`options.effort`**: The thinking level for this turn, a string: one of the bridge's [`hello.effort_levels`](#bridge--server-hello), passed to Claude as `--effort <level>`. Per turn, optional; absent means the CLI's own default. A bridge ignores a value it does not list, and any bridge that predates the field ignores the key, so it is safe to send to every bridge. This package sends a non-empty string of at most 32 characters and drops anything else, and sends it again on a [`session_lost`](#lost-session-recovery-session_lost) re-issue.
+**`options.effort`**: The thinking level for this turn, a string: one of the bridge's [`hello.effort_levels`](#bridge--server-hello), passed to Claude as `--effort <level>`. Claude only: Codex and Gemini ignore it (ai-bridge 0.32.0+). Per turn, optional; absent means the CLI's own default. A bridge ignores a value it does not list, and any bridge that predates the field ignores the key, so it is safe to send to every bridge. This package sends a non-empty string of at most 32 characters and drops anything else, and sends it again on a [`session_lost`](#lost-session-recovery-session_lost) re-issue.
 
 **`options.accepts_input`**: `true` to keep the CLI's input open for the whole turn, so a message can reach the assistant while the turn runs. Opt-in, per turn; Claude only. See [Turn Input](#turn-input). Only `true` means yes; absent, `null` and `false` all mean the turn runs as every turn did before.
 
@@ -1350,6 +1364,33 @@ What a tool returned. Emitted for **both** kinds of tool call:
 
 `is_error` is the authoritative failure signal, and is **absent when the provider did not report one** — absent never means "succeeded". Do not infer failure from the text: a tool legitimately printing `Error: no matches` is indistinguishable from one that failed. (For historical reasons the Codex and Gemini adapters additionally prefix `Error: ` onto a failed result; that prefix is not a substitute for the field.)
 
+`ui` is present only on the result of a call to a server tool **with a view** (see
+[Tools with a view](#tools-with-a-view-mcp-apps)), and only on the events the **server** itself
+emits (its stream store, `streamToResponse()`) and records on the message, never on a frame the
+bridge sends:
+
+```json
+"ui": {
+  "resource_uri": "ui://studio/grant-request",
+  "tool_name": "show_grant_request",
+  "arguments": { "grant_id": 42 },
+  "result": {
+    "content": [{ "type": "text", "text": "Grant request 42 is waiting for Dragan." }],
+    "structuredContent": { "grant_id": 42, "deliverables": [9227], "gates": ["walkthrough"] }
+  }
+}
+```
+
+`result` is the full `CallToolResult` the handler produced, kept on the server because the CLI
+only ever receives its text. A consumer that does not draw views ignores the key.
+
+A view whose JSON is over 256 KB is not kept, so its result carries no `ui`. On a **recorded**
+message block `ui` is kept whole or dropped whole, never cut: once the turn's storage budget is
+spent the block carries `ui_dropped_bytes` (the view's size as JSON) and `ui_dropped_reason`
+instead of `ui`. `ui_dropped_reason` is `too_large` for a view larger than a whole turn's budget,
+and `turn_budget_spent` when earlier blocks of the same turn had already spent it. A consumer
+draws such a block as a call with no view.
+
 ##### Chunked results
 
 A result larger than one frame arrives **in pieces**, keyed by `tool_call_id`:
@@ -1666,6 +1707,54 @@ Server                          Bridge                          CLI
   │                               │                              │
 ```
 
+### Tools with a view (MCP Apps)
+
+A server tool may name an interactive view (an [MCP App](https://github.com/modelcontextprotocol/ext-apps),
+spec `2026-01-26`) that a host draws next to its call. The view itself is HTML the **server** serves;
+the bridge only carries two things through, and needs to be 0.27.0 or newer to do it.
+
+1. **`_meta` on the definition.** A tool in `welcome.tools` (and in a request's tool list) may
+   carry `_meta.ui`:
+   ```json
+   {
+     "name": "show_grant_request",
+     "description": "Show the person a grant request to confirm",
+     "parameters": { "type": "object", "properties": { "grant_id": { "type": "integer", "description": "The grant request" } } },
+     "_meta": { "ui": { "resourceUri": "ui://studio/grant-request" } }
+   }
+   ```
+2. **`provider_tool_call_id` on `tool_call`.** The CLI's own id for the call (`toolu_…` for
+   Claude Code), the same id the stream's `tool_call` block and `tool_result` carry. It is how the
+   server joins the call it executes to the call it streams. Codex and Gemini report none; a call
+   without it is executed normally and simply gets no view.
+
+```
+Server                                   Bridge (0.27+)                   CLI
+  │──welcome.tools[ … _meta.ui … ]──────────>│──tools/list (with _meta)──────>│
+  │<──tool_call {tool_call_id: tc_7,         │<──tools/call show_grant_request│
+  │     provider_tool_call_id: toolu_01…}────│                                │
+  │  run the handler, keep the full result   │                                │
+  │  under (request, toolu_01…)              │                                │
+  │──tool_resolve {tc_7, result: text}──────>│──────── text ─────────────────>│
+  │<──stream tool_result {toolu_01…}─────────│                                │
+  │  write it to the stream store WITH `ui`  │                                │
+```
+
+The server serves `ui://` resources from its own registry. What the person does in a view never
+travels over this WebSocket and is never a tool call: the host handles a button press itself,
+behind the person's sign-in, so the assistant cannot trigger it. Views for tools of MCP servers
+configured on the machine (`--mcp-upstreams`) arrive differently: see
+[Upstream MCP Apps and OAuth sign-in](#upstream-mcp-apps-and-oauth-sign-in).
+
+**A view that is no longer registered.** History can name a `resource_uri` that a later release
+removed or renamed; `AiBridge::views()->render()` then throws `ViewNotFoundException`. A host
+treats that exactly like a call without a view and draws the call alone.
+
+**When a call shows no view, the stream does not say why.** A missing `provider_tool_call_id`
+(Codex, Gemini, a bridge older than 0.27) only leaves a debug-level line in the server's log
+("tool view not attached"), and a view the server could not keep (over 256 KB, a stream-store
+failure) a warning-level one ("could not keep a tool view"). Nothing else records it.
+
 ### Server → Bridge: `tool_resolve`
 
 After the server executes a tool, it sends the result back:
@@ -1693,6 +1782,192 @@ If a tool execution fails:
 ```
 
 The bridge passes this error back to the CLI, which typically incorporates it into its response ("I'm sorry, I made a mistake with the dice notation...").
+
+---
+
+## Upstream MCP Apps and OAuth sign-in
+
+A bridge started with `--mcp-upstreams` is the MCP client of servers on the operator's
+side. Their tools run on the bridge and never produce a `tool_call`, so the server only
+ever sees two things: the view of such a call (`tool_result.ui` naming a `server`) and,
+through this section's frames, the upstreams' state and their OAuth sign-ins. The
+bridge's side of every frame is specified in ai-bridge's PROTOCOL.md ("MCP Apps" and
+"Upstream sign-in (OAuth)"); this section says what this server does with them. Pairs
+with ai-bridge PR #60.
+
+### Handshake
+
+- **`hello.mcp_apps`** (`{spec, revision}`): the bridge relays `mcp_request`. Without it,
+  `mcp_request` is never sent (the bridge would log it and never answer).
+- **`hello.mcp_upstream_auth`** (`{revision}`): the bridge implements the sign-in frames
+  below. Without it, `upstream_auth_start`, `upstream_auth_code` and `upstream_auth_forget`
+  are never sent. Both are recorded in `last_bridge` and reported on the connection status
+  (`mcp_apps`, `mcp_upstream_auth`).
+- **`welcome.upstream_oauth`** (`{redirect_uri}`): the absolute URL of the callback route
+  (`ai-bridge.upstream-oauth.callback`, default `/ai-bridge/upstream-oauth/callback`),
+  built from `APP_URL` (or `ai-bridge.upstream_oauth.redirect_uri`), never from a request's
+  host: the bridge registers it with the authorization server and keys its client
+  registration on it. Sent to every bridge while `ai-bridge.upstream_oauth.enabled`; absent
+  when off, or when the URL would not be an absolute http(s) one.
+
+### `tool_result.ui` from the bridge
+
+```json
+{ "type": "stream", "request_id": "req_1", "event": "tool_result", "data": {
+  "tool_call_id": "toolu_01AbC", "result": "Shown 3",
+  "ui": { "server": "weather", "tool_name": "show_forecast", "resource_uri": "ui://weather/view.html",
+          "arguments": { "city": "Utrecht" }, "result": { "content": [ ... ], "structuredContent": { ... } } } } }
+```
+
+Taken from the **first** `tool_result` frame of a call only (a `ui` on a later frame is
+ignored even when the first had none), and never for a call whose view the server keeps
+itself (a server tool's call). Kept when it names a `server`,
+a `tool_name`, a `ui://` `resource_uri`, and has object `arguments` and `result`, and is at
+most 256 KB as JSON; otherwise dropped with a log line (the result still goes through). The
+server adds **`connection_id`**: the `ai_bridge_connections` id of the bridge that streamed it
+(whatever the bridge put there is replaced), so a later `mcp_request` goes to the machine that
+made the call. It then travels exactly like a server-built view: on the buffered
+`tool_result` event, on the recorded block (whole or dropped against the turn's budget, never
+cut), and to `onToolResult` as the fifth argument. A server-built view for the same call id
+never overwrites it. A server-built view has no `server` and no `connection_id`.
+
+### Server → Bridge: `mcp_request` / Bridge → Server: `mcp_result`
+
+```json
+{ "type": "mcp_request", "id": "mcp-3f2a…", "server": "weather", "method": "resources/read", "params": { "uri": "ui://weather/view.html" } }
+{ "type": "mcp_result", "id": "mcp-3f2a…", "result": { "contents": [ ... ] } }
+{ "type": "mcp_result", "id": "mcp-3f2a…", "error": "refresh is not callable from a view", "code": "refused" }
+```
+
+The server chooses `id` and answers whoever waits on it. Only `resources/read` of a `ui://`
+uri and `tools/call` (with a `name` and object `arguments`) are sent; anything else is refused
+before it reaches a bridge. `result` is passed on unchanged. `code` is one of `unknown_server`,
+`unavailable`, `timeout`, `refused`, `unsupported`, `upstream_error`; any other value becomes
+`upstream_error`. An answer from another connection than the one asked is ignored.
+
+### Bridge → Server: `upstream_status`
+
+The complete list of upstreams, after `welcome` (only from a bridge with upstreams
+configured: absent means none) and on every change. Each entry is reduced to `server`,
+`transport` (`http`|`stdio`|null), `origin` (scheme, host and port only; null for stdio),
+`auth` (`none`|`secrets`|`oauth`|null), `state` (`connecting`|`connected`|`needs_auth`|
+`unavailable`; anything else reads `unavailable`), `tools` (≥ 0) and `error` (≤ 300
+characters; for `needs_auth` a machine code: `no_token`, `refresh_failed`, `rejected`,
+`no_redirect_uri`, or the last failed sign-in's code). Kept per connection in the serve
+process, reported by `/api/status` as `upstream_status`, stored in `last_bridge` by
+`ConnectionStatus`, and announced as `UpstreamStatusChanged` when it differs from the last.
+
+### Bridge → Server: `upstream_auth_required`
+
+```json
+{ "type": "upstream_auth_required", "server": "kaizen", "state": "Xb3…", "authorization_url": "https://kaizen.example/oauth/authorize?…",
+  "expires_at": "2026-10-16T18:10:00Z", "reason": "no_token" }
+```
+
+Kept as a **pending sign-in** (state → connection key, connection id, server,
+authorization_url, expires_at, reason) in the cache (`ai-bridge.upstream_oauth.cache_store`)
+until `expires_at`, at most 15 minutes. A new one for the same upstream replaces the old one.
+Announced as `UpstreamAuthRequired`, and answers a waiting `upstream_auth_start`. Dropped when
+malformed (state under 16 or over 512 characters, a non-http(s) URL, an unreadable or past
+`expires_at`).
+
+### Server → Bridge: `upstream_auth_start`, `upstream_auth_code`, `upstream_auth_forget`
+
+```json
+{ "type": "upstream_auth_start", "server": "kaizen" }
+{ "type": "upstream_auth_code", "server": "kaizen", "state": "Xb3…", "code": "def50200…", "iss": "https://kaizen.example" }
+{ "type": "upstream_auth_code", "server": "kaizen", "state": "Xb3…", "error": "access_denied", "error_description": "The user denied the request" }
+{ "type": "upstream_auth_forget", "server": "kaizen" }
+```
+
+`upstream_auth_code` carries the redirect's `code`, `iss`, `error` and `error_description`
+as they came, and is only sent after the callback checked the state (below). Two
+`upstream_auth_start` for one upstream of the same bridge while the first is unanswered
+share one frame. The callback claims the pending sign-in atomically (a cache lock) before
+forwarding, so a state is forwarded at most once.
+
+### Bridge → Server: `upstream_auth_result`
+
+With a `state`: answers the callback waiting on that state. Without one (`state: null`):
+answers a waiting `upstream_auth_start`, and is announced as `UpstreamAuthCompleted`
+(failed, `userId` null), because it may also be a sign-in the bridge could not prepare on
+its own after connecting, which nobody waits for. `code` is passed when it is one of
+`unknown_server`, `not_oauth`, `unknown_state`, `denied`, `no_redirect_uri`,
+`discovery_failed`, `registration_failed`, `exchange_failed`, `issuer_mismatch`; otherwise
+`failed`.
+
+### The callback
+
+`GET /ai-bridge/upstream-oauth/callback?state=…&code=…[&iss=…]` (or `&error=…`), behind
+`ai-bridge.upstream_oauth.middleware` (`web`, `auth`):
+
+1. The state must name a pending sign-in: else **404**. Expired: **404**. Its connection
+   must be one the connections resolver gives the signed-in person (a bridge without a
+   connection row: the person whose id is its key): else **403**. Nothing is forwarded in
+   these cases. Neither `code` nor `error`: **400**.
+2. The pending sign-in is forgotten (a state is used once) and `upstream_auth_code` is sent.
+3. The serve process waits up to `ai-bridge.upstream_oauth.callback_timeout` (15 s) for the
+   `upstream_auth_result` with that state.
+4. A small view (`ai-bridge::upstream-oauth.result`, overridable) says "Connected — you can
+   close this tab" (**200**) or the error: the bridge's refusal (**400**, `denied` among
+   them), no answer (**504**, `timeout`), or bridge / serve process unreachable (**502**).
+   `UpstreamAuthCompleted` is fired with the outcome.
+
+### The serve process's internal API
+
+The web process reaches the serve process over its internal HTTP API with a relay token
+whose `sub` is the connection key, like `/api/request/input`; the serve process sends the
+frame on that bridge's socket and holds the response open until the bridge answers (matched
+by id or state, and by connection), the bridge drops (**404** `not_connected`), or the
+timeout fires (**504**). A bridge without the needed hello field: **409**
+`mcp_apps_unsupported` / `mcp_upstream_auth_unsupported`.
+
+| Endpoint | Body | Answer |
+|---|---|---|
+| `POST /api/mcp` | `{server, method, params}` | `{ok: true, result}` or `{ok: false, code, error}`; waits `ai-bridge.server.mcp_request_timeout` (65 s) |
+| `POST /api/upstream/auth-start` | `{server}` | `{ok: true, server, authorization_url, expires_at, reason}` or `{ok: false, server, code, error}`; 504 `no_answer` after `start_timeout` (20 s) |
+| `POST /api/upstream/auth-code` | `{server, state, code?, iss?, error?, error_description?}` | `{ok, server, code?, error?}`; 504 `timeout` after `callback_timeout` |
+| `POST /api/upstream/auth-forget` | `{server}` | `{sent: true}` once written (the bridge answers only with a new `upstream_status`) |
+| `GET /api/status` | | adds `upstream_status`, and `bridge.mcp_upstream_auth` |
+
+### The PHP API and the JSON routes
+
+`AiBridge::upstreams()` (`Upstreams\UpstreamClient`) wraps the internal API for a
+`Connection` the caller already resolved through its own scope:
+
+- `status($connection)`: `{connected, mcp_apps, mcp_upstream_auth, upstreams, pending}`
+- `pending($connection)`: `[{connection_id, server, authorization_url, expires_at, reason}]`
+- `startSignIn($connection, $server)`: the start's answer
+- `forget($connection, $server)`: bool, and drops the upstream's pending sign-in
+- `mcpRequest($connection, $server, $method, $params, $timeout = null, $toolCallId = null)`:
+  the result, or throws `McpRequestFailed` (`errorCode`: the bridge's code, or
+  `invalid_request`, `unknown_view`, `not_connected`, `mcp_apps_unsupported`, `unreachable`);
+  fires `McpRequestRelayed` (user, connection, server, method, tool name or uri, outcome,
+  duration) every time. Also `AiBridge::mcpRequest()`. With `$toolCallId` the request is
+  held to that call's view: refused (`refused`) unless `$server` is the server its `ui`
+  named on this connection, `unknown_view` when none was recorded (looked up in the cache,
+  kept `ai-bridge.upstream_oauth.view_ttl`, then in the connection's recorded blocks). A
+  host takes `server` from the view's `ui.server` and passes `tool_call_id`. Views of a
+  bridge with no connection row carry `connection_id: null` and cannot be relayed through
+  the route.
+
+Beside the connection routes, behind `ai-bridge.route_middleware` and the connections
+resolver:
+
+| Route | Name |
+|---|---|
+| `GET /ai-bridge/connections/{id}/upstreams` | `ai-bridge.upstreams.index` |
+| `GET /ai-bridge/connections/{id}/upstreams/pending` | `ai-bridge.upstreams.pending` |
+| `POST /ai-bridge/connections/{id}/upstreams/{server}/sign-in` | `ai-bridge.upstreams.sign-in` |
+| `DELETE /ai-bridge/connections/{id}/upstreams/{server}/sign-in` | `ai-bridge.upstreams.forget` |
+| `POST /ai-bridge/connections/{id}/mcp` (`{server, method, params, tool_call_id?}`, 30/min) | `ai-bridge.upstreams.mcp` |
+
+These run in the `api` group and check no CSRF token of their own; a host using session
+cookies must add CSRF protection (Sanctum stateful auth, or middleware) or call the PHP API
+from its own protected routes.
+
+Drawing the card, asking the person's consent for a view's CSP or permissions, and what a
+button means stay with the host.
 
 ---
 
@@ -1898,6 +2173,10 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `turn_input_ack` | Answering a `turn_input` |
 | `upload_done` | The one answer to an `upload_offer` |
 | `file_read_result` | Answering a `file_read` |
+| `mcp_result` | Answering an `mcp_request` |
+| `upstream_status` | The complete list of upstream MCP servers, on every change |
+| `upstream_auth_required` | An upstream needs the person to sign in |
+| `upstream_auth_result` | How a sign-in ended, or why one could not start |
 | `error` | Request-level error (non-streaming) |
 
 ### Server → Bridge
@@ -1914,6 +2193,8 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `turn_input` | A message for a turn that is still running |
 | `upload_offer` / `upload_sent` / `upload_abort` | A person's file on its way to the machine |
 | `file_read` / `file_read_cancel` | Asking for a file the machine recorded |
+| `mcp_request` | A view's `resources/read` or `tools/call` for an upstream (needs `hello.mcp_apps`) |
+| `upstream_auth_start` / `upstream_auth_code` / `upstream_auth_forget` | Upstream OAuth sign-in (needs `hello.mcp_upstream_auth`) |
 
 ---
 
@@ -1959,6 +2240,8 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 - `1.x` — Stable, semantic versioning applies
 
 **Helper activity does not bump the version either.** `parent_tool_use_id` on `block_start` and `tool_result`, the `task` stream event and `done.subagent_stats` are additive: absent means what it always meant, and a consumer ignores an event it does not know.
+
+**Upstream MCP Apps and sign-in do not bump the version.** `hello.mcp_upstream_auth`, `welcome.upstream_oauth`, `tool_result.ui.server`, `mcp_request` / `mcp_result` and the `upstream_*` frames are additive; a server sends none of its frames to a bridge that did not announce the matching hello field, and an older bridge ignores `welcome.upstream_oauth`.
 
 **Workspaces, attachments and `workspace` isolation do not bump the version.** They stay on `0.1`, deliberately. Every one of them is optional in both directions — `hello.workspaces`, `ai_request.working_dir`, `ai_request.attachments`, the `attachment` stream event and the `workspace` value of `cli_isolation` are all additive, and both ends already ignore fields they do not recognise. Only the major number is enforced, so a bump would refuse every bridge already installed in exchange for nothing.
 

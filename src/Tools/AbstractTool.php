@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tetrix\AiBridge\Tools;
 
+use Tetrix\AiBridge\Contracts\HasView;
 use Tetrix\AiBridge\Contracts\ToolHandler;
 
 /**
@@ -43,7 +44,7 @@ use Tetrix\AiBridge\Contracts\ToolHandler;
  *       }
  *   }
  */
-abstract class AbstractTool implements ToolHandler
+abstract class AbstractTool implements HasView, ToolHandler
 {
     /**
      * Get the tool's unique name.
@@ -72,6 +73,17 @@ abstract class AbstractTool implements ToolHandler
      * @return mixed  The result to send back to the AI. Must be JSON-serializable.
      */
     abstract public function handle(array $params): mixed;
+
+    /**
+     * The `ui://` URI of this tool's view (an MCP App), or null for none (the default).
+     *
+     * Override to give the tool a view; register the view's HTML in `AiBridge::views()`
+     * and return a {@see ToolResult::withView()} from handle().
+     */
+    public function view(): ?string
+    {
+        return null;
+    }
 
     /**
      * Get the JSON Schema describing the tool's parameters.

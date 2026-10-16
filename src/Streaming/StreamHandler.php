@@ -8,7 +8,9 @@ use Closure;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
+use Tetrix\AiBridge\Contracts\StoresStreamValues;
 use Tetrix\AiBridge\Contracts\StreamableProvider;
+use Tetrix\AiBridge\Contracts\StreamStoreContract;
 use Tetrix\AiBridge\Enums\BlockType;
 use Tetrix\AiBridge\Enums\ProviderMode;
 use Tetrix\AiBridge\Enums\TerminatedBy;
@@ -28,8 +30,8 @@ use Tetrix\AiBridge\Protocol\StreamEvent;
  *   $stream->onBlockStart(fn (StreamEvent $e) => ...);
  *   $stream->onBlockDelta(fn (StreamEvent $e) => ...);
  *   $stream->onBlockStop(fn (StreamEvent $e) => ...);
- *   $stream->onToolCall(fn (string $name, array $params, string $callId) => ...);
- *   $stream->onToolResult(fn (string $callId, mixed $result, ?bool $isError, ?string $parentToolUseId) => ...);
+ *   $stream->onToolCall(fn (string $name, array $params, string $callId, ?string $providerToolCallId) => ...);
+ *   $stream->onToolResult(fn (string $callId, mixed $result, ?bool $isError, ?string $parentToolUseId, ?array $ui) => ...);
  *   $stream->onTask(fn (array $task) => ...);
  *   $stream->onDone(fn (?array $usage) => ...);
  *   $stream->onError(fn (string $code, string $message) => ...);
@@ -117,6 +119,18 @@ class StreamHandler
      */
     private const MAX_OPEN_RESULT_BUFFERS = 64;
 
+    /**
+     * The largest view a tool call may carry, as its JSON (256 KB), whether the server built
+     * it or a bridge sent it for an upstream tool.
+     *
+     * #11494: the chat refuses to draw a larger `ui` (McpApps::MAX_UI_BYTES in zeroplex/ai), so
+     * keeping one only costs memory for a card nobody will see.
+     */
+    public const MAX_TOOL_VIEW_BYTES = 262144;
+
+    /** The most upstream views held at once, waiting for their result to be dispatched. */
+    private const MAX_UPSTREAM_VIEWS = 64;
+
     /** Bytes held across every open buffer, so the aggregate can be checked. */
     private int $toolResultBytes = 0;
 
@@ -176,6 +190,34 @@ class StreamHandler
 
     /** @var list<string>|null */
     private ?array $allowedTools = null;
+
+    /**
+     * The CLI call ids whose execution kept a view's result in the stream store.
+     *
+     * Only these are looked up when their `tool_result` arrives, so a turn full of
+     * results without a view costs no store read at all.
+     *
+     * @var array<string, true>
+     */
+    private array $expectedViews = [];
+
+    /**
+     * Views a bridge sent on the first `tool_result` of a call to an upstream tool
+     * (`tool_result.ui` naming a `server`), by call id, until that result is dispatched.
+     * Never taken for a call whose view the server keeps itself (a server tool), so the
+     * two cannot meet on one call id.
+     *
+     * @var array<string, array<string, mixed>>
+     */
+    private array $upstreamViews = [];
+
+    /**
+     * The call ids whose first tool_result frame has arrived. Only that first frame may
+     * carry an upstream view; a `ui` on any later frame is ignored.
+     *
+     * @var array<string, true>
+     */
+    private array $seenToolResults = [];
 
     public readonly string $requestId;
 
@@ -283,6 +325,10 @@ class StreamHandler
      * the spawning call when the call was a helper's (sub-agent's), and null
      * for the main assistant's own calls. A callback declaring only the first
      * three parameters keeps working: PHP drops the extra argument.
+     *
+     * A fifth argument, ?array $ui, is the view of a server tool that has one
+     * (`resource_uri`, `tool_name`, `arguments`, `result`; see PROTOCOL.md), and
+     * null for every other result.
      */
     public function onToolResult(Closure $callback): static
     {
@@ -555,15 +601,127 @@ class StreamHandler
     /**
      * Dispatch a tool_call event to all registered callbacks.
      *
+     * `$providerToolCallId` is the CLI's own id for the call (`toolu_…`), which the
+     * bridge reports from 0.27; null when it did not. Callbacks receive it fourth.
+     *
      * @internal Called by StreamableProvider implementations.
      */
-    public function dispatchToolCall(string $toolName, array $params, string $callId): void
+    public function dispatchToolCall(string $toolName, array $params, string $callId, ?string $providerToolCallId = null): void
     {
         if ($this->cancelled || $this->terminated) {
             return;
         }
 
-        $this->dispatchCallbacks($this->toolCallCallbacks, [$toolName, $params, $callId], 'toolCall');
+        $this->dispatchCallbacks($this->toolCallCallbacks, [$toolName, $params, $callId, $providerToolCallId], 'toolCall');
+    }
+
+    /**
+     * Note that a view's result was kept for this CLI call id, so its `tool_result`
+     * is looked up in the stream store and carries `ui`.
+     *
+     * @internal Called by MessageHandler after executing a tool with a view.
+     */
+    public function expectToolView(string $providerToolCallId): void
+    {
+        $this->expectedViews[$providerToolCallId] = true;
+    }
+
+    /**
+     * The view kept for this call, read once from the stream store.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function takeToolView(string $toolCallId): ?array
+    {
+        if (isset($this->upstreamViews[$toolCallId])) {
+            $ui = $this->upstreamViews[$toolCallId];
+            unset($this->upstreamViews[$toolCallId], $this->expectedViews[$toolCallId]);
+
+            return $ui;
+        }
+
+        if (! isset($this->expectedViews[$toolCallId])) {
+            return null;
+        }
+        unset($this->expectedViews[$toolCallId]);
+
+        try {
+            $store = app(StreamStoreContract::class);
+
+            return $store instanceof StoresStreamValues
+                ? $store->getValue($this->requestId, self::toolViewKey($toolCallId))
+                : null;
+        } catch (\Throwable $e) {
+            // A view not shown is the worst case; the result itself still goes through.
+            Log::warning('AI Bridge: could not read a tool view', [
+                'request_id' => $this->requestId,
+                'tool_call_id' => $toolCallId,
+                'error' => $e->getMessage(),
+            ]);
+
+            return null;
+        }
+    }
+
+    /**
+     * Keep the view a bridge sent with an upstream tool's result, when it is one.
+     *
+     * Checked here because it arrives from a machine: an array naming its `server`,
+     * `tool_name` and a `ui://` `resource_uri`, with `arguments` and `result` objects, at most
+     * MAX_TOOL_VIEW_BYTES as JSON. Anything else is dropped with a log line, and the result
+     * itself still goes through. `connection_id` is the one MessageHandler stamped.
+     */
+    private function keepUpstreamView(string $toolCallId, mixed $ui): void
+    {
+        $valid = is_array($ui)
+            && is_string($ui['server'] ?? null) && $ui['server'] !== '' && strlen($ui['server']) <= 128
+            && is_string($ui['tool_name'] ?? null) && $ui['tool_name'] !== ''
+            && is_string($ui['resource_uri'] ?? null) && str_starts_with(strtolower($ui['resource_uri']), 'ui://')
+            && is_array($ui['arguments'] ?? [])
+            && is_array($ui['result'] ?? null);
+
+        if (! $valid) {
+            Log::warning('AI Bridge: a tool_result carried a ui that is not an upstream view, dropped', [
+                'request_id' => $this->requestId,
+                'tool_call_id' => $toolCallId,
+            ]);
+
+            return;
+        }
+
+        $view = [
+            'server' => $ui['server'],
+            'tool_name' => $ui['tool_name'],
+            'resource_uri' => $ui['resource_uri'],
+            'arguments' => $ui['arguments'] ?? [],
+            'result' => $ui['result'],
+            'connection_id' => is_int($ui['connection_id'] ?? null) ? $ui['connection_id'] : null,
+        ];
+
+        $size = strlen((string) json_encode($view, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        if ($size > self::MAX_TOOL_VIEW_BYTES || count($this->upstreamViews) >= self::MAX_UPSTREAM_VIEWS) {
+            Log::warning('AI Bridge: an upstream tool view was not kept', [
+                'request_id' => $this->requestId,
+                'tool_call_id' => $toolCallId,
+                'bytes' => $size,
+                'reason' => $size > self::MAX_TOOL_VIEW_BYTES ? 'too_large' : 'too_many',
+            ]);
+
+            return;
+        }
+
+        $this->upstreamViews[$toolCallId] = $view;
+
+        // Remembered so a later mcp_request naming this call can be held to its server.
+        if ($view['connection_id'] !== null) {
+            \Tetrix\AiBridge\Upstreams\UpstreamViews::remember($view['connection_id'], $toolCallId, $view['server']);
+        }
+    }
+
+    /** The stream-store key a view's result is kept under, per CLI call id. */
+    public static function toolViewKey(string $providerToolCallId): string
+    {
+        return 'tool_view:'.$providerToolCallId;
     }
 
     /**
@@ -747,6 +905,23 @@ class StreamHandler
         $toolCallId = (string) ($data['tool_call_id'] ?? $data['call_id'] ?? '');
         $isError = is_bool($data['is_error'] ?? null) ? $data['is_error'] : null;
         $parent = self::parentOf($data);
+
+        // An upstream tool's view rides on the first frame of its result only, and never on
+        // a server tool's call (one whose view the server keeps itself): a bridge must not
+        // be able to put its own card on the server's tool.
+        if ($toolCallId !== '' && ! isset($this->seenToolResults[$toolCallId])) {
+            $this->seenToolResults[$toolCallId] = true;
+            if (array_key_exists('ui', $data)) {
+                if (isset($this->expectedViews[$toolCallId])) {
+                    Log::warning('AI Bridge: a bridge sent a ui for a server tool\'s call, ignored', [
+                        'request_id' => $this->requestId,
+                        'tool_call_id' => $toolCallId,
+                    ]);
+                } else {
+                    $this->keepUpstreamView($toolCallId, $data['ui']);
+                }
+            }
+        }
 
         if (! is_int($data['chunk_index'] ?? null)) {
             // An unchunked result supersedes anything half-assembled for the
@@ -956,7 +1131,7 @@ class StreamHandler
 
             $this->dispatchCallbacks(
                 $this->toolResultCallbacks,
-                [$toolCallId, $assembled['result'], $assembled['is_error'], $assembled['parent']],
+                [$toolCallId, $assembled['result'], $assembled['is_error'], $assembled['parent'], $this->takeToolView($toolCallId)],
                 'toolResult',
             );
         }
@@ -978,7 +1153,7 @@ class StreamHandler
             'tool_call_id' => $toolCallId,
         ]);
 
-        $this->dispatchCallbacks($this->toolResultCallbacks, [$toolCallId, $result, $isError, $parentToolUseId], 'toolResult');
+        $this->dispatchCallbacks($this->toolResultCallbacks, [$toolCallId, $result, $isError, $parentToolUseId, $this->takeToolView($toolCallId)], 'toolResult');
     }
 
     /**
@@ -1059,6 +1234,8 @@ class StreamHandler
                 $event->data['tool_name'],
                 $event->data['parameters'] ?? [],
                 $event->data['tool_call_id'] ?? $event->data['call_id'] ?? '',
+                // #11493: a raw tool_call event keeps the CLI's own call id too.
+                is_string($event->data['provider_tool_call_id'] ?? null) ? $event->data['provider_tool_call_id'] : null,
             ),
             MessageTypes::TOOL_RESULT => $this->receiveToolResult($event->data),
             MessageTypes::RATE_LIMIT => $this->dispatchRateLimit(

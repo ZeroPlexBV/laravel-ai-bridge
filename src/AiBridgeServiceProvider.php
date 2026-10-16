@@ -17,6 +17,7 @@ use Tetrix\AiBridge\Http\Middleware\ValidateBridgeToken;
 use Tetrix\AiBridge\Streaming\StreamStoreManager;
 use Tetrix\AiBridge\Tools\ToolContext;
 use Tetrix\AiBridge\Tools\ToolRegistry;
+use Tetrix\AiBridge\Tools\ViewRegistry;
 use Tetrix\AiBridge\WebSocket\BridgeConnectionManager;
 use Tetrix\AiBridge\WebSocket\MessageHandler;
 
@@ -48,6 +49,9 @@ class AiBridgeServiceProvider extends ServiceProvider
         $this->app->singleton(ToolRegistry::class, function () {
             return new ToolRegistry();
         });
+
+        // The ui:// views tools name, registered at boot like the tools themselves.
+        $this->app->singleton(ViewRegistry::class);
 
         // The current tool-call's conversation, injected by the runtime around
         // each execution so handlers can scope their work without the AI knowing.
@@ -86,6 +90,11 @@ class AiBridgeServiceProvider extends ServiceProvider
                 $app->make(TokenManager::class),
             );
         });
+
+        // Upstream MCP servers: pending OAuth sign-ins (cache-backed, shared by the serve
+        // and web processes) and the PHP API that reaches the serve process for them.
+        $this->app->singleton(\Tetrix\AiBridge\Upstreams\PendingSignIns::class);
+        $this->app->singleton(\Tetrix\AiBridge\Upstreams\UpstreamClient::class);
 
         // StreamStore — driver-based per-turn event buffer. Bound by the
         // manager so apps may register additional drivers via
