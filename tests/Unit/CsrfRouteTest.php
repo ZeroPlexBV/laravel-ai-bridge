@@ -51,6 +51,28 @@ function upstreamRoutes(): array
     ];
 }
 
+/** The framework CSRF middleware class the package's check extends. */
+function csrfBase(): string
+{
+    return get_parent_class(\Tetrix\AiBridge\Http\Middleware\Csrf\FrameworkCsrfCheck::class);
+}
+
+/** Apply the app's global CSRF settings (static) for $run, then reset them. */
+function withGlobalCsrfSettings(callable $apply, callable $run): void
+{
+    $apply();
+    try {
+        $run();
+    } finally {
+        $base = csrfBase();
+        if (method_exists($base, 'flushState')) {
+            $base::flushState();
+        } else {
+            (new ReflectionProperty($base, 'neverVerify'))->setValue(null, []);
+        }
+    }
+}
+
 beforeEach(function () {
     config(['app.key' => 'base64:'.base64_encode(random_bytes(32))]);
     app(AiBridgeManager::class)->resolveConnectionsUsing(fn ($request) => Connection::query());
@@ -132,20 +154,58 @@ describe('a session-authenticated request (route_middleware web + auth)', functi
         callUpstream($this, $route)->assertOk();
     })->with(array_keys(upstreamRoutes()));
 
-    it('passes a browser-set Sec-Fetch-Site: same-origin, as Laravel 13 does', function () {
+    it('passes a browser-set Sec-Fetch-Site: same-origin', function () {
         $this->actingAs($this->person)
             ->withSession(['_token' => CSRF_TOKEN])
             ->withCookie('laravel_session', 'x')->withCredentials();
 
         callUpstream($this, 'mcp', ['Sec-Fetch-Site' => 'same-origin'])->assertOk();
-    })->skip(! class_exists(\Illuminate\Foundation\Http\Middleware\PreventRequestForgery::class), 'Laravel 12 has no origin check');
+    });
 
-    it('does not trust Sec-Fetch-Site: same-site unless the app allowed it', function () {
+    it('does not trust Sec-Fetch-Site: same-site, even when the app allowed it globally', function () {
         $this->actingAs($this->person)
             ->withSession(['_token' => CSRF_TOKEN])
             ->withCookie('laravel_session', 'x')->withCredentials();
 
         callUpstream($this, 'mcp', ['Sec-Fetch-Site' => 'same-site'])->assertStatus(419);
+
+        withGlobalCsrfSettings(function () {
+            if (method_exists(csrfBase(), 'allowSameSite')) {
+                csrfBase()::allowSameSite();
+            }
+        }, function () {
+            callUpstream($this, 'mcp', ['Sec-Fetch-Site' => 'same-site'])->assertStatus(419);
+            callUpstream($this, 'sign-in', ['Sec-Fetch-Site' => 'same-site'])->assertStatus(419);
+        });
+    });
+
+    it('ignores the app\'s global CSRF exceptions on the upstream routes', function (string $route) {
+        $this->actingAs($this->person)
+            ->withSession(['_token' => CSRF_TOKEN])
+            ->withCookie('laravel_session', 'x')->withCredentials();
+
+        withGlobalCsrfSettings(fn () => csrfBase()::except(['ai-bridge/*', '*']), function () use ($route) {
+            callUpstream($this, $route)->assertStatus(419);
+        });
+    })->with(array_keys(upstreamRoutes()));
+});
+
+describe('a user signed in by cookie without a session (remember-me, route_middleware auth only)', function () {
+    it('is refused: there is no session to hold a token', function (string $route) {
+        // The web (session) guard holds a user, as after a remember_web_* cookie.
+        $this->actingAs($this->person)->withUnencryptedCookie('remember_web_x', '7|token|hash')->withCredentials();
+
+        callUpstream($this, $route)->assertStatus(419);
+        callUpstream($this, $route, ['X-CSRF-TOKEN' => CSRF_TOKEN])->assertStatus(419);
+    })->with(array_keys(upstreamRoutes()));
+
+    it('passes without cookies, and when ai-bridge.csrf.upstreams is off', function () {
+        $this->actingAs($this->person);
+        callUpstream($this, 'mcp')->assertOk();
+
+        config(['ai-bridge.csrf.upstreams' => false]);
+        $this->withUnencryptedCookie('remember_web_x', '7|token|hash')->withCredentials();
+        callUpstream($this, 'mcp')->assertOk();
     });
 });
 
@@ -162,9 +222,15 @@ describe('a session started by the api group itself (route_middleware StartSessi
     });
 });
 
-describe('a request authenticated without a session (route_middleware auth only, e.g. a bearer token)', function () {
+describe('a request authenticated by a token guard (route_middleware auth:pat, a bearer token)', function () {
+    beforeEach(function () {
+        \Illuminate\Support\Facades\Auth::viaRequest('ai-bridge-test-token', fn ($request) => $request->bearerToken() === '1|personal-access-token' ? new GenericUser(['id' => 7]) : null);
+        config(['auth.guards.pat' => ['driver' => 'ai-bridge-test-token']]);
+        csrfRoutesUnder(['auth:pat']);
+    });
+
     it('passes without a CSRF token, even carrying cookies', function (string $route) {
-        $this->actingAs($this->person)->withUnencryptedCookie('laravel_session', 'x')->withCredentials();
+        $this->withUnencryptedCookie('laravel_session', 'x')->withCredentials();
 
         callUpstream($this, $route, ['Authorization' => 'Bearer 1|personal-access-token'])->assertOk();
     })->with(array_keys(upstreamRoutes()));
@@ -203,6 +269,18 @@ describe('the other state-changing routes (ai-bridge.csrf.routes, opt-in)', func
         $this->json($method, $uri)->assertStatus(419);
         expect($this->json($method, $uri, [], ['X-CSRF-TOKEN' => CSRF_TOKEN])->status())->not->toBe(419);
     })->with($others);
+
+    it('follow the app\'s global CSRF exceptions, unlike the upstream routes', function () {
+        config(['ai-bridge.csrf.routes' => true]);
+        $this->actingAs($this->person)
+            ->withSession(['_token' => CSRF_TOKEN])
+            ->withCookie('laravel_session', 'x')->withCredentials();
+
+        withGlobalCsrfSettings(fn () => csrfBase()::except(['ai-bridge/*']), function () {
+            expect($this->postJson('/ai-bridge/conversations')->status())->not->toBe(419);
+            callUpstream($this, 'mcp')->assertStatus(419);
+        });
+    });
 
     it('leave the reading routes alone', function () {
         config(['ai-bridge.csrf.routes' => true]);

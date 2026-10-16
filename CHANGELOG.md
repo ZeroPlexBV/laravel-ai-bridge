@@ -16,9 +16,13 @@ Hardens the upstream routes added in 0.19 (decision 0009).
   stateful SPA auth) a page on any same-site subdomain could make a signed-in browser call an
   upstream tool or start and forget sign-ins. A new middleware, `ai-bridge.csrf`, now requires
   the session's CSRF token (`X-CSRF-TOKEN`, `_token` or `X-XSRF-TOKEN`, compared by Laravel's own
-  CSRF middleware on Laravel 12 and 13) on every request that rides on cookies, answering
-  `419 {"code": "csrf_token_mismatch"}`. Requests without a session or without cookies (bearer
-  tokens, Sanctum personal access tokens, server-to-server) pass unchanged.
+  CSRF middleware on Laravel 12 and 13) on every request that rides on cookies (a cookie plus a
+  started session, or a user signed in by a session guard without one, e.g. remember-me),
+  answering `419 {"code": "csrf_token_mismatch"}`. On these routes the app's global CSRF
+  exceptions and `allowSameSite()` are ignored; only a browser-set `Sec-Fetch-Site:
+  same-origin` passes without a token. Requests without cookies, or authenticated by a token
+  guard without a session (bearer tokens, Sanctum personal access tokens, server-to-server),
+  pass unchanged. Requires `laravel/framework` (without it every checked request is 419).
 
 ### Changed
 
@@ -28,9 +32,9 @@ Hardens the upstream routes added in 0.19 (decision 0009).
   held to the view that makes it. `AiBridge::mcpRequest()` / `UpstreamClient::mcpRequest()` keep
   `$toolCallId` optional for trusted server code; a host relaying a browser's request must pass
   it.
-- The reference chat UI sends the CSRF token (`csrf-token` attribute set by
-  `<x-ai-bridge::chat />`, else `<meta name="csrf-token">`, else the `XSRF-TOKEN` cookie) on
-  every state-changing request.
+- The reference chat UI sends the CSRF token on every state-changing request, read on each
+  request: the `XSRF-TOKEN` cookie when present, else the `csrf-token` attribute set by
+  `<x-ai-bridge::chat />`, else `<meta name="csrf-token">`.
 
 ### Added
 
@@ -38,7 +42,8 @@ Hardens the upstream routes added in 0.19 (decision 0009).
   upstream routes' CSRF check off only when the app protects them itself.
 - Config `ai-bridge.csrf.routes` (`AI_BRIDGE_CSRF_ROUTES`, default `false`): the same check on
   every other state-changing browser route (token, `stream/sse`, conversations POST/DELETE/stream,
-  connections POST/PATCH/DELETE/regenerate, streams abort). Opt in now; it becomes the default in
+  connections POST/PATCH/DELETE/regenerate, streams abort), following the app's global CSRF
+  exceptions and origin settings. Opt in now; it becomes the default in
   the next major version.
 
 ### Upgrading
@@ -47,7 +52,7 @@ Hardens the upstream routes added in 0.19 (decision 0009).
   (e.g. `X-CSRF-TOKEN` from `<meta name="csrf-token">`; axios sends `X-XSRF-TOKEN` by itself),
   and must send `tool_call_id` on `…/mcp`.
 
-## [Unreleased] — to be released as 0.20.0
+## [0.20.0] — 2026-10-16
 
 ### Added
 
@@ -79,7 +84,7 @@ Hardens the upstream routes added in 0.19 (decision 0009).
 
 No migration, no config change.
 
-## [Unreleased] — to be released as 0.19.0
+## [0.19.0] — 2026-10-16
 
 Upstream MCP Apps and OAuth sign-in for the MCP servers a bridge connects to
 (`--mcp-upstreams`). Pairs with tetrixdev/ai-bridge PR #60.
@@ -126,7 +131,7 @@ Upstream MCP Apps and OAuth sign-in for the MCP servers a bridge connects to
   add CSRF protection (Sanctum stateful auth, or middleware) or call the PHP API from your own
   routes. `ai-bridge:serve` warns when the sign-in cache store is `array`.
 
-## [Unreleased] — to be released as 0.18.0
+## [0.18.0] — 2026-10-16
 
 The MCP App cards built in the ZeroPlexBV fork (D09346, released there as
 `zeroplex/laravel-ai-bridge` 0.18.0) merged back, without the package rename: the package stays

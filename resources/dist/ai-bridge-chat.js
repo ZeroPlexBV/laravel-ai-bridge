@@ -167,11 +167,6 @@
             this.api = this.getAttribute('api') || '/ai-bridge';
             this.assets = this.getAttribute('assets') || (this.api + '/assets');
             this.thinkingVisible = this.getAttribute('thinking-visible') !== 'false';
-            // CSRF token for the state-changing routes (ai-bridge.csrf, decision 0009):
-            // the csrf-token attribute <x-ai-bridge::chat /> sets, else the page's
-            // <meta name="csrf-token">.
-            this.csrfToken = this.getAttribute('csrf-token')
-                || document.querySelector('meta[name="csrf-token"]')?.content || '';
 
             this.s = {
                 conversations: [], connections: [], activeId: null, conv: null,
@@ -267,15 +262,19 @@
 
         // ── HTTP ──────────────────────────────────────────────────────
         // Headers every request sends: JSON, plus the CSRF token the package checks on
-        // state-changing routes for session-cookie requests. Without a token on the page,
-        // Laravel's XSRF-TOKEN cookie (when readable) goes as X-XSRF-TOKEN instead.
+        // state-changing routes for session-cookie requests (ai-bridge.csrf, decision 0009).
+        // Read on every request, so a rotated token (a re-login regenerates it) is picked
+        // up: Laravel's XSRF-TOKEN cookie when present, sent as X-XSRF-TOKEN; else the
+        // csrf-token attribute <x-ai-bridge::chat /> sets, else <meta name="csrf-token">.
         jsonHeaders(extra = {}) {
             const h = { 'Content-Type': 'application/json', ...extra };
-            if (this.csrfToken) {
-                h['X-CSRF-TOKEN'] = this.csrfToken;
+            const m = document.cookie.match(/(?:^|;\s*)XSRF-TOKEN=([^;]+)/);
+            if (m) {
+                h['X-XSRF-TOKEN'] = decodeURIComponent(m[1]);
             } else {
-                const m = document.cookie.match(/(?:^|;\s*)XSRF-TOKEN=([^;]+)/);
-                if (m) h['X-XSRF-TOKEN'] = decodeURIComponent(m[1]);
+                const t = this.getAttribute('csrf-token')
+                    || document.querySelector('meta[name="csrf-token"]')?.content;
+                if (t) h['X-CSRF-TOKEN'] = t;
             }
             return h;
         }

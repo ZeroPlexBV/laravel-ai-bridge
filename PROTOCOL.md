@@ -1970,12 +1970,14 @@ answer is `422 {"code": "tool_call_id_required"}` and nothing is relayed.
 
 The three state-changing routes (`…/mcp`, `POST` and `DELETE …/sign-in`) carry the package's
 CSRF check (middleware `ai-bridge.csrf:upstreams`, config `ai-bridge.csrf.upstreams`, default
-on): a request that rides on cookies (a started session and at least one cookie) must carry
-the session's CSRF token as `X-CSRF-TOKEN`, `_token` or `X-XSRF-TOKEN`, compared by Laravel's
-own CSRF middleware, or it is answered `419 {"code": "csrf_token_mismatch", "message": "CSRF
-token mismatch."}`. A request without a session or without cookies (a bearer token) passes.
-`ai-bridge.csrf.routes` (default off) puts the same check on the package's other
-state-changing browser routes.
+on): a request that rides on cookies (at least one cookie, and a started session or a user
+held by a session guard) must carry the session's CSRF token as `X-CSRF-TOKEN`, `_token` or
+`X-XSRF-TOKEN`, compared by Laravel's own CSRF middleware, or come with a browser-set
+`Sec-Fetch-Site: same-origin`; otherwise it is answered `419 {"code": "csrf_token_mismatch",
+"message": "CSRF token mismatch."}`. The app's global CSRF exceptions and `allowSameSite()` do
+not apply here. A request without cookies, or authenticated by a token guard without a session
+(a bearer token), passes. `ai-bridge.csrf.routes` (default off) puts the same check on the
+package's other state-changing browser routes, following the app's global CSRF settings.
 
 Drawing the card, asking the person's consent for a view's CSP or permissions, and what a
 button means stay with the host.

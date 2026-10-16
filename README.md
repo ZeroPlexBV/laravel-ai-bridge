@@ -873,21 +873,31 @@ people in there (`'web'`, the cookie + session stack above, or Sanctum's statefu
 SameSite=Lax cookies go along with requests from any page on the same site, a sibling
 subdomain included. So the package checks the token itself (middleware `ai-bridge.csrf`):
 
-- **What is checked:** a request that rides on cookies, meaning a session was started for it
-  and it carries a cookie. It must carry the session's CSRF token the Laravel way: an
+- **What is checked:** a request that rides on cookies: it carries a cookie, and either a
+  session was started for it or a session guard signed someone in without one (a remember-me
+  cookie, Basic auth). It must carry the session's CSRF token the Laravel way: an
   `X-CSRF-TOKEN` header, a `_token` field, or `X-XSRF-TOKEN` with the value of Laravel's
-  `XSRF-TOKEN` cookie. Laravel's own CSRF middleware does the comparing, so its global
-  exceptions apply and on Laravel 13 a browser-set `Sec-Fetch-Site: same-origin` is accepted
-  as well. Missing or wrong: `419 {"code": "csrf_token_mismatch", "message": "CSRF token mismatch."}`.
-- **What passes:** a request with no started session or no cookie at all, e.g. a bearer token
-  (Sanctum personal access token, `auth:api`) or a server-to-server call: nothing a forging
-  page could make the browser add.
+  `XSRF-TOKEN` cookie, compared by Laravel's own CSRF middleware. A browser-set
+  `Sec-Fetch-Site: same-origin` is accepted too. Without a session there is no token to send,
+  so such a request is always refused. Missing or wrong:
+  `419 {"code": "csrf_token_mismatch", "message": "CSRF token mismatch."}`.
+- **The app's global CSRF settings do not apply to the upstream routes.** Exceptions from
+  `validateCsrfTokens(except: …)` and `PreventRequestForgery::allowSameSite()` are ignored
+  there (a same-site page is exactly the attacker); `ai-bridge.csrf.upstreams` is the switch.
+  The opt-in `routes` scope below follows the app's settings, like its own routes.
+- **What passes:** a request with no cookie at all, or one authenticated by a token guard with
+  no session, e.g. a bearer token (Sanctum personal access token, `auth:api`) or a
+  server-to-server call: nothing a forging page could make the browser add.
+- **Needs `laravel/framework`.** Laravel's CSRF middleware lives there, not in the `illuminate/*`
+  components this package requires. An install without it is not a supported setup: every
+  checked request is answered 419.
 - **Where, by default:** the state-changing upstream routes, `POST /ai-bridge/connections/{id}/mcp`
   and `POST`/`DELETE /ai-bridge/connections/{id}/upstreams/{server}/sign-in`
   (`ai-bridge.csrf.upstreams`, default `true`).
 - **Opt in for the rest:** `ai-bridge.csrf.routes` (`AI_BRIDGE_CSRF_ROUTES=true`) adds every other
   state-changing route (token, `stream/sse`, conversations POST/DELETE/stream, connections
-  POST/PATCH/DELETE/regenerate, streams abort). It becomes the default in the next major version.
+  POST/PATCH/DELETE/regenerate, streams abort), honouring the app's global CSRF exceptions and
+  origin settings. It becomes the default in the next major version.
 
 **Sending the token from a page.** Put `<meta name="csrf-token" content="{{ csrf_token() }}">` in
 the layout and send it on every `POST`, `PATCH` and `DELETE`:
@@ -944,9 +954,9 @@ your app's CSS framework or JavaScript (no global Tailwind, no global Alpine).
 Its pre-built bundle is served by the package; your app needs no build toolchain.
 It is entirely optional — the backend is fully usable without it.
 
-The component sends the session's CSRF token (its `csrf-token` attribute, filled in by
-`<x-ai-bridge::chat />`; else the page's `<meta name="csrf-token">`, else the `XSRF-TOKEN`
-cookie) on every state-changing request, so it keeps working with `ai-bridge.csrf.routes` on.
+The component sends the session's CSRF token on every state-changing request, read afresh
+each time: the `XSRF-TOKEN` cookie when present, else its `csrf-token` attribute (filled in by
+`<x-ai-bridge::chat />`), else the page's `<meta name="csrf-token">`, so it keeps working with `ai-bridge.csrf.routes` on.
 
 ### Customizing the chat UI
 

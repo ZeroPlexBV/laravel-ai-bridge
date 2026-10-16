@@ -1,7 +1,7 @@
 ---
 status: accepted
 date: 2026-10-16
-supersedes:
+supersedes: 0008 (in part: tool_call_id is required on the route)
 superseded_by:
 revisit_when: the next major version, when ai-bridge.csrf.routes is to become the default; or when Laravel's own CSRF middleware changes shape again (it was renamed PreventRequestForgery in 13)
 ---
@@ -22,13 +22,18 @@ Bauer (owner).
 ## Decision
 
 - The package checks CSRF itself, with middleware `ai-bridge.csrf:<scope>` on its routes,
-  whatever `route_middleware` the app chose. It checks a request that rides on cookies: a
-  started session and at least one cookie. Such a request must carry the session's token
-  (`X-CSRF-TOKEN`, `_token`, or `X-XSRF-TOKEN`), compared by a subclass of Laravel's own CSRF
-  middleware (`PreventRequestForgery` on 13, `VerifyCsrfToken` on 12) that only drops the
-  unit-test skip and the cookie side effect, so the app's global exceptions and Laravel 13's
-  `Sec-Fetch-Site` origin check apply. Mismatch: 419 JSON. A request without a session or
-  without cookies (bearer tokens, server-to-server) passes: nothing a forging page could add.
+  whatever `route_middleware` the app chose. It checks a request that rides on cookies: at
+  least one cookie, and a started session or a user held by a session-driver guard (a
+  remember-me cookie without a session; then there is no token and it is refused). Such a
+  request must carry the session's token (`X-CSRF-TOKEN`, `_token`, or `X-XSRF-TOKEN`),
+  compared by a subclass of Laravel's own CSRF middleware (`PreventRequestForgery` on 13,
+  `VerifyCsrfToken` on 12) that only drops the unit-test skip and the cookie side effect; a
+  browser-set `Sec-Fetch-Site: same-origin` also passes. Mismatch: 419 JSON. A request without
+  cookies, or authenticated by a token guard without a session, passes: nothing a forging page
+  could add.
+- On the upstream routes the app's global CSRF settings are ignored: its exceptions list and
+  `allowSameSite()` (a same-site page is the attacker this guards against). Switching the check
+  off is `ai-bridge.csrf.upstreams`. The opt-in `routes` scope follows the app's settings.
 - Scope `upstreams` (the three routes above) is on by default (`ai-bridge.csrf.upstreams`);
   scope `routes` (every other state-changing browser route) is opt-in
   (`ai-bridge.csrf.routes`) and becomes the default in the next major.
@@ -41,6 +46,8 @@ Bauer (owner).
 - A front end calling these routes with session cookies must send the token; the reference chat
   UI does (its `csrf-token` attribute, the meta tag or the `XSRF-TOKEN` cookie).
 - Route callers that omitted `tool_call_id` now get 422; called out in the CHANGELOG.
-- Without `laravel/framework` (no Laravel CSRF middleware class) the check fails closed with 419.
+- Supported setups need `laravel/framework`: Laravel's CSRF middleware is not in the
+  `illuminate/*` components composer requires. Without it every checked request is answered
+  419; that is not a supported mode, only a safe failure.
 - With `web` in `route_middleware` the token is checked twice (the `web` group's own middleware
   and this one); harmless.
