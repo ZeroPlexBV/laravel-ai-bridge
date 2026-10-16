@@ -1,6 +1,6 @@
 # Laravel AI Bridge
 
-[![Latest version](https://img.shields.io/github/v/tag/ZeroPlexBV/laravel-ai-bridge?label=version)](https://github.com/ZeroPlexBV/laravel-ai-bridge/tags)
+[![Latest version](https://img.shields.io/github/v/tag/tetrixdev/laravel-ai-bridge?label=version)](https://github.com/tetrixdev/laravel-ai-bridge/tags)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![PHP 8.2+](https://img.shields.io/badge/PHP-8.2%2B-blue.svg)](https://php.net)
 [![Laravel 12+](https://img.shields.io/badge/Laravel-12%2B-red.svg)](https://laravel.com)
@@ -18,14 +18,9 @@ Laravel AI Bridge provides a unified streaming pipeline: **provider -> normalize
 ## Installation
 
 ```bash
-composer require zeroplex/laravel-ai-bridge
+composer require tetrixdev/laravel-ai-bridge
 ```
 
-> **This is the ZeroPlex fork** of [tetrixdev/laravel-ai-bridge](https://github.com/tetrixdev/laravel-ai-bridge),
-> published as `zeroplex/laravel-ai-bridge` from 0.18.0. It `replace`s the original, keeps its PHP
-> namespace (`Tetrix\AiBridge`) so changes can still be offered back upstream, and adds what
-> ZeroPlex needs first, starting with [tools with a view](#tools-with-a-view-mcp-apps). Install it
-> from the ZeroPlexBV GitHub repository (a `vcs` repository entry), not from Packagist.
 
 Publish the config file:
 

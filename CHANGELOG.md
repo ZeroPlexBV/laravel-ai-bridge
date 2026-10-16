@@ -3,11 +3,12 @@
 Release notes for earlier versions are on the GitHub releases page of
 tetrixdev/laravel-ai-bridge. This file starts with 0.16.0-RC1.
 
-## [Unreleased] — to be released as 0.18.0 (ZeroPlex fork)
+## [Unreleased] — to be released as 0.18.0
 
-From here the package is the ZeroPlex fork, published as **`zeroplex/laravel-ai-bridge`**. It
-`replace`s `tetrixdev/laravel-ai-bridge` and keeps the `Tetrix\AiBridge` namespace, so an
-application switches by changing its `require` and adding the ZeroPlexBV `vcs` repository.
+The MCP App cards built in the ZeroPlexBV fork (D09346, released there as
+`zeroplex/laravel-ai-bridge` 0.18.0) merged back, without the package rename: the package stays
+**`tetrixdev/laravel-ai-bridge`**. An application on the fork can switch back by requiring
+`tetrixdev/laravel-ai-bridge` again; the namespace (`Tetrix\AiBridge`) never changed.
 
 ### Added
 
