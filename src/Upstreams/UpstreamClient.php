@@ -141,7 +141,10 @@ class UpstreamClient
      * Pass `$toolCallId` (the `tool_call_id` of the result whose view is asking) whenever the
      * request comes from a view, as a host should: the request is then held to that view, and
      * refused (`refused`) unless `$server` is the server its recorded `ui` names on this
-     * connection, or (`unknown_view`) when no such view was recorded here.
+     * connection, or (`unknown_view`) when no such view was recorded here. It is optional
+     * only for trusted server code that decides `$server` itself; a host relaying a request
+     * that came from a browser must pass it (POST /ai-bridge/connections/{id}/mcp requires
+     * it, decision 0009).
      *
      * @param  array<string, mixed>  $params  The MCP params of the method, unchanged.
      * @param  int|null  $timeout  Seconds to wait; default ai-bridge.server.mcp_request_timeout.

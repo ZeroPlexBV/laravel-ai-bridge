@@ -79,12 +79,13 @@ class UpstreamController extends Controller
 
     /**
      * POST /ai-bridge/connections/{id}/mcp — relay a view's request
-     * (`{server, method, params, tool_call_id?}`). Send `tool_call_id`, the call whose view
-     * asks: the request is then refused unless `server` is that view's.
+     * (`{server, method, params, tool_call_id}`). `tool_call_id`, the call whose view asks,
+     * is required here (422 `tool_call_id_required` without it): a browser's request is
+     * always held to that view, and refused unless `server` is that view's (0008, 0009).
      *
      * 200 `{result}`, or `{error, code}` with 400 (refused here or by the bridge), 404
-     * (no bridge connected), 409 (the bridge has no mcp_apps), 502 (the upstream failed)
-     * or 504 (timeout).
+     * (no bridge connected), 409 (the bridge has no mcp_apps), 422 (no tool_call_id),
+     * 502 (the upstream failed) or 504 (timeout).
      */
     public function mcp(Request $request, int|string $id): JsonResponse
     {
@@ -99,7 +100,11 @@ class UpstreamController extends Controller
         $toolCallId = $request->input('tool_call_id');
 
         if (! is_string($server) || ! is_string($method) || ! is_array($params) || ($toolCallId !== null && ! is_string($toolCallId))) {
-            return response()->json(['code' => 'invalid_request', 'error' => 'Body must be {server: string, method: string, params: object, tool_call_id?: string}.'], 400);
+            return response()->json(['code' => 'invalid_request', 'error' => 'Body must be {server: string, method: string, params: object, tool_call_id: string}.'], 400);
+        }
+
+        if ($toolCallId === null || trim($toolCallId) === '') {
+            return response()->json(['code' => 'tool_call_id_required', 'error' => 'tool_call_id is required: the call whose view makes this request.'], 422);
         }
 
         try {

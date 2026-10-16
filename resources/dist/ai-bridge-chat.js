@@ -261,10 +261,27 @@
         }
 
         // ── HTTP ──────────────────────────────────────────────────────
+        // Headers every request sends: JSON, plus the CSRF token the package checks on
+        // state-changing routes for session-cookie requests (ai-bridge.csrf, decision 0009).
+        // Read on every request, so a rotated token (a re-login regenerates it) is picked
+        // up: Laravel's XSRF-TOKEN cookie when present, sent as X-XSRF-TOKEN; else the
+        // csrf-token attribute <x-ai-bridge::chat /> sets, else <meta name="csrf-token">.
+        jsonHeaders(extra = {}) {
+            const h = { 'Content-Type': 'application/json', ...extra };
+            const m = document.cookie.match(/(?:^|;\s*)XSRF-TOKEN=([^;]+)/);
+            if (m) {
+                h['X-XSRF-TOKEN'] = decodeURIComponent(m[1]);
+            } else {
+                const t = this.getAttribute('csrf-token')
+                    || document.querySelector('meta[name="csrf-token"]')?.content;
+                if (t) h['X-CSRF-TOKEN'] = t;
+            }
+            return h;
+        }
         async apiCall(path, opts = {}) {
             const res = await fetch(this.api + path, {
                 credentials: 'same-origin',
-                headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+                headers: this.jsonHeaders({ Accept: 'application/json' }),
                 ...opts,
             });
             if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -880,7 +897,7 @@
             try {
                 const res = await fetch(this.api + '/conversations/' + this.s.activeId + '/stream', {
                     method: 'POST', credentials: 'same-origin',
-                    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+                    headers: this.jsonHeaders({ Accept: 'application/json' }),
                     body: JSON.stringify({ message: text }),
                 });
                 // 409: another tab is already streaming a response on this
@@ -925,7 +942,7 @@
             try {
                 await fetch(this.api + '/streams/' + encodeURIComponent(rid) + '/abort', {
                     method: 'POST', credentials: 'same-origin',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: this.jsonHeaders(),
                 });
             } catch (e) { /* the EventSource will deliver the terminal regardless */ }
         }

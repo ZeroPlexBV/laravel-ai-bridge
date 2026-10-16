@@ -85,8 +85,10 @@ graph LR
   sign-ins and stream tails across processes.
 - **Proxies.** A reverse proxy that buffers responses or intercepts 502/503 breaks SSE and the
   bridge connection (see the CHANGELOG's 0.16.0-RC1 upgrading note).
-- **JSON routes without CSRF.** They run in the `api` group; with session-cookie auth the host
-  must add CSRF protection ([README](../README.md#tools-from-the-machines-own-mcp-servers-upstream-mcp-apps-and-sign-in)).
+- **JSON routes in the `api` group.** It checks no CSRF token. The package checks one itself on
+  the state-changing upstream routes for requests that ride on cookies (0009); the other
+  state-changing routes are checked only with `ai-bridge.csrf.routes` on until the next major
+  ([README](../README.md#csrf-on-the-packages-routes)).
 - **Hand-maintained chat bundle.** `resources/dist/ai-bridge-chat.js` has no build step and only
   manual browser tests.
 - **Protocol drift.** PROTOCOL.md and the bridge project must move together; a frame sent to a

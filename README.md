@@ -455,6 +455,9 @@ Full reference for `config/ai-bridge.php`:
 | Key | Env Variable | Default | Description |
 |-----|-------------|---------|-------------|
 | `mode` | `AI_BRIDGE_MODE` | `byok` | Active mode: `byok`, `managed`, or `bridge` |
+| `route_middleware` | -- | `['auth']` | Middleware on the browser JSON routes, inside the `api` group |
+| `csrf.upstreams` | `AI_BRIDGE_CSRF_UPSTREAMS` | `true` | The package checks a CSRF token on the state-changing upstream routes (`…/mcp`, `…/upstreams/{server}/sign-in` POST and DELETE) for every request that rides on a session cookie; 419 JSON without one. Switch off only when the app protects these routes itself. See [CSRF](#csrf-on-the-packages-routes) |
+| `csrf.routes` | `AI_BRIDGE_CSRF_ROUTES` | `false` | The same check on every other state-changing browser route (token, `stream/sse`, conversations POST/DELETE/stream, connections POST/PATCH/DELETE/regenerate, streams abort). Opt in now; **becomes the default in the next major** |
 | `token.secret` | `AI_BRIDGE_TOKEN_SECRET` | `null` | JWT signing secret (required) |
 | `token.ttl` | `AI_BRIDGE_TOKEN_TTL` | `86400` | Token TTL in seconds (24h) |
 | `websocket.heartbeat_interval` | -- | `30` | Seconds between ping/pong |
@@ -858,6 +861,61 @@ Eloquent `deleting` event on `Tetrix\AiBridge\Models\Connection`.
 > session-scoped conversations and connections appear to vanish between
 > requests. Apps that scope by an authenticated user instead (`$request->user()`)
 > can use their normal auth middleware and are unaffected.
+>
+> A session on these routes makes them reachable by a forged request from any
+> same-site page, so the package checks a CSRF token on the state-changing ones:
+> see [CSRF on the package's routes](#csrf-on-the-packages-routes).
+
+### CSRF on the package's routes
+
+The JSON routes run in the `api` group, which checks no CSRF token. Once a session signs
+people in there (`'web'`, the cookie + session stack above, or Sanctum's stateful SPA auth),
+SameSite=Lax cookies go along with requests from any page on the same site, a sibling
+subdomain included. So the package checks the token itself (middleware `ai-bridge.csrf`):
+
+- **What is checked:** a request that rides on cookies: it carries a cookie, and either a
+  session was started for it or a session guard signed someone in without one (a remember-me
+  cookie, Basic auth). It must carry the session's CSRF token the Laravel way: an
+  `X-CSRF-TOKEN` header, a `_token` field, or `X-XSRF-TOKEN` with the value of Laravel's
+  `XSRF-TOKEN` cookie, compared by Laravel's own CSRF middleware. A browser-set
+  `Sec-Fetch-Site: same-origin` is accepted too. Without a session there is no token to send,
+  so such a request is always refused. Missing or wrong:
+  `419 {"code": "csrf_token_mismatch", "message": "CSRF token mismatch."}`.
+- **The app's global CSRF settings do not apply to the upstream routes.** Exceptions from
+  `validateCsrfTokens(except: …)` and `PreventRequestForgery::allowSameSite()` are ignored
+  there (a same-site page is exactly the attacker); `ai-bridge.csrf.upstreams` is the switch.
+  The opt-in `routes` scope below follows the app's settings, like its own routes.
+- **What passes:** a request with no cookie at all, or one authenticated by a token guard with
+  no session, e.g. a bearer token (Sanctum personal access token, `auth:api`) or a
+  server-to-server call: nothing a forging page could make the browser add.
+- **Needs `laravel/framework`.** Laravel's CSRF middleware lives there, not in the `illuminate/*`
+  components this package requires. An install without it is not a supported setup: every
+  checked request is answered 419.
+- **Where, by default:** the state-changing upstream routes, `POST /ai-bridge/connections/{id}/mcp`
+  and `POST`/`DELETE /ai-bridge/connections/{id}/upstreams/{server}/sign-in`
+  (`ai-bridge.csrf.upstreams`, default `true`).
+- **Opt in for the rest:** `ai-bridge.csrf.routes` (`AI_BRIDGE_CSRF_ROUTES=true`) adds every other
+  state-changing route (token, `stream/sse`, conversations POST/DELETE/stream, connections
+  POST/PATCH/DELETE/regenerate, streams abort), honouring the app's global CSRF exceptions and
+  origin settings. It becomes the default in the next major version.
+
+**Sending the token from a page.** Put `<meta name="csrf-token" content="{{ csrf_token() }}">` in
+the layout and send it on every `POST`, `PATCH` and `DELETE`:
+
+```js
+fetch('/ai-bridge/connections/' + id + '/mcp', {
+    method: 'POST', credentials: 'same-origin',
+    headers: {
+        'Content-Type': 'application/json',
+        'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content,
+    },
+    body: JSON.stringify({ server, method, params, tool_call_id }),
+});
+```
+
+axios sends `X-XSRF-TOKEN` from the `XSRF-TOKEN` cookie by itself. The reference chat UI
+(`<x-ai-bridge::chat />`) passes the token as its `csrf-token` attribute and sends it; the JS
+client (`resources/js/ai-bridge.js`) sends what you give it in `headers`.
 
 ### HTTP API
 
@@ -895,6 +953,10 @@ component uses **Shadow DOM**, so it is fully isolated — it cannot conflict wi
 your app's CSS framework or JavaScript (no global Tailwind, no global Alpine).
 Its pre-built bundle is served by the package; your app needs no build toolchain.
 It is entirely optional — the backend is fully usable without it.
+
+The component sends the session's CSRF token on every state-changing request, read afresh
+each time: the `XSRF-TOKEN` cookie when present, else its `csrf-token` attribute (filled in by
+`<x-ai-bridge::chat />`), else the page's `<meta name="csrf-token">`, so it keeps working with `ai-bridge.csrf.routes` on.
 
 ### Customizing the chat UI
 
@@ -1157,8 +1219,11 @@ try {
 **Pin the request to the view.** Take `server` from the view's own `ui.server`, never from what
 the view's frame asks for, and pass the call's `tool_call_id`: the request is then refused
 (`refused`) unless `server` is the one recorded for that view on that connection, or
-(`unknown_view`) when no such view was recorded there. Without `tool_call_id`, any server and
-any tool the upstream lets views call are reachable by whoever can call the API. A bridge
+(`unknown_view`) when no such view was recorded there. The route requires `tool_call_id`
+(`422 tool_call_id_required` without it). `AiBridge::mcpRequest()` keeps it optional for
+server code that decides `server` itself; **a host relaying a request that came from a browser
+must pass the `tool_call_id` the browser named**, or any server and any tool the upstream lets
+views call are reachable by whoever can reach that host route. A bridge
 connected without an `ai_bridge_connections` row (under a user id rather than a connection key)
 gives its views `connection_id: null`; such views cannot be relayed through the route.
 
@@ -1167,15 +1232,15 @@ before it leaves this server. It works from a web worker or a job (it reaches th
 over its internal API, like `sendTurnInput()`), waits up to `ai-bridge.server.mcp_request_timeout`
 (65 s), and fires `Tetrix\AiBridge\Events\McpRequestRelayed` (user, connection, server, method,
 tool or uri, outcome) for an audit trail. The same is `POST /ai-bridge/connections/{id}/mcp`
-(`{server, method, params, tool_call_id}`), throttled to 30 a minute.
+(`{server, method, params, tool_call_id}`, all required), throttled to 30 a minute.
 
-> **CSRF: these JSON routes have none of their own.** Like every route under
-> `ai-bridge.route_middleware` they run in the `api` group, which does not check a CSRF token.
-> With session-cookie auth (`['auth']` and a browser) a hostile page could POST to
-> `…/mcp` or `…/sign-in` as the signed-in person. Use Sanctum's stateful SPA auth
-> (`auth:sanctum`, which checks the XSRF token for first-party requests), a token in a header,
-> or add CSRF-checking middleware to `ai-bridge.route_middleware`; or do not expose them and
-> call `AiBridge::mcpRequest()` / `AiBridge::upstreams()` from your own CSRF-protected routes.
+> **CSRF is checked by the package on `…/mcp` and both `…/sign-in` routes.** A request that
+> rides on a session cookie must carry the CSRF token (`X-CSRF-TOKEN`, `_token` or
+> `X-XSRF-TOKEN`), or it is answered `419`; a bearer-token request passes. See
+> [CSRF on the package's routes](#csrf-on-the-packages-routes) for how to send it, and
+> `ai-bridge.csrf.upstreams` to switch it off when your app protects these routes itself.
+> Relaying from your own routes instead (`AiBridge::mcpRequest()` / `AiBridge::upstreams()`),
+> keep them CSRF-protected (the `web` group does that) and pass `tool_call_id`.
 
 **Sign-in.** When an upstream needs the person to sign in, the bridge sends an authorization URL;
 the package keeps it as a pending sign-in and fires `UpstreamAuthRequired` (in the serve process)
