@@ -1,5 +1,5 @@
 {
-    "name": "tetrixdev/laravel-ai-bridge",
+    "name": "zeroplex/laravel-ai-bridge",
     "description": "Laravel package for AI Bridge — unified streaming interface for CLI Bridge, BYOK, and managed AI modes",
     "type": "library",
     "license": "MIT",
@@ -12,6 +12,9 @@
         "guzzlehttp/psr7": "^2.0",
         "react/socket": "^1.14",
         "ratchet/rfc6455": "^0.4"
+    },
+    "replace": {
+        "tetrixdev/laravel-ai-bridge": "self.version"
     },
     "require-dev": {
         "orchestra/testbench": "^10.0|^11.0",

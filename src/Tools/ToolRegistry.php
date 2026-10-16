@@ -30,15 +30,16 @@ class ToolRegistry
      * @param  string  $description  Description for the AI.
      * @param  array<string, mixed>  $parameters  JSON Schema for parameters.
      * @param  Closure  $handler  The function that executes the tool.
+     * @param  string|null  $view  The `ui://` URI of the tool's view, or null for none.
      * @return $this
      *
      * @throws InvalidArgumentException If a tool with the same name is already registered.
      */
-    public function register(string $name, string $description, array $parameters, Closure $handler): static
+    public function register(string $name, string $description, array $parameters, Closure $handler, ?string $view = null): static
     {
         $this->ensureUnique($name);
 
-        $this->tools[$name] = new ToolDefinition($name, $description, $parameters, $handler);
+        $this->tools[$name] = new ToolDefinition($name, $description, $parameters, $handler, $view);
 
         return $this;
     }

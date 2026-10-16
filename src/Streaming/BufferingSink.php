@@ -105,18 +105,25 @@ final class BufferingSink
             $append($event->event, $event->data);
         });
 
-        $handler->onToolCall(function (string $name, array $params, string $callId) use ($append): void {
-            $append(MessageTypes::TOOL_CALL, [
+        $handler->onToolCall(function (string $name, array $params, string $callId, ?string $providerToolCallId = null) use ($append): void {
+            $data = [
                 'tool_name' => $name,
                 'parameters' => $params,
                 'tool_call_id' => $callId,
-            ]);
+            ];
+            // The CLI's own id for this call (ai-bridge 0.27+): the id the stream's tool_call
+            // block already carries, so a host can tell this is the SAME call it is drawing,
+            // not a second one. Absent when the bridge does not report it.
+            if ($providerToolCallId !== null && $providerToolCallId !== '') {
+                $data['provider_tool_call_id'] = $providerToolCallId;
+            }
+            $append(MessageTypes::TOOL_CALL, $data);
         });
 
         // Without this the browser could never see a tool result at all: the
         // bridge sends them, StreamHandler dispatches them, and the SSE buffer
         // simply had no handler, so they stopped here.
-        $handler->onToolResult(function (string $toolCallId, mixed $result, ?bool $isError = null, ?string $parentToolUseId = null) use ($append): void {
+        $handler->onToolResult(function (string $toolCallId, mixed $result, ?bool $isError = null, ?string $parentToolUseId = null, ?array $ui = null) use ($append): void {
             // `result` is sent even when null — dropping the key leaves the
             // browser waiting for a result that has already arrived, and the
             // call renders as still running for ever.
@@ -127,6 +134,11 @@ final class BufferingSink
             // Absent for the main assistant, as on the wire.
             if ($parentToolUseId !== null) {
                 $data['parent_tool_use_id'] = $parentToolUseId;
+            }
+            // The view of a server tool that has one, for the host to draw.
+            // Absent on every other result.
+            if ($ui !== null) {
+                $data['ui'] = $ui;
             }
             $append(MessageTypes::TOOL_RESULT, $data);
         });

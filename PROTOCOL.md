@@ -240,6 +240,19 @@ The field is **omitted entirely** when the operator allowed nothing, so "this br
 
 The server records both per connection, in the same `bridge` record as the fields above, and reports them on the connection status (`bridge_version`, `self_update`). `bridge_version` is kept from the last connection while the machine is off (check `connected`); `self_update` is live only, `false` whenever the bridge is not connected. An absent or non-boolean `self_update` is `false` — a bridge older than 0.24.0 never sends it, and cannot update itself anyway. An older server ignores the field.
 
+#### Additive field: `mcp_apps` (ai-bridge 0.27+)
+
+```json
+{ "type": "hello", "bridge_version": "0.29.0", "mcp_apps": { "spec": "2026-01-26", "revision": 1 } }
+```
+
+Present when the bridge passes MCP Apps through: it copies a tool definition's `_meta` into the
+CLI's tool list and reports the CLI's own call id on every `tool_call` (see
+[Tools with a view](#tools-with-a-view-mcp-apps)). The server records it per connection in the
+same `bridge` record as `bridge_version` (`last_bridge.mcp_apps`) and reports `mcp_apps: true|false`
+on the connection status. Absent means the bridge is older than 0.27.0: the server then attaches no
+view to that machine's tool results and never sends `mcp_request`.
+
 ### Bridge → Server: `providers_update`
 
 Sent mid-connection when the bridge's set of available provider CLIs changes after the `hello` — for example, the user installs or removes a CLI while the bridge stays connected.
@@ -1345,6 +1358,33 @@ What a tool returned. Emitted for **both** kinds of tool call:
 
 `is_error` is the authoritative failure signal, and is **absent when the provider did not report one** — absent never means "succeeded". Do not infer failure from the text: a tool legitimately printing `Error: no matches` is indistinguishable from one that failed. (For historical reasons the Codex and Gemini adapters additionally prefix `Error: ` onto a failed result; that prefix is not a substitute for the field.)
 
+`ui` is present only on the result of a call to a server tool **with a view** (see
+[Tools with a view](#tools-with-a-view-mcp-apps)), and only on the events the **server** itself
+emits (its stream store, `streamToResponse()`) and records on the message, never on a frame the
+bridge sends:
+
+```json
+"ui": {
+  "resource_uri": "ui://studio/grant-request",
+  "tool_name": "show_grant_request",
+  "arguments": { "grant_id": 42 },
+  "result": {
+    "content": [{ "type": "text", "text": "Grant request 42 is waiting for Dragan." }],
+    "structuredContent": { "grant_id": 42, "deliverables": [9227], "gates": ["walkthrough"] }
+  }
+}
+```
+
+`result` is the full `CallToolResult` the handler produced, kept on the server because the CLI
+only ever receives its text. A consumer that does not draw views ignores the key.
+
+A view whose JSON is over 256 KB is not kept, so its result carries no `ui`. On a **recorded**
+message block `ui` is kept whole or dropped whole, never cut: once the turn's storage budget is
+spent the block carries `ui_dropped_bytes` (the view's size as JSON) and `ui_dropped_reason`
+instead of `ui`. `ui_dropped_reason` is `too_large` for a view larger than a whole turn's budget,
+and `turn_budget_spent` when earlier blocks of the same turn had already spent it. A consumer
+draws such a block as a call with no view.
+
 ##### Chunked results
 
 A result larger than one frame arrives **in pieces**, keyed by `tool_call_id`:
@@ -1660,6 +1700,54 @@ Server                          Bridge                          CLI
   │                               │   return "18" to CLI ───────>│
   │                               │                              │
 ```
+
+### Tools with a view (MCP Apps)
+
+A server tool may name an interactive view (an [MCP App](https://github.com/modelcontextprotocol/ext-apps),
+spec `2026-01-26`) that a host draws next to its call. The view itself is HTML the **server** serves;
+the bridge only carries two things through, and needs to be 0.27.0 or newer to do it.
+
+1. **`_meta` on the definition.** A tool in `welcome.tools` (and in a request's tool list) may
+   carry `_meta.ui`:
+   ```json
+   {
+     "name": "show_grant_request",
+     "description": "Show the person a grant request to confirm",
+     "parameters": { "type": "object", "properties": { "grant_id": { "type": "integer", "description": "The grant request" } } },
+     "_meta": { "ui": { "resourceUri": "ui://studio/grant-request" } }
+   }
+   ```
+2. **`provider_tool_call_id` on `tool_call`.** The CLI's own id for the call (`toolu_…` for
+   Claude Code), the same id the stream's `tool_call` block and `tool_result` carry. It is how the
+   server joins the call it executes to the call it streams. Codex and Gemini report none; a call
+   without it is executed normally and simply gets no view.
+
+```
+Server                                   Bridge (0.27+)                   CLI
+  │──welcome.tools[ … _meta.ui … ]──────────>│──tools/list (with _meta)──────>│
+  │<──tool_call {tool_call_id: tc_7,         │<──tools/call show_grant_request│
+  │     provider_tool_call_id: toolu_01…}────│                                │
+  │  run the handler, keep the full result   │                                │
+  │  under (request, toolu_01…)              │                                │
+  │──tool_resolve {tc_7, result: text}──────>│──────── text ─────────────────>│
+  │<──stream tool_result {toolu_01…}─────────│                                │
+  │  write it to the stream store WITH `ui`  │                                │
+```
+
+The server serves `ui://` resources from its own registry. What the person does in a view never
+travels over this WebSocket and is never a tool call: the host handles a button press itself,
+behind the person's sign-in, so the assistant cannot trigger it. Views for tools of MCP servers
+configured on the machine (`--mcp-upstreams`, `mcp_request` / `mcp_result`) are not handled by this
+server: it records `mcp_apps` but never sends `mcp_request`.
+
+**A view that is no longer registered.** History can name a `resource_uri` that a later release
+removed or renamed; `AiBridge::views()->render()` then throws `ViewNotFoundException`. A host
+treats that exactly like a call without a view and draws the call alone.
+
+**When a call shows no view, the stream does not say why.** A missing `provider_tool_call_id`
+(Codex, Gemini, a bridge older than 0.27) only leaves a debug-level line in the server's log
+("tool view not attached"), and a view the server could not keep (over 256 KB, a stream-store
+failure) a warning-level one ("could not keep a tool view"). Nothing else records it.
 
 ### Server → Bridge: `tool_resolve`
 

@@ -62,7 +62,12 @@ class ConnectionStatus
      * it announced: `turn_input`, `input_closed`, `file_uploads`,
      * `file_downloads`, `app_backends`. Test a capability, not a version.
      *
-     * @return array{connected: bool, providers: array<int, mixed>, workspaces: array<int, mixed>, posture: array<string, mixed>, bridge_version: string|null, self_update: bool, attachment_limits: array<string, int>|null, capabilities: list<string>}
+     * `mcp_apps` is whether the bridge passes MCP Apps through (0.27+: a tool's
+     * `_meta` reaches the CLI, and it reports the CLI's call ids), so a server
+     * tool's view can be shown. True only when the last hello carried a valid
+     * `mcp_apps` object; like `capabilities`, kept while the machine is off.
+     *
+     * @return array{connected: bool, providers: array<int, mixed>, workspaces: array<int, mixed>, posture: array<string, mixed>, bridge_version: string|null, self_update: bool, attachment_limits: array<string, int>|null, capabilities: list<string>, mcp_apps: bool}
      */
     public function for(Connection $connection): array
     {
@@ -114,7 +119,7 @@ class ConnectionStatus
      * `self_update` is only ever true while connected (see for()).
      *
      * @param  mixed  $bridge
-     * @return array{bridge_version: string|null, self_update: bool, attachment_limits: array<string, int>|null, capabilities: list<string>}
+     * @return array{bridge_version: string|null, self_update: bool, attachment_limits: array<string, int>|null, capabilities: list<string>, mcp_apps: bool}
      */
     private static function bridgeFields(mixed $bridge, bool $connected): array
     {
@@ -128,6 +133,7 @@ class ConnectionStatus
             'self_update' => $connected && ($bridge['self_update'] ?? null) === true,
             'attachment_limits' => is_array($limits) && $limits !== [] ? $limits : null,
             'capabilities' => is_array($capabilities) ? array_values(array_filter($capabilities, 'is_string')) : [],
+            'mcp_apps' => is_array($bridge['mcp_apps'] ?? null) && is_string($bridge['mcp_apps']['spec'] ?? null) && $bridge['mcp_apps']['spec'] !== '',
         ];
     }
 
@@ -141,7 +147,7 @@ class ConnectionStatus
      * Query the bridge server for a bridge connection's live status, refreshing the cached
      * capabilities. Falls back to cached providers + connected=false when unreachable.
      *
-     * @return array{connected: bool, providers: array<int, mixed>, workspaces: array<int, mixed>, posture: array<string, mixed>, bridge_version: string|null, self_update: bool, attachment_limits: array<string, int>|null, capabilities: list<string>}
+     * @return array{connected: bool, providers: array<int, mixed>, workspaces: array<int, mixed>, posture: array<string, mixed>, bridge_version: string|null, self_update: bool, attachment_limits: array<string, int>|null, capabilities: list<string>, mcp_apps: bool}
      */
     private function bridgeLiveStatus(Connection $connection): array
     {
