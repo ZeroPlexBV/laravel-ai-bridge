@@ -28,6 +28,7 @@ use Tetrix\AiBridge\Streaming\StreamHandler;
 use Tetrix\AiBridge\Streaming\TurnInputResult;
 use Tetrix\AiBridge\Support\BridgeLog;
 use Tetrix\AiBridge\Tools\ToolRegistry;
+use Tetrix\AiBridge\Tools\ViewRegistry;
 use Tetrix\AiBridge\WebSocket\BridgeConnectionManager;
 
 /**
@@ -109,11 +110,12 @@ class AiBridgeManager
      * @param  string  $description  Human-readable description.
      * @param  array<string, mixed>  $parameters  JSON Schema for parameters.
      * @param  Closure  $handler  The function that executes the tool.
+     * @param  string|null  $view  The `ui://` URI of the tool's view (see views()), or null for none.
      * @return $this
      */
-    public function registerTool(string $name, string $description, array $parameters, Closure $handler): static
+    public function registerTool(string $name, string $description, array $parameters, Closure $handler, ?string $view = null): static
     {
-        $this->toolRegistry->register($name, $description, $parameters, $handler);
+        $this->toolRegistry->register($name, $description, $parameters, $handler, $view);
 
         return $this;
     }
@@ -137,6 +139,14 @@ class AiBridgeManager
     public function tools(): ToolRegistry
     {
         return $this->toolRegistry;
+    }
+
+    /**
+     * The `ui://` views (MCP Apps) this server serves, which tools name by URI.
+     */
+    public function views(): ViewRegistry
+    {
+        return app(ViewRegistry::class);
     }
 
     /**
@@ -665,29 +675,36 @@ class AiBridgeManager
             $visibleBlockCounter++;
         });
 
-        $stream->onToolCall(function (string $toolName, array $params, string $callId) use ($sink) {
-            $sink([
-                'event' => MessageTypes::TOOL_CALL,
-                'data' => [
-                    'tool_name' => $toolName,
-                    'parameters' => $params,
-                    'tool_call_id' => $callId,
-                    'call_id' => $callId, // Deprecated: use tool_call_id instead
-                ],
-            ]);
+        $stream->onToolCall(function (string $toolName, array $params, string $callId, ?string $providerToolCallId = null) use ($sink) {
+            $data = [
+                'tool_name' => $toolName,
+                'parameters' => $params,
+                'tool_call_id' => $callId,
+                'call_id' => $callId, // Deprecated: use tool_call_id instead
+            ];
+            // #11493: the CLI's own id for this call, as BufferingSink::attach() forwards it,
+            // so a consumer of this sink can join a server tool_call to its tool_result and
+            // card too. Absent when the bridge does not report it.
+            if ($providerToolCallId !== null && $providerToolCallId !== '') {
+                $data['provider_tool_call_id'] = $providerToolCallId;
+            }
+            $sink(['event' => MessageTypes::TOOL_CALL, 'data' => $data]);
         });
 
         // What a tool returned. For a tool that ran on the operator's own
         // machine this is the only account of it there will ever be — and this
         // sink powers the documented streamToResponse() API, so leaving it
         // unwired meant half the fix reached one consumer and not the other.
-        $stream->onToolResult(function (string $toolCallId, mixed $result, ?bool $isError = null, ?string $parentToolUseId = null) use ($sink) {
+        $stream->onToolResult(function (string $toolCallId, mixed $result, ?bool $isError = null, ?string $parentToolUseId = null, ?array $ui = null) use ($sink) {
             $data = ['tool_call_id' => $toolCallId, 'result' => $result];
             if ($isError !== null) {
                 $data['is_error'] = $isError;
             }
             if ($parentToolUseId !== null) {
                 $data['parent_tool_use_id'] = $parentToolUseId;
+            }
+            if ($ui !== null) {
+                $data['ui'] = $ui;
             }
             $sink(['event' => MessageTypes::TOOL_RESULT, 'data' => $data]);
         });

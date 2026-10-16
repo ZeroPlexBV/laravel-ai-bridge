@@ -322,7 +322,7 @@ class BridgeConnectionManager
      * @return array<string, mixed>  Empty when not connected. Keys: `bridge_version`
      *                               (?string), `protocol_version` (?string),
      *                               `attachment_limits` (?array), `capabilities` (string[]),
-     *                               `self_update` (bool).
+     *                               `self_update` (bool), `mcp_apps` (?array{spec, revision}).
      */
     public function getBridgeInfo(int|string $userId): array
     {

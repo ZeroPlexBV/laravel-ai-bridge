@@ -1,6 +1,6 @@
 # Laravel AI Bridge
 
-[![Latest Version on Packagist](https://img.shields.io/packagist/v/tetrixdev/laravel-ai-bridge.svg)](https://packagist.org/packages/tetrixdev/laravel-ai-bridge)
+[![Latest version](https://img.shields.io/github/v/tag/tetrixdev/laravel-ai-bridge?label=version)](https://github.com/tetrixdev/laravel-ai-bridge/tags)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![PHP 8.2+](https://img.shields.io/badge/PHP-8.2%2B-blue.svg)](https://php.net)
 [![Laravel 12+](https://img.shields.io/badge/Laravel-12%2B-red.svg)](https://laravel.com)
@@ -20,6 +20,7 @@ Laravel AI Bridge provides a unified streaming pipeline: **provider -> normalize
 ```bash
 composer require tetrixdev/laravel-ai-bridge
 ```
+
 
 Publish the config file:
 
@@ -867,7 +868,7 @@ Eloquent `deleting` event on `Tetrix\AiBridge\Models\Connection`.
 | `GET /ai-bridge/streams/{rid}/status` | Status snapshot of an in-flight or recently-completed turn |
 | `GET /ai-bridge/streams/{rid}/events` | SSE tail of the per-turn event buffer; resumes by `Last-Event-ID` |
 | `POST /ai-bridge/streams/{rid}/abort` | Cancel an in-flight turn. Sets a flag; the WebSocket process acts on it at the turn's next event, or at the next heartbeat when the turn has gone quiet — so a stop takes effect within the heartbeat interval (30s by default) at worst. **Stopping the CLI itself needs `@tetrixdev/ai-bridge` 0.11.0 or newer**: older bridges ignore `cancel`, so the chat ends the turn but the CLI runs on to the end on the operator's machine |
-| `GET /ai-bridge/connections` | List connections with their advertised providers/models + live `connected` flag, plus the `bridge_version` a connected bridge runs and whether it will follow `bridge.desired_version` (`self_update`) |
+| `GET /ai-bridge/connections` | List connections with their advertised providers/models + live `connected` flag, plus the `bridge_version` a connected bridge runs and whether it will follow `bridge.desired_version` (`self_update`), and for a bridge whether it passes MCP Apps through (`mcp_apps`) |
 | `POST /ai-bridge/connections` | Register a CLI bridge or BYOK connection |
 | `PATCH /ai-bridge/connections/{id}` | Rename a connection |
 | `POST /ai-bridge/connections/{id}/regenerate` | Rotate a bridge's token (revokes the old one, disconnects any live bridge) |
@@ -903,7 +904,12 @@ The component is a reference implementation — you are never locked into it.
    Livewire, Vue, React. The stream emits these events (each as an SSE
    `event: <name>` line with a JSON `data:` payload): `block_start`,
    `block_delta` (`{block_type, content}`), `block_stop`, `tool_call`
-   (`{tool_name, parameters}`), `done` (`{usage}`), `error`, `cancelled`.
+   (`{tool_name, parameters, tool_call_id}`, plus `provider_tool_call_id`, the
+   CLI's own id for a server-run call when the bridge reports it), `tool_result`
+   (`{tool_call_id, result}`, plus `is_error`, `parent_tool_use_id` and `ui`
+   when present), `done` (`{usage}`), `error`, `cancelled`. A `tool_result` that
+   carries `ui` is a card to draw: see
+   [Tools with a view (MCP Apps)](#tools-with-a-view-mcp-apps).
 
    The bundled component (`resources/dist/ai-bridge-chat.js`) is the working
    reference for everything a client needs to do: API calls, EventSource
@@ -1042,6 +1048,77 @@ class LookupCharacterTool implements ToolHandler
 // Register it
 AiBridge::registerToolHandler(new LookupCharacterTool());
 ```
+
+### Tools with a view (MCP Apps)
+
+A tool can name an interactive **view** that the chat draws next to its call: a card with the
+tool's result and, for example, a Confirm button. It follows the MCP Apps standard, so the view is
+plain HTML that talks to its host through `postMessage`. Needs `@tetrixdev/ai-bridge` 0.27.0 or
+newer on the machine and a CLI that reports its call ids (Claude Code); anywhere else the tool
+still runs, it just shows no view. See [PROTOCOL.md](PROTOCOL.md#tools-with-a-view-mcp-apps).
+
+**What happens when the person presses a button in a card is not this package's concern.** The
+host (the chat, `zeroplex/ai`) handles it through its own doorway, behind the person's sign-in;
+it never becomes a tool call and never travels over the bridge. This package only makes the card
+appear: it declares the view, serves its HTML and hands the host the tool's result.
+
+**1. Register the view** (a `ui://` resource the server serves; the HTML is rendered per request):
+
+```php
+use Tetrix\AiBridge\Facades\AiBridge;
+
+AiBridge::views()->register(
+    uri: 'ui://studio/grant-request',
+    html: fn () => view('grants.card')->render(),
+    csp: [],                                   // MCP Apps `_meta.ui.csp`; empty = nothing external
+);
+```
+
+**2. Give the tool the view, and return a result for both readers.** The model gets the text; the
+view gets the structured content too.
+
+```php
+use Tetrix\AiBridge\Tools\AbstractTool;
+use Tetrix\AiBridge\Tools\ToolResult;
+
+class ShowGrantRequestTool extends AbstractTool
+{
+    public function name(): string { return 'show_grant_request'; }
+    public function description(): string { return 'Show the person a grant request to confirm'; }
+    public function view(): ?string { return 'ui://studio/grant-request'; }   // null = no view (default)
+
+    protected function defineParameters(): array { /* grant_id */ }
+
+    public function handle(array $params): mixed
+    {
+        $grant = GrantRequest::findOrFail($params['grant_id']);
+
+        return ToolResult::withView(
+            text: "Grant request {$grant->id} is shown to the person.",
+            structured: $grant->toCardData(),
+        );
+    }
+}
+```
+
+**Return `ToolResult::withView()`, not a plain array or string.** A tool with a view that returns
+anything else still gets a card, but one with only that value as text and no structured content,
+and nothing fails: the server only logs it at debug level. A `ToolResult::withView()` with an
+empty `structured` looks the same.
+
+A `ToolHandler` class gets the same by implementing `Tetrix\AiBridge\Contracts\HasView`
+(`view()`); a closure tool passes `view:` to `registerTool()`. Showing the card is all the tool
+does: it changes nothing.
+
+**3. The host draws it.** The stream's `tool_result` for such a call carries `ui`
+(`resource_uri`, `tool_name`, `arguments`, `result`), in the stream store and on the recorded
+block; `onToolResult` receives it as a fifth argument (`?array $ui`, null for every other result).
+The host fetches the HTML with `AiBridge::views()->render($ui['resource_uri'])`
+(`['html' => …, 'csp' => […]]`; an unknown URI throws `ViewNotFoundException`, which a host
+treats as a call with no view: old history can name a view a later release removed or renamed).
+A view over 256 KB is not kept, so its call shows no card. Whether a machine
+can show views at all is `$status['mcp_apps']` on its connection status (true once its bridge
+announced `mcp_apps` at hello).
 
 ### Listening for Tool Calls
 

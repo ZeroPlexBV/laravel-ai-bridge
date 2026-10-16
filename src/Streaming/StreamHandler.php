@@ -8,7 +8,9 @@ use Closure;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
+use Tetrix\AiBridge\Contracts\StoresStreamValues;
 use Tetrix\AiBridge\Contracts\StreamableProvider;
+use Tetrix\AiBridge\Contracts\StreamStoreContract;
 use Tetrix\AiBridge\Enums\BlockType;
 use Tetrix\AiBridge\Enums\ProviderMode;
 use Tetrix\AiBridge\Enums\TerminatedBy;
@@ -28,8 +30,8 @@ use Tetrix\AiBridge\Protocol\StreamEvent;
  *   $stream->onBlockStart(fn (StreamEvent $e) => ...);
  *   $stream->onBlockDelta(fn (StreamEvent $e) => ...);
  *   $stream->onBlockStop(fn (StreamEvent $e) => ...);
- *   $stream->onToolCall(fn (string $name, array $params, string $callId) => ...);
- *   $stream->onToolResult(fn (string $callId, mixed $result, ?bool $isError, ?string $parentToolUseId) => ...);
+ *   $stream->onToolCall(fn (string $name, array $params, string $callId, ?string $providerToolCallId) => ...);
+ *   $stream->onToolResult(fn (string $callId, mixed $result, ?bool $isError, ?string $parentToolUseId, ?array $ui) => ...);
  *   $stream->onTask(fn (array $task) => ...);
  *   $stream->onDone(fn (?array $usage) => ...);
  *   $stream->onError(fn (string $code, string $message) => ...);
@@ -177,6 +179,16 @@ class StreamHandler
     /** @var list<string>|null */
     private ?array $allowedTools = null;
 
+    /**
+     * The CLI call ids whose execution kept a view's result in the stream store.
+     *
+     * Only these are looked up when their `tool_result` arrives, so a turn full of
+     * results without a view costs no store read at all.
+     *
+     * @var array<string, true>
+     */
+    private array $expectedViews = [];
+
     public readonly string $requestId;
 
     public function __construct(
@@ -283,6 +295,10 @@ class StreamHandler
      * the spawning call when the call was a helper's (sub-agent's), and null
      * for the main assistant's own calls. A callback declaring only the first
      * three parameters keeps working: PHP drops the extra argument.
+     *
+     * A fifth argument, ?array $ui, is the view of a server tool that has one
+     * (`resource_uri`, `tool_name`, `arguments`, `result`; see PROTOCOL.md), and
+     * null for every other result.
      */
     public function onToolResult(Closure $callback): static
     {
@@ -555,15 +571,65 @@ class StreamHandler
     /**
      * Dispatch a tool_call event to all registered callbacks.
      *
+     * `$providerToolCallId` is the CLI's own id for the call (`toolu_…`), which the
+     * bridge reports from 0.27; null when it did not. Callbacks receive it fourth.
+     *
      * @internal Called by StreamableProvider implementations.
      */
-    public function dispatchToolCall(string $toolName, array $params, string $callId): void
+    public function dispatchToolCall(string $toolName, array $params, string $callId, ?string $providerToolCallId = null): void
     {
         if ($this->cancelled || $this->terminated) {
             return;
         }
 
-        $this->dispatchCallbacks($this->toolCallCallbacks, [$toolName, $params, $callId], 'toolCall');
+        $this->dispatchCallbacks($this->toolCallCallbacks, [$toolName, $params, $callId, $providerToolCallId], 'toolCall');
+    }
+
+    /**
+     * Note that a view's result was kept for this CLI call id, so its `tool_result`
+     * is looked up in the stream store and carries `ui`.
+     *
+     * @internal Called by MessageHandler after executing a tool with a view.
+     */
+    public function expectToolView(string $providerToolCallId): void
+    {
+        $this->expectedViews[$providerToolCallId] = true;
+    }
+
+    /**
+     * The view kept for this call, read once from the stream store.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function takeToolView(string $toolCallId): ?array
+    {
+        if (! isset($this->expectedViews[$toolCallId])) {
+            return null;
+        }
+        unset($this->expectedViews[$toolCallId]);
+
+        try {
+            $store = app(StreamStoreContract::class);
+
+            return $store instanceof StoresStreamValues
+                ? $store->getValue($this->requestId, self::toolViewKey($toolCallId))
+                : null;
+        } catch (\Throwable $e) {
+            // A view not shown is the worst case; the result itself still goes through.
+            Log::warning('AI Bridge: could not read a tool view', [
+                'request_id' => $this->requestId,
+                'tool_call_id' => $toolCallId,
+                'error' => $e->getMessage(),
+            ]);
+
+            return null;
+        }
+    }
+
+    /** The stream-store key a view's result is kept under, per CLI call id. */
+    public static function toolViewKey(string $providerToolCallId): string
+    {
+        return 'tool_view:'.$providerToolCallId;
     }
 
     /**
@@ -956,7 +1022,7 @@ class StreamHandler
 
             $this->dispatchCallbacks(
                 $this->toolResultCallbacks,
-                [$toolCallId, $assembled['result'], $assembled['is_error'], $assembled['parent']],
+                [$toolCallId, $assembled['result'], $assembled['is_error'], $assembled['parent'], $this->takeToolView($toolCallId)],
                 'toolResult',
             );
         }
@@ -978,7 +1044,7 @@ class StreamHandler
             'tool_call_id' => $toolCallId,
         ]);
 
-        $this->dispatchCallbacks($this->toolResultCallbacks, [$toolCallId, $result, $isError, $parentToolUseId], 'toolResult');
+        $this->dispatchCallbacks($this->toolResultCallbacks, [$toolCallId, $result, $isError, $parentToolUseId, $this->takeToolView($toolCallId)], 'toolResult');
     }
 
     /**
@@ -1059,6 +1125,8 @@ class StreamHandler
                 $event->data['tool_name'],
                 $event->data['parameters'] ?? [],
                 $event->data['tool_call_id'] ?? $event->data['call_id'] ?? '',
+                // #11493: a raw tool_call event keeps the CLI's own call id too.
+                is_string($event->data['provider_tool_call_id'] ?? null) ? $event->data['provider_tool_call_id'] : null,
             ),
             MessageTypes::TOOL_RESULT => $this->receiveToolResult($event->data),
             MessageTypes::RATE_LIMIT => $this->dispatchRateLimit(

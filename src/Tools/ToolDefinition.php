@@ -6,13 +6,15 @@ namespace Tetrix\AiBridge\Tools;
 
 use Closure;
 use InvalidArgumentException;
+use Tetrix\AiBridge\Contracts\HasView;
 use Tetrix\AiBridge\Contracts\ToolHandler;
 
 /**
  * Immutable value object representing a tool the AI can call.
  *
  * A ToolDefinition holds the tool's name, description, JSON Schema parameters,
- * and the handler (closure or ToolHandler instance) that executes it.
+ * the handler (closure or ToolHandler instance) that executes it, and the
+ * `ui://` view (MCP App) a host may draw next to its call, if it has one.
  *
  * Construction validates the name, description, and parameters so that a tool
  * can never be registered with a malformed name, an empty description, or
@@ -25,18 +27,23 @@ final class ToolDefinition
      * @param  string  $description  Human-readable description for the AI.
      * @param  array<string, mixed>  $parameters  JSON Schema for the tool's input parameters.
      * @param  Closure|ToolHandler  $handler  The callable that executes the tool.
+     * @param  string|null  $view  The `ui://` URI of the tool's view, or null for none.
      *
-     * @throws InvalidArgumentException If the name, description, or parameters are invalid.
+     * @throws InvalidArgumentException If the name, description, parameters or view are invalid.
      */
     public function __construct(
         public readonly string $name,
         public readonly string $description,
         public readonly array $parameters,
         private readonly Closure|ToolHandler $handler,
+        public readonly ?string $view = null,
     ) {
         $this->validateName($name);
         $this->validateDescription($name, $description);
         $this->validateParameters($name, $parameters);
+        if ($view !== null) {
+            ViewRegistry::assertViewUri($view);
+        }
     }
 
     /**
@@ -140,6 +147,7 @@ final class ToolDefinition
             description: $handler->description(),
             parameters: $handler->parameters(),
             handler: $handler,
+            view: $handler instanceof HasView ? $handler->view() : null,
         );
     }
 
@@ -178,14 +186,24 @@ final class ToolDefinition
     /**
      * Serialize the tool definition to a plain array (useful for WebSocket transmission).
      *
+     * A tool with a view carries `_meta.ui.resourceUri`, the MCP Apps field the bridge
+     * (0.27+) copies into the CLI's tool list. Absent for a tool without one, so the
+     * definition of every other tool is unchanged.
+     *
      * @return array<string, mixed>
      */
     public function toArray(): array
     {
-        return [
+        $array = [
             'name' => $this->name,
             'description' => $this->description,
             'parameters' => $this->parameters,
         ];
+
+        if ($this->view !== null) {
+            $array['_meta'] = ['ui' => ['resourceUri' => $this->view]];
+        }
+
+        return $array;
     }
 }

@@ -8,6 +8,7 @@ use Illuminate\Support\Facades\Log;
 use Tetrix\AiBridge\Auth\TokenManager;
 use Tetrix\AiBridge\Auth\TokenValidationException;
 use Tetrix\AiBridge\Contracts\MergesStreamMetadata;
+use Tetrix\AiBridge\Contracts\StoresStreamValues;
 use Tetrix\AiBridge\Contracts\StreamStoreContract;
 use Tetrix\AiBridge\Enums\BlockType;
 use Tetrix\AiBridge\Models\Conversation;
@@ -20,6 +21,7 @@ use Tetrix\AiBridge\Streaming\TurnMarker;
 use Tetrix\AiBridge\Support\BridgeLog;
 use Tetrix\AiBridge\Support\DesiredBridgeVersion;
 use Tetrix\AiBridge\Tools\ToolRegistry;
+use Tetrix\AiBridge\Tools\ToolResult;
 
 /**
  * Handles incoming WebSocket messages from CLI bridge clients.
@@ -82,6 +84,14 @@ class MessageHandler
      * and only then start a new turn with it.
      */
     private const TURN_INPUT_REASONS = ['turn_not_running', 'turn_ending', 'input_not_open'];
+
+    /**
+     * The largest view a tool call may keep in the stream store, as its JSON (256 KB).
+     *
+     * #11494: the chat refuses to draw a larger `ui` (McpApps::MAX_UI_BYTES in zeroplex/ai), so
+     * storing one only costs the shared store memory for a card nobody will see.
+     */
+    private const MAX_TOOL_VIEW_BYTES = 262144;
 
     public function __construct(
         private readonly BridgeConnectionManager $connectionManager,
@@ -565,12 +575,14 @@ class MessageHandler
      * `self_update` is whether the bridge will follow `desired_bridge_version`
      * (0.24.0+); absent or non-boolean is false, which is what every older
      * bridge sends and which is right: it cannot follow one.
+     * `mcp_apps` is the MCP Apps support the bridge announced (0.27+), as
+     * `{spec, revision}`, or null: absent, or not an object naming a spec.
      *
      * Every field is type-checked, because this runs in the serve process's
      * event loop and a TypeError there drops every connected bridge.
      *
      * @param  array<string, mixed>  $message
-     * @return array{bridge_version: string|null, protocol_version: string|null, attachment_limits: array<string, int>|null, capabilities: list<string>, self_update: bool}
+     * @return array{bridge_version: string|null, protocol_version: string|null, attachment_limits: array<string, int>|null, capabilities: list<string>, self_update: bool, mcp_apps: array{spec: string, revision: int|null}|null}
      */
     public static function bridgeInfoFromHello(array $message): array
     {
@@ -602,6 +614,25 @@ class MessageHandler
             'attachment_limits' => $limits,
             'capabilities' => $capabilities,
             'self_update' => ($message['self_update'] ?? null) === true,
+            'mcp_apps' => self::mcpAppsOf($message['mcp_apps'] ?? null),
+        ];
+    }
+
+    /**
+     * The hello's `mcp_apps` reduced to `{spec, revision}`, or null when it is not
+     * an object naming a spec (an older bridge sends none).
+     *
+     * @return array{spec: string, revision: int|null}|null
+     */
+    private static function mcpAppsOf(mixed $value): ?array
+    {
+        if (! is_array($value) || ! is_string($value['spec'] ?? null) || $value['spec'] === '') {
+            return null;
+        }
+
+        return [
+            'spec' => mb_substr($value['spec'], 0, 32),
+            'revision' => is_int($value['revision'] ?? null) ? $value['revision'] : null,
         ];
     }
 
@@ -1188,7 +1219,19 @@ class MessageHandler
             $data['tool_name'] ?? '',
             $data['parameters'] ?? [],
             $data['tool_call_id'] ?? $data['call_id'] ?? '',
+            self::providerToolCallIdOf($message['provider_tool_call_id'] ?? $data['provider_tool_call_id'] ?? null),
         );
+    }
+
+    /**
+     * The CLI's own id for a call (`toolu_…`), reported on `tool_call` by bridge 0.27+.
+     *
+     * Read defensively: an older bridge sends none, Codex and Gemini report none,
+     * and anything that is not a short non-empty string is treated as none.
+     */
+    private static function providerToolCallIdOf(mixed $value): ?string
+    {
+        return is_string($value) && $value !== '' && strlen($value) <= 256 ? $value : null;
     }
 
     /**
@@ -1221,6 +1264,7 @@ class MessageHandler
             $message['tool_name'] ?? $message['data']['tool_name'] ?? '',
             $message['arguments'] ?? $message['parameters'] ?? $message['data']['parameters'] ?? $message['data']['arguments'] ?? [],
             $message['tool_call_id'] ?? $message['call_id'] ?? $message['data']['tool_call_id'] ?? $message['data']['call_id'] ?? '',
+            self::providerToolCallIdOf($message['provider_tool_call_id'] ?? $message['data']['provider_tool_call_id'] ?? null),
         );
     }
 
@@ -1228,8 +1272,11 @@ class MessageHandler
      * Execute a tool call: dispatch to StreamHandler callbacks, run the tool, return response.
      *
      * Shared implementation for both stream-envelope and top-level tool_call messages.
+     *
+     * `$providerCallId` is the CLI's own id for the call, when the bridge reported
+     * one. A tool with a view has its full result kept under it (see keepToolView()).
      */
-    private function executeToolCall(string $requestId, string $toolName, array $params, string $callId): ?array
+    private function executeToolCall(string $requestId, string $toolName, array $params, string $callId, ?string $providerCallId = null): ?array
     {
         $handler = $this->connectionManager->getPendingRequest($requestId);
 
@@ -1289,7 +1336,7 @@ class MessageHandler
         // non-blocking when the bridge server runs under ReactPHP.
 
         // Dispatch to the StreamHandler's tool call callbacks
-        $handler->dispatchToolCall($toolName, $params, $callId);
+        $handler->dispatchToolCall($toolName, $params, $callId, $providerCallId);
 
         // Execute the tool if registered
         if ($this->toolRegistry->has($toolName)) {
@@ -1317,11 +1364,43 @@ class MessageHandler
                     ];
                 }
 
+                $view = $this->toolRegistry->get($toolName)->view;
+                // #11497: without the CLI's own call id there is nothing to join the view to, so
+                // the call is shown without its card. Expected (Codex, an older bridge), but say so,
+                // so an operator can tell it from "this tool has no view".
+                if ($view !== null && $providerCallId === null) {
+                    Log::debug('AI Bridge: tool view not attached, the bridge reported no provider call id', [
+                        'request_id' => $requestId,
+                        'tool' => $toolName,
+                        'view' => $view,
+                    ]);
+                }
+                // #11489: a view tool whose handle() returns a plain value still gets a card, but one
+                // with only that value as text and no structured content. Easy to miss, so say so.
+                if ($view !== null && ! $result instanceof ToolResult) {
+                    Log::debug('AI Bridge: a tool with a view returned no ToolResult, its view gets text only', [
+                        'request_id' => $requestId,
+                        'tool' => $toolName,
+                        'view' => $view,
+                    ]);
+                }
+                if ($view !== null && $providerCallId !== null) {
+                    $this->keepToolView($handler, $providerCallId, [
+                        'resource_uri' => $view,
+                        'tool_name' => $toolName,
+                        'arguments' => $params,
+                        'result' => $result instanceof ToolResult
+                            ? $result->toCallToolResult()
+                            : ['content' => [['type' => 'text', 'text' => is_string($result) ? $result : (string) json_encode($result)]]],
+                    ]);
+                }
+
                 return [
                     'type' => MessageTypes::TOOL_RESOLVE,
                     'request_id' => $requestId,
                     'tool_call_id' => $callId,
-                    'result' => $result,
+                    // The CLI reads text only; the rest of a ToolResult is for the view.
+                    'result' => $result instanceof ToolResult ? $result->text : $result,
                 ];
             } catch (\Throwable $e) {
                 // Return a generic message to the client, log the full exception server-side.
@@ -1350,6 +1429,43 @@ class MessageHandler
             'tool_call_id' => $callId,
             'error' => "Tool '{$toolName}' is not registered.",
         ];
+    }
+
+    /**
+     * Keep a view's full result in the stream store under the CLI's call id, for the
+     * stream's `tool_result` of that call to carry as `ui` (StreamHandler joins them).
+     *
+     * Failures are logged, never thrown: the tool already ran and its text still goes
+     * to the CLI; the worst case is a call shown without its view.
+     *
+     * @param  array{resource_uri: string, tool_name: string, arguments: array<string, mixed>, result: array<string, mixed>}  $ui
+     */
+    private function keepToolView(StreamHandler $handler, string $providerCallId, array $ui): void
+    {
+        try {
+            $encoded = json_encode($ui, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            if ($encoded === false) {
+                throw new \UnexpectedValueException('the view result is not JSON-serializable: '.json_last_error_msg());
+            }
+            // #11494: a view the host will never draw is not written to the shared stream store.
+            if (strlen($encoded) > self::MAX_TOOL_VIEW_BYTES) {
+                throw new \LengthException('the view result is '.strlen($encoded).' bytes, over the '.self::MAX_TOOL_VIEW_BYTES.' a view may take');
+            }
+
+            $store = app(StreamStoreContract::class);
+            if (! $store instanceof StoresStreamValues) {
+                return;
+            }
+
+            $store->putValue($handler->requestId, StreamHandler::toolViewKey($providerCallId), $ui);
+            $handler->expectToolView($providerCallId);
+        } catch (\Throwable $e) {
+            Log::warning('AI Bridge: could not keep a tool view', [
+                'request_id' => $handler->requestId,
+                'tool' => $ui['tool_name'],
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     /**
