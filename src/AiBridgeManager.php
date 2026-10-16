@@ -162,17 +162,18 @@ class AiBridgeManager
      * Relay a view's request to an upstream MCP server through a connection's bridge and
      * return the upstream's result. Only `resources/read` (a `ui://` uri) and `tools/call`.
      *
-     * Send it to the connection named by the view's `ui.connection_id`: the bridge that made
-     * the call is the only one that has that upstream.
+     * Send it to the connection named by the view's `ui.connection_id` (the bridge that made
+     * the call is the only one that has that upstream), with `$server` pinned to the view's
+     * `ui.server`, and pass the call's `tool_call_id` so the request is held to that view.
      *
      * @param  array<string, mixed>  $params
      * @return array<string, mixed>
      *
      * @throws \Tetrix\AiBridge\Upstreams\McpRequestFailed
      */
-    public function mcpRequest(Connection $connection, string $server, string $method, array $params = [], ?int $timeout = null): array
+    public function mcpRequest(Connection $connection, string $server, string $method, array $params = [], ?int $timeout = null, ?string $toolCallId = null): array
     {
-        return $this->upstreams()->mcpRequest($connection, $server, $method, $params, $timeout);
+        return $this->upstreams()->mcpRequest($connection, $server, $method, $params, $timeout, $toolCallId);
     }
 
     /**

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tetrix\AiBridge\Upstreams;
 
+use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Contracts\Cache\Repository;
 use Illuminate\Support\Facades\Cache;
 
@@ -43,16 +44,50 @@ class PendingSignIns
             return;
         }
 
-        $index = $this->forConnectionKey($record['connection_key']);
-        $previous = $index[$record['server']] ?? null;
-        if ($previous !== null && $previous['state'] !== $record['state']) {
-            $this->store()->forget($this->stateKey($previous['state']));
+        $this->withIndexLock($record['connection_key'], function () use ($record, $ttl): void {
+            $index = $this->forConnectionKey($record['connection_key']);
+            $previous = $index[$record['server']] ?? null;
+            if ($previous !== null && $previous['state'] !== $record['state']) {
+                $this->store()->forget($this->stateKey($previous['state']));
+            }
+
+            $this->store()->put($this->stateKey($record['state']), $record, $ttl);
+
+            $index[$record['server']] = $record;
+            $this->store()->put($this->indexKey($record['connection_key']), $index, self::MAX_TTL);
+        });
+    }
+
+    /**
+     * Take a sign-in for use, once: the record when this caller is the first, null when it
+     * is gone or another request claimed it first. Forgets it either way.
+     *
+     * Atomic where the store has locks (redis, database, memcached, file, array): two
+     * callbacks racing on one state cannot both forward its code.
+     *
+     * @return array<string, mixed>|null
+     */
+    public function claim(string $state): ?array
+    {
+        if ($state === '' || strlen($state) > 512) {
+            return null;
         }
 
-        $this->store()->put($this->stateKey($record['state']), $record, $ttl);
+        $store = $this->store()->getStore();
+        $lock = $store instanceof LockProvider ? $store->lock($this->stateKey($state).':claim', 30) : null;
 
-        $index[$record['server']] = $record;
-        $this->store()->put($this->indexKey($record['connection_key']), $index, self::MAX_TTL);
+        if ($lock !== null && ! $lock->get()) {
+            return null;
+        }
+
+        $record = $this->find($state);
+        if ($record !== null) {
+            $this->forget($state);
+        }
+
+        // Not released: the record is gone, and a racer that waited for the lock would only
+        // find nothing. The lock expires on its own.
+        return $record;
     }
 
     /**
@@ -78,23 +113,27 @@ class PendingSignIns
         $this->store()->forget($this->stateKey($state));
 
         if ($record !== null) {
-            $index = $this->forConnectionKey((string) $record['connection_key']);
-            if (($index[$record['server']]['state'] ?? null) === $state) {
-                unset($index[$record['server']]);
-                $this->putIndex((string) $record['connection_key'], $index);
-            }
+            $this->withIndexLock((string) $record['connection_key'], function () use ($record, $state): void {
+                $index = $this->forConnectionKey((string) $record['connection_key']);
+                if (($index[$record['server']]['state'] ?? null) === $state) {
+                    unset($index[$record['server']]);
+                    $this->putIndex((string) $record['connection_key'], $index);
+                }
+            });
         }
     }
 
     /** Forget the sign-in pending for one upstream of a connection, if any. */
     public function forgetServer(string $connectionKey, string $server): void
     {
-        $index = $this->forConnectionKey($connectionKey);
-        if (isset($index[$server])) {
-            $this->store()->forget($this->stateKey((string) $index[$server]['state']));
-            unset($index[$server]);
-            $this->putIndex($connectionKey, $index);
-        }
+        $this->withIndexLock($connectionKey, function () use ($connectionKey, $server): void {
+            $index = $this->forConnectionKey($connectionKey);
+            if (isset($index[$server])) {
+                $this->store()->forget($this->stateKey((string) $index[$server]['state']));
+                unset($index[$server]);
+                $this->putIndex($connectionKey, $index);
+            }
+        });
     }
 
     /**
@@ -148,10 +187,57 @@ class PendingSignIns
         return self::PREFIX.'connection:'.hash('sha256', $connectionKey);
     }
 
+    /**
+     * Run a read-modify-write of a connection's index under a short lock, so the serve
+     * process and a web request cannot each write back a copy missing the other's change.
+     * Waits at most a second (it runs in the serve process's loop too), then goes ahead
+     * unlocked rather than drop the change.
+     */
+    private function withIndexLock(string $connectionKey, \Closure $change): void
+    {
+        $store = $this->store()->getStore();
+
+        if (! $store instanceof LockProvider) {
+            $change();
+
+            return;
+        }
+
+        try {
+            $store->lock($this->indexKey($connectionKey).':lock', 5)->block(1, $change);
+        } catch (\Illuminate\Contracts\Cache\LockTimeoutException) {
+            $change();
+        }
+    }
+
     private function store(): Repository
+    {
+        return self::cache();
+    }
+
+    /** The cache store pending sign-ins (and remembered upstream views) live in. */
+    public static function cache(): Repository
+    {
+        return Cache::store(self::storeName());
+    }
+
+    /** The configured store name, or null for the default. */
+    public static function storeName(): ?string
     {
         $store = config('ai-bridge.upstream_oauth.cache_store');
 
-        return Cache::store(is_string($store) && $store !== '' ? $store : null);
+        return is_string($store) && $store !== '' ? $store : null;
+    }
+
+    /**
+     * The driver of that store (`redis`, `database`, `array`, ...), or null when unknown.
+     * `array` cannot work across the serve and web processes.
+     */
+    public static function driver(): ?string
+    {
+        $name = self::storeName() ?? config('cache.default');
+        $driver = is_string($name) ? config("cache.stores.{$name}.driver") : null;
+
+        return is_string($driver) ? $driver : null;
     }
 }

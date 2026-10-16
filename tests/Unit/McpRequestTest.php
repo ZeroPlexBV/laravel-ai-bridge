@@ -109,3 +109,41 @@ it('refuses a BYOK connection, which has no upstreams', function () {
         ->toThrow(fn (McpRequestFailed $e) => expect($e->errorCode)->toBe('invalid_request'));
     Http::assertNothingSent();
 });
+
+describe('held to the view that asks (tool_call_id)', function () {
+    it('relays when the server is the one the view recorded on this connection', function () {
+        Http::fake(['*/api/mcp' => Http::response(['ok' => true, 'result' => ['content' => []]])]);
+        \Tetrix\AiBridge\Upstreams\UpstreamViews::remember($this->connection->id, 'toolu_u1', 'weather');
+
+        expect(AiBridge::mcpRequest($this->connection, 'weather', 'tools/call', ['name' => 'refresh'], null, 'toolu_u1'))->toBe(['content' => []]);
+        Http::assertSentCount(1);
+    });
+
+    it('refuses another server, and a call with no recorded view, sending nothing', function () {
+        Event::fake([McpRequestRelayed::class]);
+        Http::fake();
+        \Tetrix\AiBridge\Upstreams\UpstreamViews::remember($this->connection->id, 'toolu_u1', 'weather');
+        $other = Connection::create(['type' => Connection::TYPE_BRIDGE, 'connection_key' => 'key-2']);
+
+        expect(fn () => AiBridge::mcpRequest($this->connection, 'payments', 'tools/call', ['name' => 'pay'], null, 'toolu_u1'))
+            ->toThrow(fn (McpRequestFailed $e) => expect($e->errorCode)->toBe('refused'))
+            ->and(fn () => AiBridge::mcpRequest($this->connection, 'weather', 'tools/call', ['name' => 'refresh'], null, 'toolu_never'))
+            ->toThrow(fn (McpRequestFailed $e) => expect($e->errorCode)->toBe('unknown_view'))
+            ->and(fn () => AiBridge::mcpRequest($other, 'weather', 'tools/call', ['name' => 'refresh'], null, 'toolu_u1'))
+            ->toThrow(fn (McpRequestFailed $e) => expect($e->errorCode)->toBe('unknown_view'));
+
+        Http::assertNothingSent();
+    });
+
+    it('finds the view in the recorded blocks once the cache forgot it', function () {
+        Http::fake(['*/api/mcp' => Http::response(['ok' => true, 'result' => []])]);
+        $conversation = \Tetrix\AiBridge\Models\Conversation::create(['mode' => 'bridge', 'provider' => 'claude', 'connection_id' => $this->connection->id]);
+        $conversation->messages()->create(['role' => 'assistant', 'content' => '', 'blocks' => [
+            ['type' => 'tool_call', 'tool_call_id' => 'toolu_old', 'ui' => ['server' => 'weather', 'connection_id' => $this->connection->id]],
+        ]]);
+
+        expect(AiBridge::mcpRequest($this->connection, 'weather', 'tools/call', ['name' => 'refresh'], null, 'toolu_old'))->toBe([])
+            ->and(fn () => AiBridge::mcpRequest($this->connection, 'other', 'tools/call', ['name' => 'x'], null, 'toolu_old'))
+            ->toThrow(fn (McpRequestFailed $e) => expect($e->errorCode)->toBe('refused'));
+    });
+});

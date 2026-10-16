@@ -70,6 +70,12 @@ class UpstreamOAuthCallbackController extends Controller
             return $this->page(400, false, $server, 'invalid_request', 'The sign-in came back without a code.');
         }
 
+        // Claimed atomically: of two requests racing on one state, only one forwards it.
+        $signIn = $this->signIns->claim((string) $state);
+        if ($signIn === null) {
+            return $this->page(404, false, $server, 'unknown_state', 'This sign-in link is unknown or was already used. Start the sign-in again from the application.');
+        }
+
         $answer = $this->upstreams->completeSignIn($signIn, $query);
         $ok = ($answer['ok'] ?? false) === true;
         $code = $ok ? null : (is_string($answer['code'] ?? null) ? $answer['code'] : 'failed');

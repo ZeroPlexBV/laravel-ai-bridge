@@ -149,14 +149,37 @@ it('drops a ui that is not an upstream view', function (array $ui) {
     'no tool name' => [upstreamUi(['tool_name' => null])],
 ]);
 
-it('lets a bridge-sent view win over the server-built path for the same call id', function () {
+it('ignores a bridge-sent ui on a server tool\'s call, keeping the server-built view', function () {
     $rig = upstreamViewRig();
 
     upstreamBlock($rig, 0, 'toolu_s1');
     ($rig->send)(['type' => MessageTypes::TOOL_CALL, 'request_id' => 'req-u', 'tool_call_id' => 'tc_1', 'tool_name' => 'show_grant_request', 'arguments' => [], 'provider_tool_call_id' => 'toolu_s1']);
     ($rig->stream)(MessageTypes::TOOL_RESULT, ['tool_call_id' => 'toolu_s1', 'result' => 'Shown.', 'ui' => upstreamUi()]);
 
-    expect(upstreamResults($rig)[0]['ui']['server'])->toBe('weather');
+    $ui = upstreamResults($rig)[0]['ui'];
+    expect($ui['resource_uri'])->toBe('ui://studio/grant')
+        ->and($ui)->not->toHaveKey('server');
+});
+
+it('takes a ui only from the very first frame of a call, not the first that carries one', function () {
+    $rig = upstreamViewRig();
+
+    upstreamBlock($rig, 0, 'toolu_u1');
+    ($rig->stream)(MessageTypes::TOOL_RESULT, ['tool_call_id' => 'toolu_u1', 'result' => 'Shown ', 'chunk_index' => 0]);
+    ($rig->stream)(MessageTypes::TOOL_RESULT, ['tool_call_id' => 'toolu_u1', 'result' => '3', 'chunk_index' => 1, 'final' => true, 'ui' => upstreamUi()]);
+
+    expect(upstreamResults($rig)[0])->not->toHaveKey('ui')
+        ->and(upstreamResults($rig)[0]['result'])->toBe('Shown 3');
+});
+
+it('remembers which server a kept view belongs to, for holding a view\'s requests to it', function () {
+    $rig = upstreamViewRig();
+
+    upstreamBlock($rig, 0, 'toolu_u1');
+    ($rig->stream)(MessageTypes::TOOL_RESULT, ['tool_call_id' => 'toolu_u1', 'result' => 'Shown 3', 'ui' => upstreamUi()]);
+
+    expect(\Tetrix\AiBridge\Upstreams\UpstreamViews::serverOf($rig->connection->id, 'toolu_u1'))->toBe('weather')
+        ->and(\Tetrix\AiBridge\Upstreams\UpstreamViews::serverOf($rig->connection->id + 1, 'toolu_u1'))->toBeNull();
 });
 
 it('still attaches a server-built view, without server or connection_id, when the bridge sends none', function () {

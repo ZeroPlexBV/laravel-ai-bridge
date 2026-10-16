@@ -204,12 +204,20 @@ class StreamHandler
     /**
      * Views a bridge sent on the first `tool_result` of a call to an upstream tool
      * (`tool_result.ui` naming a `server`), by call id, until that result is dispatched.
-     * They win over a server-built view for the same id: a bridge-sent view is never
-     * overwritten by the server's path.
+     * Never taken for a call whose view the server keeps itself (a server tool), so the
+     * two cannot meet on one call id.
      *
      * @var array<string, array<string, mixed>>
      */
     private array $upstreamViews = [];
+
+    /**
+     * The call ids whose first tool_result frame has arrived. Only that first frame may
+     * carry an upstream view; a `ui` on any later frame is ignored.
+     *
+     * @var array<string, true>
+     */
+    private array $seenToolResults = [];
 
     public readonly string $requestId;
 
@@ -703,6 +711,11 @@ class StreamHandler
         }
 
         $this->upstreamViews[$toolCallId] = $view;
+
+        // Remembered so a later mcp_request naming this call can be held to its server.
+        if ($view['connection_id'] !== null) {
+            \Tetrix\AiBridge\Upstreams\UpstreamViews::remember($view['connection_id'], $toolCallId, $view['server']);
+        }
     }
 
     /** The stream-store key a view's result is kept under, per CLI call id. */
@@ -893,9 +906,21 @@ class StreamHandler
         $isError = is_bool($data['is_error'] ?? null) ? $data['is_error'] : null;
         $parent = self::parentOf($data);
 
-        // An upstream tool's view rides on the first frame of its result only.
-        if (array_key_exists('ui', $data) && $toolCallId !== '' && ! isset($this->upstreamViews[$toolCallId])) {
-            $this->keepUpstreamView($toolCallId, $data['ui']);
+        // An upstream tool's view rides on the first frame of its result only, and never on
+        // a server tool's call (one whose view the server keeps itself): a bridge must not
+        // be able to put its own card on the server's tool.
+        if ($toolCallId !== '' && ! isset($this->seenToolResults[$toolCallId])) {
+            $this->seenToolResults[$toolCallId] = true;
+            if (array_key_exists('ui', $data)) {
+                if (isset($this->expectedViews[$toolCallId])) {
+                    Log::warning('AI Bridge: a bridge sent a ui for a server tool\'s call, ignored', [
+                        'request_id' => $this->requestId,
+                        'tool_call_id' => $toolCallId,
+                    ]);
+                } else {
+                    $this->keepUpstreamView($toolCallId, $data['ui']);
+                }
+            }
         }
 
         if (! is_int($data['chunk_index'] ?? null)) {

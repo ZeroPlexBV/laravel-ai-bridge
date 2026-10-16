@@ -109,8 +109,8 @@ class UpstreamClient
 
     /**
      * Pass the authorization server's redirect for a pending sign-in to its bridge, and
-     * return how it ended. The caller has already checked the sign-in is the person's; it is
-     * forgotten here before anything is sent, so a state is used once.
+     * return how it ended. The caller has already checked the sign-in is the person's and
+     * claimed it (PendingSignIns::claim()), so a state is used once.
      *
      * @param  array<string, mixed>  $signIn  A PendingSignIns record.
      * @param  array<string, mixed>  $query  The redirect's query parameters.
@@ -118,8 +118,6 @@ class UpstreamClient
      */
     public function completeSignIn(array $signIn, array $query): array
     {
-        $this->signIns->forget((string) $signIn['state']);
-
         $body = ['server' => $signIn['server'], 'state' => $signIn['state']];
         foreach (['code', 'iss', 'error', 'error_description'] as $field) {
             if (is_string($query[$field] ?? null) && $query[$field] !== '') {
@@ -140,13 +138,19 @@ class UpstreamClient
      * refused here without reaching the bridge. A bridge whose hello had no `mcp_apps` is
      * refused too. Fires McpRequestRelayed whatever the outcome.
      *
+     * Pass `$toolCallId` (the `tool_call_id` of the result whose view is asking) whenever the
+     * request comes from a view, as a host should: the request is then held to that view, and
+     * refused (`refused`) unless `$server` is the server its recorded `ui` names on this
+     * connection, or (`unknown_view`) when no such view was recorded here.
+     *
      * @param  array<string, mixed>  $params  The MCP params of the method, unchanged.
      * @param  int|null  $timeout  Seconds to wait; default ai-bridge.server.mcp_request_timeout.
+     * @param  string|null  $toolCallId  The call whose view makes the request.
      * @return array<string, mixed>  The MCP result (`contents` for resources/read, a CallToolResult for tools/call).
      *
      * @throws McpRequestFailed  With the bridge's code, or one decided here.
      */
-    public function mcpRequest(Connection $connection, string $server, string $method, array $params = [], ?int $timeout = null): array
+    public function mcpRequest(Connection $connection, string $server, string $method, array $params = [], ?int $timeout = null, ?string $toolCallId = null): array
     {
         $started = microtime(true);
         $target = $method === 'tools/call'
@@ -158,6 +162,16 @@ class UpstreamClient
             $refusal = self::refusalFor(UpstreamFrames::serverOf($server), $method, $params);
             if ($refusal !== null) {
                 throw new McpRequestFailed($refusal['code'], $refusal['error']);
+            }
+
+            if ($toolCallId !== null) {
+                $viewServer = UpstreamViews::serverOf((int) $connection->id, $toolCallId);
+                if ($viewServer === null) {
+                    throw new McpRequestFailed('unknown_view', 'No upstream view was recorded for this call on this connection.');
+                }
+                if ($viewServer !== $server) {
+                    throw new McpRequestFailed('refused', 'This view belongs to another upstream server.');
+                }
             }
 
             $wait = $timeout ?? (int) config('ai-bridge.server.mcp_request_timeout', 65);

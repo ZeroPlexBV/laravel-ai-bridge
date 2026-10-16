@@ -117,6 +117,16 @@ class ServeCommand extends Command
             $this->newLine();
         }
 
+        // Pending upstream sign-ins are written here and read by the web process; an
+        // in-memory cache store loses them between the two, and every callback 404s.
+        if (\Tetrix\AiBridge\Upstreams\UpstreamOAuth::enabled() && \Tetrix\AiBridge\Upstreams\PendingSignIns::driver() === 'array') {
+            $this->line('  <fg=yellow;options=bold>⚠  Upstream sign-in:</> the cache store for pending sign-ins is "array" (per process).');
+            $this->line('     Sign-ins to upstream MCP servers will not complete. Set AI_BRIDGE_UPSTREAM_OAUTH_CACHE_STORE');
+            $this->line('     (or the default cache) to a shared store such as redis or database.');
+            $this->newLine();
+            \Tetrix\AiBridge\Support\BridgeLog::warning('the upstream_oauth cache store is "array": pending upstream sign-ins cannot reach the web process');
+        }
+
         // Prefer the configured public URL so operators with TLS see the correct
         // wss:// connection command.
         $publicUrl = config('ai-bridge.server.public_url');

@@ -109,8 +109,10 @@ Route::middleware($middleware)->prefix('ai-bridge')->group(function () {
     });
 
     // A view's request to an upstream MCP server, relayed through the bridge that made
-    // the call (`mcp_request`). Held open while the upstream answers, so throttled apart.
-    Route::middleware('throttle:120,1')->group(function () {
+    // the call (`mcp_request`). Held open (up to mcp_request_timeout) while the upstream
+    // answers, so throttled lower than the browsing routes. Like every route in this
+    // group it has no CSRF protection of its own: see the README.
+    Route::middleware('throttle:30,1')->group(function () {
         Route::post('/connections/{id}/mcp', [UpstreamController::class, 'mcp'])
             ->name('ai-bridge.upstreams.mcp');
     });

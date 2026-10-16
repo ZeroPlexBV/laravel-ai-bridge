@@ -78,7 +78,9 @@ class UpstreamController extends Controller
     }
 
     /**
-     * POST /ai-bridge/connections/{id}/mcp — relay a view's request (`{server, method, params}`).
+     * POST /ai-bridge/connections/{id}/mcp — relay a view's request
+     * (`{server, method, params, tool_call_id?}`). Send `tool_call_id`, the call whose view
+     * asks: the request is then refused unless `server` is that view's.
      *
      * 200 `{result}`, or `{error, code}` with 400 (refused here or by the bridge), 404
      * (no bridge connected), 409 (the bridge has no mcp_apps), 502 (the upstream failed)
@@ -94,13 +96,14 @@ class UpstreamController extends Controller
         $server = $request->input('server');
         $method = $request->input('method');
         $params = $request->input('params', []);
+        $toolCallId = $request->input('tool_call_id');
 
-        if (! is_string($server) || ! is_string($method) || ! is_array($params)) {
-            return response()->json(['code' => 'invalid_request', 'error' => 'Body must be {server: string, method: string, params: object}.'], 400);
+        if (! is_string($server) || ! is_string($method) || ! is_array($params) || ($toolCallId !== null && ! is_string($toolCallId))) {
+            return response()->json(['code' => 'invalid_request', 'error' => 'Body must be {server: string, method: string, params: object, tool_call_id?: string}.'], 400);
         }
 
         try {
-            return response()->json(['result' => $this->upstreams->mcpRequest($connection, $server, $method, $params)]);
+            return response()->json(['result' => $this->upstreams->mcpRequest($connection, $server, $method, $params, null, $toolCallId)]);
         } catch (McpRequestFailed $e) {
             return response()->json(['code' => $e->errorCode, 'error' => $e->getMessage()], self::statusFor($e->errorCode));
         }
@@ -109,7 +112,7 @@ class UpstreamController extends Controller
     private static function statusFor(mixed $code): int
     {
         return match ($code) {
-            'invalid_request', 'unsupported', 'refused', 'unknown_server', 'not_oauth' => 400,
+            'invalid_request', 'unsupported', 'refused', 'unknown_server', 'not_oauth', 'unknown_view' => 400,
             'not_connected' => 404,
             'mcp_apps_unsupported', 'mcp_upstream_auth_unsupported' => 409,
             'timeout', 'no_answer' => 504,

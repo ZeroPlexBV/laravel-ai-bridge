@@ -220,6 +220,10 @@ return [
     |   process writes and the web process reads it, so it must be shared: not
     |   'array'. null = the default store.
     | - 'view': the Blade view the callback renders.
+    | - 'view_ttl': how long the server of an upstream tool's view is remembered
+    |   in that cache, so AiBridge::mcpRequest() with a tool_call_id can hold a
+    |   view's request to its server (seconds). After that the recorded message
+    |   blocks are looked through instead.
     |
     */
 
@@ -232,6 +236,7 @@ return [
         'start_timeout' => env('AI_BRIDGE_UPSTREAM_OAUTH_START_TIMEOUT', 20), // seconds
         'cache_store' => env('AI_BRIDGE_UPSTREAM_OAUTH_CACHE_STORE'),
         'view' => 'ai-bridge::upstream-oauth.result',
+        'view_ttl' => env('AI_BRIDGE_UPSTREAM_VIEW_TTL', 604800), // seconds (7 days)
     ],
 
     /*

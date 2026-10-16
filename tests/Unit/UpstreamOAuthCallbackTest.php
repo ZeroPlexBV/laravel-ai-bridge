@@ -110,6 +110,42 @@ describe('GET the callback', function () {
         Http::assertSentCount(1);
     });
 
+    it('claims a state once, and not at all while another request holds it', function () {
+        pendingSignIn($this->connection);
+        $signIns = app(PendingSignIns::class);
+
+        // A racing callback holds the claim: this one gets nothing and forwards nothing.
+        $lock = \Illuminate\Support\Facades\Cache::lock('ai-bridge:upstream-oauth:state:'.hash('sha256', CB_STATE).':claim', 30);
+        expect($lock->get())->toBeTrue()
+            ->and($signIns->claim(CB_STATE))->toBeNull()
+            ->and($signIns->find(CB_STATE))->not->toBeNull();
+        $lock->release();
+
+        expect($signIns->claim(CB_STATE)['server'])->toBe('kaizen')
+            ->and($signIns->claim(CB_STATE))->toBeNull()
+            ->and($signIns->forConnectionKey('key-1'))->toBe([]);
+    });
+
+    it('answers 404 when the state is claimed between the checks and the forwarding', function () {
+        Http::fake();
+        pendingSignIn($this->connection);
+        \Illuminate\Support\Facades\Cache::lock('ai-bridge:upstream-oauth:state:'.hash('sha256', CB_STATE).':claim', 30)->get();
+
+        $this->actingAs($this->person)->get(callbackUrl(['state' => CB_STATE, 'code' => 'a']))->assertNotFound();
+
+        Http::assertNothingSent();
+    });
+
+    it('keeps both sign-ins in the index when two upstreams write it', function () {
+        pendingSignIn($this->connection);
+        app(PendingSignIns::class)->put([
+            'state' => 'Zz9yX8wV7uT6sR5qP4oN3mL2kJ1iH0gF', 'connection_key' => 'key-1', 'connection_id' => $this->connection->id,
+            'server' => 'other', 'authorization_url' => 'https://o.example/a', 'expires_at' => gmdate('Y-m-d\TH:i:s\Z', time() + 600), 'reason' => 'no_token',
+        ]);
+
+        expect(array_keys(app(PendingSignIns::class)->forConnectionKey('key-1')))->toBe(['kaizen', 'other']);
+    });
+
     it('answers 404 for an expired state, without forwarding anything', function () {
         Http::fake();
         pendingSignIn($this->connection, 600);
@@ -269,6 +305,20 @@ describe('JSON routes', function () {
             ->assertJson(['sent' => true]);
 
         expect(app(PendingSignIns::class)->find(CB_STATE))->toBeNull();
+    });
+
+    it('passes tool_call_id on, refusing a server other than the view\'s', function () {
+        Http::fake(['*/api/mcp' => Http::response(['ok' => true, 'result' => []])]);
+        \Tetrix\AiBridge\Upstreams\UpstreamViews::remember($this->connection->id, 'toolu_u1', 'weather');
+        $url = route('ai-bridge.upstreams.mcp', ['id' => $this->connection->id]);
+
+        $this->actingAs($this->person)->postJson($url, ['server' => 'weather', 'method' => 'tools/call', 'params' => ['name' => 'refresh'], 'tool_call_id' => 'toolu_u1'])
+            ->assertOk();
+        $this->actingAs($this->person)->postJson($url, ['server' => 'payments', 'method' => 'tools/call', 'params' => ['name' => 'pay'], 'tool_call_id' => 'toolu_u1'])
+            ->assertStatus(400)
+            ->assertJsonPath('code', 'refused');
+
+        Http::assertSentCount(1);
     });
 
     it('relays a view\'s request and maps failures to statuses', function () {
