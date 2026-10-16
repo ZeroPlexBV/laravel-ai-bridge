@@ -3,6 +3,48 @@
 Release notes for earlier versions are on the GitHub releases page of
 tetrixdev/laravel-ai-bridge. This file starts with 0.16.0-RC1.
 
+## [Unreleased] — to be released as 0.19.0
+
+Upstream MCP Apps and OAuth sign-in for the MCP servers a bridge connects to
+(`--mcp-upstreams`). Pairs with tetrixdev/ai-bridge PR #60.
+
+### Added
+
+- **Upstream tool views.** A bridge's `tool_result.ui` naming a `server` (an upstream tool's
+  view) is kept on the stream event, the recorded block and `onToolResult`'s fifth argument,
+  under the same 256 KB and turn-budget rules as a server-built view, from the first frame of
+  the call only, and stamped with `connection_id` (the connection that streamed it). A
+  server-built view never overwrites it.
+- **`AiBridge::mcpRequest($connection, $server, $method, $params)`** (also
+  `AiBridge::upstreams()->mcpRequest()`, `POST /ai-bridge/connections/{id}/mcp`): relays a
+  view's `resources/read` (`ui://` only) or `tools/call` to the bridge as `mcp_request` and
+  returns the `mcp_result`, or throws `Upstreams\McpRequestFailed` with its code. Works from
+  any process through the serve process's new `POST /api/mcp`; refuses other methods locally
+  and bridges without `hello.mcp_apps`. Event `McpRequestRelayed` per request.
+- **OAuth sign-in to upstreams** (bridge `hello.mcp_upstream_auth`): `welcome.upstream_oauth`
+  with the callback URL; `upstream_status` recorded (`ConnectionStatus`: `mcp_upstream_auth`,
+  `upstream_status`); `upstream_auth_required` kept as a pending sign-in in the cache; the
+  callback route `ai-bridge.upstream-oauth.callback` (`web` + `auth`, 404 unknown or expired
+  state, 403 someone else's) forwards `upstream_auth_code`, waits for `upstream_auth_result`
+  and renders the overridable view `ai-bridge::upstream-oauth.result`.
+  `AiBridge::upstreams()`: `status()`, `pending()`, `startSignIn()` (`upstream_auth_start`),
+  `forget()` (`upstream_auth_forget`), and the JSON routes `ai-bridge.upstreams.index`,
+  `.pending`, `.sign-in`, `.forget`. Events `UpstreamAuthRequired`, `UpstreamAuthCompleted`,
+  `UpstreamStatusChanged`.
+- Config: `ai-bridge.upstream_oauth.*` (`enabled`, `path`, `middleware`, `redirect_uri`,
+  `callback_timeout`, `start_timeout`, `cache_store`, `view`) and
+  `ai-bridge.server.mcp_request_timeout`. Serve-process endpoints `POST /api/mcp`,
+  `/api/upstream/auth-start`, `/api/upstream/auth-code`, `/api/upstream/auth-forget`;
+  `/api/status` reports `upstream_status`.
+
+### Upgrading
+
+- The pending sign-ins live in the cache and are written by the serve process: use a cache
+  store both processes share (`AI_BRIDGE_UPSTREAM_OAUTH_CACHE_STORE`).
+- The callback URL is built from `APP_URL`; set it to the public address, or set
+  `AI_BRIDGE_UPSTREAM_OAUTH_REDIRECT_URI`. `AI_BRIDGE_UPSTREAM_OAUTH=false` turns it off.
+- `GET /ai-bridge/connections` adds `mcp_upstream_auth` and `upstream_status` for a bridge.
+
 ## [Unreleased] — to be released as 0.18.0
 
 The MCP App cards built in the ZeroPlexBV fork (D09346, released there as

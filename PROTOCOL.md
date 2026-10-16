@@ -17,6 +17,7 @@ Specification for the WebSocket protocol between `@tetrixdev/ai-bridge` (npm, cl
 - [Conversation Continuity](#conversation-continuity)
 - [Streaming Events](#streaming-events)
 - [Tool Calls](#tool-calls)
+- [Upstream MCP Apps and OAuth sign-in](#upstream-mcp-apps-and-oauth-sign-in)
 - [Heartbeat](#heartbeat)
 - [Error Handling](#error-handling)
 - [Provider Reference](#provider-reference)
@@ -1737,8 +1738,8 @@ Server                                   Bridge (0.27+)                   CLI
 The server serves `ui://` resources from its own registry. What the person does in a view never
 travels over this WebSocket and is never a tool call: the host handles a button press itself,
 behind the person's sign-in, so the assistant cannot trigger it. Views for tools of MCP servers
-configured on the machine (`--mcp-upstreams`, `mcp_request` / `mcp_result`) are not handled by this
-server: it records `mcp_apps` but never sends `mcp_request`.
+configured on the machine (`--mcp-upstreams`) arrive differently: see
+[Upstream MCP Apps and OAuth sign-in](#upstream-mcp-apps-and-oauth-sign-in).
 
 **A view that is no longer registered.** History can name a `resource_uri` that a later release
 removed or renamed; `AiBridge::views()->render()` then throws `ViewNotFoundException`. A host
@@ -1776,6 +1777,178 @@ If a tool execution fails:
 ```
 
 The bridge passes this error back to the CLI, which typically incorporates it into its response ("I'm sorry, I made a mistake with the dice notation...").
+
+---
+
+## Upstream MCP Apps and OAuth sign-in
+
+A bridge started with `--mcp-upstreams` is the MCP client of servers on the operator's
+side. Their tools run on the bridge and never produce a `tool_call`, so the server only
+ever sees two things: the view of such a call (`tool_result.ui` naming a `server`) and,
+through this section's frames, the upstreams' state and their OAuth sign-ins. The
+bridge's side of every frame is specified in ai-bridge's PROTOCOL.md ("MCP Apps" and
+"Upstream sign-in (OAuth)"); this section says what this server does with them. Pairs
+with ai-bridge PR #60.
+
+### Handshake
+
+- **`hello.mcp_apps`** (`{spec, revision}`): the bridge relays `mcp_request`. Without it,
+  `mcp_request` is never sent (the bridge would log it and never answer).
+- **`hello.mcp_upstream_auth`** (`{revision}`): the bridge implements the sign-in frames
+  below. Without it, `upstream_auth_start`, `upstream_auth_code` and `upstream_auth_forget`
+  are never sent. Both are recorded in `last_bridge` and reported on the connection status
+  (`mcp_apps`, `mcp_upstream_auth`).
+- **`welcome.upstream_oauth`** (`{redirect_uri}`): the absolute URL of the callback route
+  (`ai-bridge.upstream-oauth.callback`, default `/ai-bridge/upstream-oauth/callback`),
+  built from `APP_URL` (or `ai-bridge.upstream_oauth.redirect_uri`), never from a request's
+  host: the bridge registers it with the authorization server and keys its client
+  registration on it. Sent to every bridge while `ai-bridge.upstream_oauth.enabled`; absent
+  when off, or when the URL would not be an absolute http(s) one.
+
+### `tool_result.ui` from the bridge
+
+```json
+{ "type": "stream", "request_id": "req_1", "event": "tool_result", "data": {
+  "tool_call_id": "toolu_01AbC", "result": "Shown 3",
+  "ui": { "server": "weather", "tool_name": "show_forecast", "resource_uri": "ui://weather/view.html",
+          "arguments": { "city": "Utrecht" }, "result": { "content": [ ... ], "structuredContent": { ... } } } } }
+```
+
+Taken from the **first** `tool_result` frame of a call only. Kept when it names a `server`,
+a `tool_name`, a `ui://` `resource_uri`, and has object `arguments` and `result`, and is at
+most 256 KB as JSON; otherwise dropped with a log line (the result still goes through). The
+server adds **`connection_id`**: the `ai_bridge_connections` id of the bridge that streamed it
+(whatever the bridge put there is replaced), so a later `mcp_request` goes to the machine that
+made the call. It then travels exactly like a server-built view: on the buffered
+`tool_result` event, on the recorded block (whole or dropped against the turn's budget, never
+cut), and to `onToolResult` as the fifth argument. A server-built view for the same call id
+never overwrites it. A server-built view has no `server` and no `connection_id`.
+
+### Server → Bridge: `mcp_request` / Bridge → Server: `mcp_result`
+
+```json
+{ "type": "mcp_request", "id": "mcp-3f2a…", "server": "weather", "method": "resources/read", "params": { "uri": "ui://weather/view.html" } }
+{ "type": "mcp_result", "id": "mcp-3f2a…", "result": { "contents": [ ... ] } }
+{ "type": "mcp_result", "id": "mcp-3f2a…", "error": "refresh is not callable from a view", "code": "refused" }
+```
+
+The server chooses `id` and answers whoever waits on it. Only `resources/read` of a `ui://`
+uri and `tools/call` (with a `name` and object `arguments`) are sent; anything else is refused
+before it reaches a bridge. `result` is passed on unchanged. `code` is one of `unknown_server`,
+`unavailable`, `timeout`, `refused`, `unsupported`, `upstream_error`; any other value becomes
+`upstream_error`. An answer from another connection than the one asked is ignored.
+
+### Bridge → Server: `upstream_status`
+
+The complete list of upstreams, after `welcome` (only from a bridge with upstreams
+configured: absent means none) and on every change. Each entry is reduced to `server`,
+`transport` (`http`|`stdio`|null), `origin` (scheme, host and port only; null for stdio),
+`auth` (`none`|`secrets`|`oauth`|null), `state` (`connecting`|`connected`|`needs_auth`|
+`unavailable`; anything else reads `unavailable`), `tools` (≥ 0) and `error` (≤ 300
+characters; for `needs_auth` a machine code: `no_token`, `refresh_failed`, `rejected`,
+`no_redirect_uri`, or the last failed sign-in's code). Kept per connection in the serve
+process, reported by `/api/status` as `upstream_status`, stored in `last_bridge` by
+`ConnectionStatus`, and announced as `UpstreamStatusChanged` when it differs from the last.
+
+### Bridge → Server: `upstream_auth_required`
+
+```json
+{ "type": "upstream_auth_required", "server": "kaizen", "state": "Xb3…", "authorization_url": "https://kaizen.example/oauth/authorize?…",
+  "expires_at": "2026-10-16T18:10:00Z", "reason": "no_token" }
+```
+
+Kept as a **pending sign-in** (state → connection key, connection id, server,
+authorization_url, expires_at, reason) in the cache (`ai-bridge.upstream_oauth.cache_store`)
+until `expires_at`, at most 15 minutes. A new one for the same upstream replaces the old one.
+Announced as `UpstreamAuthRequired`, and answers a waiting `upstream_auth_start`. Dropped when
+malformed (state under 16 or over 512 characters, a non-http(s) URL, an unreadable or past
+`expires_at`).
+
+### Server → Bridge: `upstream_auth_start`, `upstream_auth_code`, `upstream_auth_forget`
+
+```json
+{ "type": "upstream_auth_start", "server": "kaizen" }
+{ "type": "upstream_auth_code", "server": "kaizen", "state": "Xb3…", "code": "def50200…", "iss": "https://kaizen.example" }
+{ "type": "upstream_auth_code", "server": "kaizen", "state": "Xb3…", "error": "access_denied", "error_description": "The user denied the request" }
+{ "type": "upstream_auth_forget", "server": "kaizen" }
+```
+
+`upstream_auth_code` carries the redirect's `code`, `iss`, `error` and `error_description`
+as they came, and is only sent after the callback checked the state (below). Two
+`upstream_auth_start` for one upstream while the first is unanswered share one frame.
+
+### Bridge → Server: `upstream_auth_result`
+
+With a `state`: answers the callback waiting on that state. Without one (`state: null`):
+answers a waiting `upstream_auth_start`, and is announced as `UpstreamAuthCompleted`
+(failed, `userId` null), because it may also be a sign-in the bridge could not prepare on
+its own after connecting, which nobody waits for. `code` is passed when it is one of
+`unknown_server`, `not_oauth`, `unknown_state`, `denied`, `no_redirect_uri`,
+`discovery_failed`, `registration_failed`, `exchange_failed`, `issuer_mismatch`; otherwise
+`failed`.
+
+### The callback
+
+`GET /ai-bridge/upstream-oauth/callback?state=…&code=…[&iss=…]` (or `&error=…`), behind
+`ai-bridge.upstream_oauth.middleware` (`web`, `auth`):
+
+1. The state must name a pending sign-in: else **404**. Expired: **404**. Its connection
+   must be one the connections resolver gives the signed-in person (a bridge without a
+   connection row: the person whose id is its key): else **403**. Nothing is forwarded in
+   these cases. Neither `code` nor `error`: **400**.
+2. The pending sign-in is forgotten (a state is used once) and `upstream_auth_code` is sent.
+3. The serve process waits up to `ai-bridge.upstream_oauth.callback_timeout` (15 s) for the
+   `upstream_auth_result` with that state.
+4. A small view (`ai-bridge::upstream-oauth.result`, overridable) says "Connected — you can
+   close this tab" (**200**) or the error: the bridge's refusal (**400**, `denied` among
+   them), no answer (**504**, `timeout`), or bridge / serve process unreachable (**502**).
+   `UpstreamAuthCompleted` is fired with the outcome.
+
+### The serve process's internal API
+
+The web process reaches the serve process over its internal HTTP API with a relay token
+whose `sub` is the connection key, like `/api/request/input`; the serve process sends the
+frame on that bridge's socket and holds the response open until the bridge answers (matched
+by id or state, and by connection), the bridge drops (**404** `not_connected`), or the
+timeout fires (**504**). A bridge without the needed hello field: **409**
+`mcp_apps_unsupported` / `mcp_upstream_auth_unsupported`.
+
+| Endpoint | Body | Answer |
+|---|---|---|
+| `POST /api/mcp` | `{server, method, params}` | `{ok: true, result}` or `{ok: false, code, error}`; waits `ai-bridge.server.mcp_request_timeout` (65 s) |
+| `POST /api/upstream/auth-start` | `{server}` | `{ok: true, server, authorization_url, expires_at, reason}` or `{ok: false, server, code, error}`; 504 `no_answer` after `start_timeout` (20 s) |
+| `POST /api/upstream/auth-code` | `{server, state, code?, iss?, error?, error_description?}` | `{ok, server, code?, error?}`; 504 `timeout` after `callback_timeout` |
+| `POST /api/upstream/auth-forget` | `{server}` | `{sent: true}` once written (the bridge answers only with a new `upstream_status`) |
+| `GET /api/status` | | adds `upstream_status`, and `bridge.mcp_upstream_auth` |
+
+### The PHP API and the JSON routes
+
+`AiBridge::upstreams()` (`Upstreams\UpstreamClient`) wraps the internal API for a
+`Connection` the caller already resolved through its own scope:
+
+- `status($connection)`: `{connected, mcp_apps, mcp_upstream_auth, upstreams, pending}`
+- `pending($connection)`: `[{connection_id, server, authorization_url, expires_at, reason}]`
+- `startSignIn($connection, $server)`: the start's answer
+- `forget($connection, $server)`: bool, and drops the upstream's pending sign-in
+- `mcpRequest($connection, $server, $method, $params, $timeout = null)`: the result, or
+  throws `McpRequestFailed` (`errorCode`: the bridge's code, or `invalid_request`,
+  `not_connected`, `mcp_apps_unsupported`, `unreachable`); fires `McpRequestRelayed` (user,
+  connection, server, method, tool name or uri, outcome, duration) every time. Also
+  `AiBridge::mcpRequest()`.
+
+Beside the connection routes, behind `ai-bridge.route_middleware` and the connections
+resolver:
+
+| Route | Name |
+|---|---|
+| `GET /ai-bridge/connections/{id}/upstreams` | `ai-bridge.upstreams.index` |
+| `GET /ai-bridge/connections/{id}/upstreams/pending` | `ai-bridge.upstreams.pending` |
+| `POST /ai-bridge/connections/{id}/upstreams/{server}/sign-in` | `ai-bridge.upstreams.sign-in` |
+| `DELETE /ai-bridge/connections/{id}/upstreams/{server}/sign-in` | `ai-bridge.upstreams.forget` |
+| `POST /ai-bridge/connections/{id}/mcp` (`{server, method, params}`) | `ai-bridge.upstreams.mcp` |
+
+Drawing the card, asking the person's consent for a view's CSP or permissions, and what a
+button means stay with the host.
 
 ---
 
@@ -1981,6 +2154,10 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `turn_input_ack` | Answering a `turn_input` |
 | `upload_done` | The one answer to an `upload_offer` |
 | `file_read_result` | Answering a `file_read` |
+| `mcp_result` | Answering an `mcp_request` |
+| `upstream_status` | The complete list of upstream MCP servers, on every change |
+| `upstream_auth_required` | An upstream needs the person to sign in |
+| `upstream_auth_result` | How a sign-in ended, or why one could not start |
 | `error` | Request-level error (non-streaming) |
 
 ### Server → Bridge
@@ -1997,6 +2174,8 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `turn_input` | A message for a turn that is still running |
 | `upload_offer` / `upload_sent` / `upload_abort` | A person's file on its way to the machine |
 | `file_read` / `file_read_cancel` | Asking for a file the machine recorded |
+| `mcp_request` | A view's `resources/read` or `tools/call` for an upstream (needs `hello.mcp_apps`) |
+| `upstream_auth_start` / `upstream_auth_code` / `upstream_auth_forget` | Upstream OAuth sign-in (needs `hello.mcp_upstream_auth`) |
 
 ---
 
@@ -2042,6 +2221,8 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 - `1.x` — Stable, semantic versioning applies
 
 **Helper activity does not bump the version either.** `parent_tool_use_id` on `block_start` and `tool_result`, the `task` stream event and `done.subagent_stats` are additive: absent means what it always meant, and a consumer ignores an event it does not know.
+
+**Upstream MCP Apps and sign-in do not bump the version.** `hello.mcp_upstream_auth`, `welcome.upstream_oauth`, `tool_result.ui.server`, `mcp_request` / `mcp_result` and the `upstream_*` frames are additive; a server sends none of its frames to a bridge that did not announce the matching hello field, and an older bridge ignores `welcome.upstream_oauth`.
 
 **Workspaces, attachments and `workspace` isolation do not bump the version.** They stay on `0.1`, deliberately. Every one of them is optional in both directions — `hello.workspaces`, `ai_request.working_dir`, `ai_request.attachments`, the `attachment` stream event and the `workspace` value of `cli_isolation` are all additive, and both ends already ignore fields they do not recognise. Only the major number is enforced, so a bump would refuse every bridge already installed in exchange for nothing.
 
