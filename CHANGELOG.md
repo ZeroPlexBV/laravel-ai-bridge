@@ -3,6 +3,50 @@
 Release notes for earlier versions are on the GitHub releases page of
 tetrixdev/laravel-ai-bridge. This file starts with 0.16.0-RC1.
 
+## [Unreleased] — to be released as 0.21.0
+
+Hardens the upstream routes added in 0.19 (decision 0009).
+
+### Security
+
+- **CSRF checked by the package on the state-changing upstream routes.**
+  `POST /ai-bridge/connections/{id}/mcp` and `POST`/`DELETE
+  /ai-bridge/connections/{id}/upstreams/{server}/sign-in` run in the `api` group, which checks no
+  CSRF token; with session auth on those routes (`web`, the cookie + session stack, Sanctum's
+  stateful SPA auth) a page on any same-site subdomain could make a signed-in browser call an
+  upstream tool or start and forget sign-ins. A new middleware, `ai-bridge.csrf`, now requires
+  the session's CSRF token (`X-CSRF-TOKEN`, `_token` or `X-XSRF-TOKEN`, compared by Laravel's own
+  CSRF middleware on Laravel 12 and 13) on every request that rides on cookies, answering
+  `419 {"code": "csrf_token_mismatch"}`. Requests without a session or without cookies (bearer
+  tokens, Sanctum personal access tokens, server-to-server) pass unchanged.
+
+### Changed
+
+- **Breaking for route callers: `tool_call_id` is now required on
+  `POST /ai-bridge/connections/{id}/mcp`.** Without it (missing, null or empty) the route answers
+  `422 {"code": "tool_call_id_required"}` and relays nothing, so a browser's request is always
+  held to the view that makes it. `AiBridge::mcpRequest()` / `UpstreamClient::mcpRequest()` keep
+  `$toolCallId` optional for trusted server code; a host relaying a browser's request must pass
+  it.
+- The reference chat UI sends the CSRF token (`csrf-token` attribute set by
+  `<x-ai-bridge::chat />`, else `<meta name="csrf-token">`, else the `XSRF-TOKEN` cookie) on
+  every state-changing request.
+
+### Added
+
+- Config `ai-bridge.csrf.upstreams` (`AI_BRIDGE_CSRF_UPSTREAMS`, default `true`): switch the
+  upstream routes' CSRF check off only when the app protects them itself.
+- Config `ai-bridge.csrf.routes` (`AI_BRIDGE_CSRF_ROUTES`, default `false`): the same check on
+  every other state-changing browser route (token, `stream/sse`, conversations POST/DELETE/stream,
+  connections POST/PATCH/DELETE/regenerate, streams abort). Opt in now; it becomes the default in
+  the next major version.
+
+### Upgrading
+
+- A front end calling `…/mcp` or `…/sign-in` with session cookies must send the CSRF token
+  (e.g. `X-CSRF-TOKEN` from `<meta name="csrf-token">`; axios sends `X-XSRF-TOKEN` by itself),
+  and must send `tool_call_id` on `…/mcp`.
+
 ## [Unreleased] — to be released as 0.20.0
 
 ### Added

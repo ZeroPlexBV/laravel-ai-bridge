@@ -167,6 +167,11 @@
             this.api = this.getAttribute('api') || '/ai-bridge';
             this.assets = this.getAttribute('assets') || (this.api + '/assets');
             this.thinkingVisible = this.getAttribute('thinking-visible') !== 'false';
+            // CSRF token for the state-changing routes (ai-bridge.csrf, decision 0009):
+            // the csrf-token attribute <x-ai-bridge::chat /> sets, else the page's
+            // <meta name="csrf-token">.
+            this.csrfToken = this.getAttribute('csrf-token')
+                || document.querySelector('meta[name="csrf-token"]')?.content || '';
 
             this.s = {
                 conversations: [], connections: [], activeId: null, conv: null,
@@ -261,10 +266,23 @@
         }
 
         // ── HTTP ──────────────────────────────────────────────────────
+        // Headers every request sends: JSON, plus the CSRF token the package checks on
+        // state-changing routes for session-cookie requests. Without a token on the page,
+        // Laravel's XSRF-TOKEN cookie (when readable) goes as X-XSRF-TOKEN instead.
+        jsonHeaders(extra = {}) {
+            const h = { 'Content-Type': 'application/json', ...extra };
+            if (this.csrfToken) {
+                h['X-CSRF-TOKEN'] = this.csrfToken;
+            } else {
+                const m = document.cookie.match(/(?:^|;\s*)XSRF-TOKEN=([^;]+)/);
+                if (m) h['X-XSRF-TOKEN'] = decodeURIComponent(m[1]);
+            }
+            return h;
+        }
         async apiCall(path, opts = {}) {
             const res = await fetch(this.api + path, {
                 credentials: 'same-origin',
-                headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+                headers: this.jsonHeaders({ Accept: 'application/json' }),
                 ...opts,
             });
             if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -880,7 +898,7 @@
             try {
                 const res = await fetch(this.api + '/conversations/' + this.s.activeId + '/stream', {
                     method: 'POST', credentials: 'same-origin',
-                    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+                    headers: this.jsonHeaders({ Accept: 'application/json' }),
                     body: JSON.stringify({ message: text }),
                 });
                 // 409: another tab is already streaming a response on this
@@ -925,7 +943,7 @@
             try {
                 await fetch(this.api + '/streams/' + encodeURIComponent(rid) + '/abort', {
                     method: 'POST', credentials: 'same-origin',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: this.jsonHeaders(),
                 });
             } catch (e) { /* the EventSource will deliver the terminal regardless */ }
         }

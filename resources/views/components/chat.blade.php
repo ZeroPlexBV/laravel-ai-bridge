@@ -14,6 +14,9 @@
       api               Base path of the AI Bridge API (default "/ai-bridge").
       thinking-visible  false to hide expandable thinking blocks (default true).
 
+    The session's CSRF token goes along as csrf-token, so the component sends it
+    (X-CSRF-TOKEN) on the routes the package checks it on (ai-bridge.csrf).
+
     Streaming is delivered over plain SSE (text/event-stream) tailed by the
     browser's native EventSource — no Reverb/Echo dependency.
 --}}
@@ -22,10 +25,15 @@
     'thinkingVisible' => true,
 ])
 
+@php
+    $aiBridgeCsrf = request()->hasSession() ? csrf_token() : '';
+@endphp
+
 <ai-bridge-chat
     api="{{ $api }}"
     assets="{{ $api }}/assets"
     thinking-visible="{{ $thinkingVisible ? 'true' : 'false' }}"
+    csrf-token="{{ $aiBridgeCsrf }}"
 ></ai-bridge-chat>
 
 <script src="{{ $api }}/assets/ai-bridge-chat.js" defer></script>

@@ -1947,7 +1947,10 @@ timeout fires (**504**). A bridge without the needed hello field: **409**
   held to that call's view: refused (`refused`) unless `$server` is the server its `ui`
   named on this connection, `unknown_view` when none was recorded (looked up in the cache,
   kept `ai-bridge.upstream_oauth.view_ttl`, then in the connection's recorded blocks). A
-  host takes `server` from the view's `ui.server` and passes `tool_call_id`. Views of a
+  host takes `server` from the view's `ui.server` and passes `tool_call_id`. `$toolCallId`
+  is optional here only for trusted server code that decides `$server` itself: a host
+  relaying a request that came from a browser must pass the `tool_call_id` it named, as the
+  package's own route requires (decision 0009). Views of a
   bridge with no connection row carry `connection_id: null` and cannot be relayed through
   the route.
 
@@ -1960,11 +1963,19 @@ resolver:
 | `GET /ai-bridge/connections/{id}/upstreams/pending` | `ai-bridge.upstreams.pending` |
 | `POST /ai-bridge/connections/{id}/upstreams/{server}/sign-in` | `ai-bridge.upstreams.sign-in` |
 | `DELETE /ai-bridge/connections/{id}/upstreams/{server}/sign-in` | `ai-bridge.upstreams.forget` |
-| `POST /ai-bridge/connections/{id}/mcp` (`{server, method, params, tool_call_id?}`, 30/min) | `ai-bridge.upstreams.mcp` |
+| `POST /ai-bridge/connections/{id}/mcp` (`{server, method, params, tool_call_id}`, 30/min) | `ai-bridge.upstreams.mcp` |
 
-These run in the `api` group and check no CSRF token of their own; a host using session
-cookies must add CSRF protection (Sanctum stateful auth, or middleware) or call the PHP API
-from its own protected routes.
+On the `mcp` route `tool_call_id` is required: without it (missing, null or empty) the
+answer is `422 {"code": "tool_call_id_required"}` and nothing is relayed.
+
+The three state-changing routes (`…/mcp`, `POST` and `DELETE …/sign-in`) carry the package's
+CSRF check (middleware `ai-bridge.csrf:upstreams`, config `ai-bridge.csrf.upstreams`, default
+on): a request that rides on cookies (a started session and at least one cookie) must carry
+the session's CSRF token as `X-CSRF-TOKEN`, `_token` or `X-XSRF-TOKEN`, compared by Laravel's
+own CSRF middleware, or it is answered `419 {"code": "csrf_token_mismatch", "message": "CSRF
+token mismatch."}`. A request without a session or without cookies (a bearer token) passes.
+`ai-bridge.csrf.routes` (default off) puts the same check on the package's other
+state-changing browser routes.
 
 Drawing the card, asking the person's consent for a view's CSP or permissions, and what a
 button means stay with the host.

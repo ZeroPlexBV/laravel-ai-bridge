@@ -15,3 +15,4 @@ Accepted records are binding; see [AGENTS.md](../../AGENTS.md) for the one-line 
 | [0006](0006-keep-package-name.md) | The package keeps the name tetrixdev/laravel-ai-bridge after merging the fork's 0.18 | accepted | 2026-10-16 |
 | [0007](0007-upstream-oauth-via-callback.md) | Upstream OAuth sign-in is relayed through a callback route; tokens stay on the bridge | accepted | 2026-10-16 |
 | [0008](0008-mcp-request-pinned-by-tool-call-id.md) | A view's mcp_request is pinned to its server via tool_call_id | accepted | 2026-10-16 |
+| [0009](0009-csrf-on-upstream-routes.md) | CSRF enforced by the package on state-changing upstream routes; tool_call_id required on the browser route | accepted | 2026-10-16 |

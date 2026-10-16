@@ -168,6 +168,9 @@ class AiBridgeManager
      * Send it to the connection named by the view's `ui.connection_id` (the bridge that made
      * the call is the only one that has that upstream), with `$server` pinned to the view's
      * `ui.server`, and pass the call's `tool_call_id` so the request is held to that view.
+     * `$toolCallId` is optional here for trusted server code only: a host relaying a request
+     * that came from a browser MUST pass the tool_call_id the browser named (the package's
+     * own route refuses a request without one, 0009), or a page could reach any server.
      *
      * @param  array<string, mixed>  $params
      * @return array<string, mixed>

@@ -13,6 +13,7 @@ use Tetrix\AiBridge\Console\ServeCommand;
 use Tetrix\AiBridge\Console\SweepTurnMarkersCommand;
 use Tetrix\AiBridge\Console\TestCommand;
 use Tetrix\AiBridge\Contracts\StreamStoreContract;
+use Tetrix\AiBridge\Http\Middleware\RequireCsrfToken;
 use Tetrix\AiBridge\Http\Middleware\ValidateBridgeToken;
 use Tetrix\AiBridge\Streaming\StreamStoreManager;
 use Tetrix\AiBridge\Tools\ToolContext;
@@ -136,6 +137,8 @@ class AiBridgeServiceProvider extends ServiceProvider
 
         // Register named middleware for bridge token validation
         $this->app['router']->aliasMiddleware('ai-bridge.token', ValidateBridgeToken::class);
+        // CSRF for the package's state-changing browser routes (ai-bridge.csrf.*, 0009).
+        $this->app['router']->aliasMiddleware(RequireCsrfToken::ALIAS, RequireCsrfToken::class);
 
         // Warn when route_middleware is empty — routes will be unprotected.
         // Fire at most once per process to avoid flooding logs under PHP-FPM.

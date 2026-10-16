@@ -325,8 +325,9 @@ describe('JSON routes', function () {
         Http::fake(['*/api/mcp' => Http::sequence()
             ->push(['ok' => true, 'result' => ['content' => [['type' => 'text', 'text' => 'Refreshed']]]])
             ->push(['ok' => false, 'code' => 'refused', 'error' => 'not for views'])]);
+        \Tetrix\AiBridge\Upstreams\UpstreamViews::remember($this->connection->id, 'toolu_u1', 'weather');
         $url = route('ai-bridge.upstreams.mcp', ['id' => $this->connection->id]);
-        $body = ['server' => 'weather', 'method' => 'tools/call', 'params' => ['name' => 'refresh', 'arguments' => ['city' => 'Utrecht']]];
+        $body = ['server' => 'weather', 'method' => 'tools/call', 'params' => ['name' => 'refresh', 'arguments' => ['city' => 'Utrecht']], 'tool_call_id' => 'toolu_u1'];
 
         $this->actingAs($this->person)->postJson($url, $body)
             ->assertOk()
@@ -334,10 +335,27 @@ describe('JSON routes', function () {
         $this->actingAs($this->person)->postJson($url, $body)
             ->assertStatus(400)
             ->assertJson(['code' => 'refused', 'error' => 'not for views']);
-        $this->actingAs($this->person)->postJson($url, ['server' => 'weather', 'method' => 'ping'])
+        $this->actingAs($this->person)->postJson($url, ['server' => 'weather', 'method' => 'ping', 'tool_call_id' => 'toolu_u1'])
             ->assertStatus(400)
             ->assertJsonPath('code', 'unsupported');
 
         Http::assertSentCount(2);
     });
+
+    it('requires tool_call_id on the route, sending nothing without it', function (array $extra) {
+        Http::fake();
+        $url = route('ai-bridge.upstreams.mcp', ['id' => $this->connection->id]);
+
+        $this->actingAs($this->person)
+            ->postJson($url, ['server' => 'weather', 'method' => 'tools/call', 'params' => ['name' => 'refresh']] + $extra)
+            ->assertStatus(422)
+            ->assertJsonPath('code', 'tool_call_id_required');
+
+        Http::assertNothingSent();
+    })->with([
+        'missing' => [[]],
+        'null' => [['tool_call_id' => null]],
+        'empty' => [['tool_call_id' => '']],
+        'blank' => [['tool_call_id' => '  ']],
+    ]);
 });

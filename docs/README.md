@@ -8,6 +8,7 @@ In suggested reading order.
 1. [../README.md](../README.md) — what the package is, installation and quick start; the manual for application developers. Sections worth going straight to:
    [Modes of Operation](../README.md#modes-of-operation),
    [Configuration](../README.md#configuration),
+   [CSRF on the package's routes](../README.md#csrf-on-the-packages-routes),
    [Streaming to Browser](../README.md#streaming-to-browser),
    [Conversation Persistence](../README.md#conversation-persistence),
    [Tool System](../README.md#tool-system) (with [Tools with a view](../README.md#tools-with-a-view-mcp-apps) and [upstream MCP Apps and sign-in](../README.md#tools-from-the-machines-own-mcp-servers-upstream-mcp-apps-and-sign-in)),

@@ -35,6 +35,35 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | CSRF on the package's own routes
+    |--------------------------------------------------------------------------
+    |
+    | The routes above run in the 'api' group, which checks no CSRF token. When a
+    | session signs people in there ('web' in route_middleware, Sanctum's stateful
+    | SPA auth), a page on any same-site subdomain could make a signed-in browser
+    | call them. The package checks a CSRF token itself (middleware ai-bridge.csrf),
+    | the Laravel way: X-CSRF-TOKEN, _token, or X-XSRF-TOKEN from the XSRF-TOKEN
+    | cookie; 419 JSON when it is missing or wrong. Only requests that ride on
+    | cookies (a started session and at least one cookie) are checked: a bearer
+    | token or server-to-server request passes.
+    |
+    | - 'upstreams': POST /connections/{id}/mcp and POST/DELETE
+    |   /connections/{id}/upstreams/{server}/sign-in. On by default; switch it off
+    |   only when the app protects these routes itself.
+    | - 'routes': every other state-changing browser route (token, stream/sse,
+    |   conversations POST/DELETE/stream, connections POST/PATCH/DELETE/regenerate,
+    |   streams abort). Off by default for now; it becomes the default in the next
+    |   major version, so turn it on and send the token from your front end.
+    |
+    */
+
+    'csrf' => [
+        'upstreams' => env('AI_BRIDGE_CSRF_UPSTREAMS', true),
+        'routes' => env('AI_BRIDGE_CSRF_ROUTES', false),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | JWT Token Settings
     |--------------------------------------------------------------------------
     |

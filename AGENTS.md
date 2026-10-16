@@ -36,6 +36,9 @@ docker run --rm -u $(id -u):$(id -g) -v $PWD:/app -w /app --entrypoint php compo
   serve process writes for the web process to read goes through Redis or a shared cache store.
 - A view's `mcp_request` is pinned to the view's own server through `tool_call_id`; only
   `resources/read` of a `ui://` uri and `tools/call` are relayed (0008).
+- The package's state-changing upstream routes check CSRF themselves (`ai-bridge.csrf`) for
+  requests that ride on cookies, and `POST …/mcp` requires `tool_call_id`; a new state-changing
+  browser route gets `ai-bridge.csrf:routes` at least (0009).
 - Every wire change is documented in [PROTOCOL.md](PROTOCOL.md), the README section for it and
   [CHANGELOG.md](CHANGELOG.md) (Keep a Changelog, "Unreleased — to be released as X.Y.Z" until tagged).
 
@@ -60,5 +63,6 @@ docker run --rm -u $(id -u):$(id -g) -v $PWD:/app -w /app --entrypoint php compo
 - 0006 The package keeps the name `tetrixdev/laravel-ai-bridge` after merging the fork's 0.18.
 - 0007 Upstream OAuth sign-in is relayed through a callback route; tokens stay on the bridge.
 - 0008 A view's `mcp_request` is pinned to its server via `tool_call_id`.
+- 0009 CSRF enforced by the package on state-changing upstream routes; `tool_call_id` required on the route.
 
 Full records: [docs/decisions/](docs/decisions/README.md).
