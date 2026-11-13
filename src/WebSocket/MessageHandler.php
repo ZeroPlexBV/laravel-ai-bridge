@@ -354,6 +354,7 @@ class MessageHandler
     private function reattachRunningTurns(string $userId, array $message): void
     {
         $listed = [];
+        $acked = [];
         $raw = $message['running_turns'] ?? null;
 
         if (is_array($raw) && array_is_list($raw)) {
@@ -361,11 +362,25 @@ class MessageHandler
                 $id = is_array($turn) ? ($turn['request_id'] ?? null) : null;
                 if (is_string($id) && $id !== '' && strlen($id) <= 256) {
                     $listed[] = $id;
+                    $acked[$id] = is_int($turn['last_acked_seq'] ?? null) ? $turn['last_acked_seq'] : 0;
                 }
             }
         }
 
-        $this->connectionManager->reattachRunningTurns($userId, $listed);
+        $result = $this->connectionManager->reattachRunningTurns($userId, $listed);
+
+        // A `session_lost` re-issue whose error frame the bridge never saw confirmed was lost
+        // with the connection: a continued_seq bridge that got it counts the error frame as
+        // confirmed (it numbers on after it). Sent again, after the welcome.
+        foreach ($result['reattached'] as $requestId) {
+            $reissue = $this->connectionManager->pendingReissue($requestId);
+            if ($reissue !== null && ($acked[$requestId] ?? 0) < $reissue['error_seq']) {
+                BridgeLog::info('session_lost re-issue not confirmed by the reconnected bridge; sending it again', [
+                    'request_id' => $requestId,
+                ]);
+                $this->connectionManager->holdFrame($userId, 'reissue:'.$requestId, $reissue['frame']);
+            }
+        }
     }
 
     /**
@@ -662,6 +677,11 @@ class MessageHandler
         $nested = is_array($message['capabilities'] ?? null) ? $message['capabilities'] : [];
         if (($nested['reliable_delivery'] ?? null) === true || ($message['reliable_delivery'] ?? null) === true) {
             $capabilities[] = 'reliable_delivery';
+        }
+        // Numbers a re-issued turn on from `ai_request.first_seq` instead of from 1 (PROTOCOL.md,
+        // "Short drops", re-issued turns).
+        if (($nested['continued_seq'] ?? null) === true || ($message['continued_seq'] ?? null) === true) {
+            $capabilities[] = 'continued_seq';
         }
 
         return [
@@ -1119,15 +1139,23 @@ class MessageHandler
      * processed without an error (commitSeq()): a frame lost to an error is stored when the
      * bridge re-sends it, instead of being dropped as a duplicate. A re-send of a frame
      * already stored is dropped and confirmed again; a frame after a gap is dropped without
-     * a confirmation, and the bridge re-sends from the last confirmed one after it
-     * reconnects. What was stored is confirmed with a cumulative `stream_ack` (ackStream()).
+     * a confirmation, and the bridge re-sends from the last confirmed one (after a reconnect,
+     * or on a live connection when no confirmation came in time).
+     *
+     * A frame is confirmed with a cumulative `stream_ack` (ackStream()) only once it is in
+     * the stream store too: a store write that failed is kept on the turn's handler and
+     * tried again (StreamHandler::deferStore()), on the next frame, on a re-send and on the
+     * tick (tickUnconfirmedFrames()), and only then confirmed. The frame is never processed
+     * twice for it. A turn that makes no progress for `stream_stall_seconds` is ended with a
+     * visible error (tickUnconfirmedFrames()).
      *
      * A frame for a turn this server does not hold (it ended, it was never known here, or it
      * is beyond the finished-turn memory) is answered with `stream_ack` `closed: true` and
      * that frame's own `seq`, so the bridge can let go of the turn. It is then routed the
      * usual way (which settles an orphaned final frame), except the re-sent final frame of a
-     * turn that ended normally here, which was settled already. A frame for a turn another
-     * user holds is routed the usual way, where it is refused.
+     * turn that ended normally here, which was settled already (and is confirmed once its
+     * store writes are done, see $unstoredFinals). A frame for a turn another user holds is
+     * routed the usual way, where it is refused.
      *
      * @param  array<string, mixed>  $message
      */
@@ -1139,7 +1167,16 @@ class MessageHandler
             return $this->routeStreamEvent($connectionId, $message);
         }
 
-        if ($this->connectionManager->getPendingRequest($requestId) === null) {
+        $handler = $this->connectionManager->getPendingRequest($requestId);
+
+        if ($handler === null) {
+            if (isset($this->unstoredFinals[$requestId]) && $this->unstoredFinals[$requestId]['user_id'] === $senderUserId) {
+                // The re-sent final frame of a turn that ended here with store writes kept.
+                $this->retryUnstoredFinal($requestId);
+
+                return null;
+            }
+
             $this->sendClosedAck($senderUserId, $requestId, $seq);
 
             if ($this->connectionManager->finishedRequestSeq($requestId, $senderUserId) !== null) {
@@ -1156,7 +1193,9 @@ class MessageHandler
         $verdict = $this->connectionManager->acceptSeq($requestId, $seq);
 
         if ($verdict === BridgeConnectionManager::SEQ_DUPLICATE) {
-            $this->ackStream($senderUserId, $requestId, $this->connectionManager->lastStoredSeq($requestId), false);
+            // A re-send is also the bridge asking again: write what the store refused before.
+            $this->catchUpStore($requestId, $handler);
+            $this->ackStream($senderUserId, $requestId, $this->connectionManager->confirmedSeq($requestId), false);
 
             return null;
         }
@@ -1167,23 +1206,39 @@ class MessageHandler
                 'seq' => $seq,
                 'last_stored' => $this->connectionManager->lastStoredSeq($requestId),
             ]);
+            $this->connectionManager->markStalled($requestId);
 
             return null;
         }
 
         // An exception leaves the frame uncounted (and is logged by the socket handler).
-        $response = $this->routeStreamEvent($connectionId, $message);
+        $this->routingSeq = $seq;
+        try {
+            $response = $this->routeStreamEvent($connectionId, $message);
+        } catch (\Throwable $e) {
+            $this->connectionManager->markStalled($requestId);
+
+            throw $e;
+        } finally {
+            $this->routingSeq = null;
+        }
+
         $final = $eventType === MessageTypes::ERROR || $eventType === MessageTypes::DONE;
+        $inStore = ! $handler->hasUnstored();
 
         if ($this->connectionManager->getPendingRequest($requestId) === null) {
             $this->connectionManager->rememberFinishedRequest($requestId, $senderUserId, $seq);
 
-            if ($final) {
+            if (! $final) {
+                // The server ended it on this frame (a stop seen on it): over on this side.
+                $this->sendClosedAck($senderUserId, $requestId, $seq);
+            } elseif ($inStore) {
                 // The turn ended with its own final frame.
                 $this->ackStream($senderUserId, $requestId, $seq, true);
             } else {
-                // The server ended it on this frame (a stop seen on it): over on this side.
-                $this->sendClosedAck($senderUserId, $requestId, $seq);
+                // Ended, but not all of it is in the store yet: confirmed once it is.
+                unset($this->owedAcks[$requestId], $this->lastAckAt[$requestId]);
+                $this->unstoredFinals[$requestId] = ['handler' => $handler, 'user_id' => $senderUserId, 'seq' => $seq, 'since' => time()];
             }
 
             return $response;
@@ -1191,16 +1246,203 @@ class MessageHandler
 
         $this->connectionManager->commitSeq($requestId, $seq);
 
-        if ($final) {
+        if ($final && $this->connectionManager->pendingReissue($requestId) === null) {
             // Still pending after a final frame: a session_lost re-issue, which runs on under
-            // the same request id and may number its frames from 1 again.
+            // the same request id and may number its frames from 1 again. Not for a bridge
+            // told to number on (`first_seq`): there a seq 1 is the old run's frame again.
             $this->connectionManager->allowSeqRestart($requestId);
-            $this->ackStream($senderUserId, $requestId, $seq, true);
-        } else {
-            $this->ackStream($senderUserId, $requestId, $seq, false);
         }
 
+        if (! $inStore) {
+            $this->connectionManager->markStalled($requestId);
+
+            return $response;
+        }
+
+        $this->connectionManager->confirmSeq($requestId, $seq);
+        $this->ackStream($senderUserId, $requestId, $seq, $final);
+
         return $response;
+    }
+
+    /** The `seq` of the numbered frame being routed now, null between frames (see recoverLostSession()). */
+    private ?int $routingSeq = null;
+
+    /**
+     * Turns that ended here with their final frame while a store write of theirs was still
+     * kept for a retry, by request id: the final frame is confirmed only once the writes are
+     * done (tickUnconfirmedFrames(), or the bridge's re-send of it). Given up, with a closed
+     * `stream_ack`, after `stream_stall_seconds`.
+     *
+     * @var array<string, array{handler: StreamHandler, user_id: string, seq: int, since: int}>
+     */
+    private array $unstoredFinals = [];
+
+    /**
+     * Write what the store refused before for a pending turn; when that leaves nothing kept,
+     * everything processed is confirmable (BridgeConnectionManager::confirmSeq()).
+     */
+    private function catchUpStore(string $requestId, StreamHandler $handler): void
+    {
+        if ($handler->hasUnstored() && $handler->retryStore()) {
+            $this->connectionManager->confirmSeq($requestId, $this->connectionManager->lastStoredSeq($requestId));
+        }
+    }
+
+    /** Try the kept store writes of an ended turn again; confirm its final frame once they are done. */
+    private function retryUnstoredFinal(string $requestId): void
+    {
+        $entry = $this->unstoredFinals[$requestId];
+
+        if ($entry['handler']->retryStore()) {
+            unset($this->unstoredFinals[$requestId]);
+            $this->sendStreamAck($entry['user_id'], $requestId, $entry['seq']);
+        }
+    }
+
+    /**
+     * Keep numbered turns moving. Called by the serve process every second.
+     *
+     * 1. Store writes kept for a retry are tried again, and what is then in the store is
+     *    confirmed (so a turn that stopped sending frames is still confirmed once the store
+     *    is back).
+     * 2. A turn that made no progress for `ai-bridge.websocket.stream_stall_seconds` (default
+     *    60) while its bridge is connected is ended with the error `stream_stalled`, and the
+     *    bridge is told it is closed: a frame it keeps re-sending that this server cannot
+     *    store (it fails each time, or the store stays down), or a gap the bridge never
+     *    fills, would otherwise leave the turn waiting with no output. A detached turn is
+     *    bounded by its grace period instead.
+     * 3. An ended turn whose final frame could not be confirmed (its store writes kept) is
+     *    let go of after the same bound, with a closed `stream_ack`.
+     * 4. A connected turn of a `reliable_delivery` bridge whose kept store writes reached their
+     *    bound (StreamHandler::deferStore()) is ended with `stream_stalled` at once.
+     * 5. An ended turn's kept store writes, however it ended (an unnumbered `done`, a stall,
+     *    a cancel, a drop), are tried again; after the same bound all but the writes that end
+     *    it are given up and those are tried once more (StreamHandler::forceTerminalStore()),
+     *    so its buffer does not stay `streaming`.
+     *
+     * @return int how many turns were ended for a stall
+     */
+    public function tickUnconfirmedFrames(?int $now = null): int
+    {
+        $now ??= time();
+        $bound = max(1, (int) config('ai-bridge.websocket.stream_stall_seconds', 60));
+        $full = [];
+
+        foreach ($this->connectionManager->connectedUserIds() as $userId) {
+            foreach ($this->connectionManager->pendingRequestIdsForUser($userId) as $requestId) {
+                $requestId = (string) $requestId;
+                $handler = $this->connectionManager->getPendingRequest($requestId);
+                $before = $this->connectionManager->confirmedSeq($requestId);
+
+                if ($handler !== null && $handler->hasUnstored()) {
+                    $this->catchUpStore($requestId, $handler);
+                    $after = $this->connectionManager->confirmedSeq($requestId);
+                    if ($after > $before) {
+                        $this->sendStreamAck((string) $userId, $requestId, $after);
+                    }
+                }
+
+                if ($handler !== null && $handler->storeBacklogFull() && ! $this->connectionManager->isDetached($requestId)
+                    && $this->connectionManager->bridgeSupports($userId, 'reliable_delivery')) {
+                    $full[$requestId] = true;
+                }
+            }
+        }
+
+        $ended = 0;
+        foreach (array_unique([...array_keys($full), ...$this->connectionManager->stalledRequestIds($now - $bound)]) as $requestId) {
+            $this->endStalledTurn((string) $requestId);
+            $ended++;
+        }
+
+        foreach (array_keys($this->unstoredFinals) as $requestId) {
+            $requestId = (string) $requestId;
+            $this->retryUnstoredFinal($requestId);
+            $entry = $this->unstoredFinals[$requestId] ?? null;
+
+            if ($entry !== null && ($entry['since'] <= $now - $bound || $entry['handler']->storeBacklogFull())) {
+                unset($this->unstoredFinals[$requestId]);
+                Log::error('AI Bridge: an ended turn\'s output could not be written to the stream store; giving up', [
+                    'request_id' => $requestId,
+                ]);
+                $this->sendClosedAck($entry['user_id'], $requestId, $entry['seq']);
+            }
+        }
+
+        $this->retryEndedTurnStores($now, $bound);
+
+        return $ended;
+    }
+
+    /**
+     * Try again the kept store writes of turns that have ended, on whichever path they ended
+     * (see tickUnconfirmedFrames(), step 5), and give up on them `$bound` seconds after the
+     * turn was first seen ended here. A pending turn's writes are its own path's to retry
+     * (catchUpStore()), which confirms what is then stored.
+     */
+    private function retryEndedTurnStores(int $now, int $bound): void
+    {
+        foreach ($this->connectionManager->unstoredHandlers() as $handler) {
+            if ($this->connectionManager->getPendingRequest($handler->requestId) === $handler) {
+                continue;
+            }
+
+            $id = spl_object_id($handler);
+            $since = $this->endedUnstoredSince[$id] ??= $now;
+
+            if ($handler->hasKeptWrites()) {
+                $handler->retryStore();
+            }
+
+            if ($handler->hasKeptWrites() && $since <= $now - $bound) {
+                $handler->forceTerminalStore();
+            }
+
+            if (! $handler->hasKeptWrites()) {
+                $this->connectionManager->forgetUnstoredHandler($handler);
+                unset($this->endedUnstoredSince[$id]);
+            }
+        }
+    }
+
+    /**
+     * When a turn with kept store writes was first seen ended (retryEndedTurnStores()), by the
+     * handler's object id (held by BridgeConnectionManager until forgotten, so not reused).
+     *
+     * @var array<int, int>
+     */
+    private array $endedUnstoredSince = [];
+
+    /** End a pending turn that stopped making progress (see tickUnconfirmedFrames()). */
+    private function endStalledTurn(string $requestId): void
+    {
+        $handler = $this->connectionManager->getPendingRequest($requestId);
+        $userId = $this->connectionManager->getPendingRequestUserId($requestId);
+        $confirmed = $this->connectionManager->confirmedSeq($requestId);
+
+        Log::error('AI Bridge: a turn made no progress within the stall bound; ending it', [
+            'request_id' => $requestId,
+            'last_stored' => $this->connectionManager->lastStoredSeq($requestId),
+            'confirmed' => $confirmed,
+        ]);
+
+        $this->connectionManager->removePendingRequest($requestId);
+        $this->forgetRecovery($requestId);
+
+        try {
+            $handler?->dispatchError('stream_stalled', 'Part of the reply could not be saved, so it stopped here. Send your message again to continue.');
+        } catch (\Throwable $e) {
+            Log::warning('AI Bridge: could not end a stalled turn', ['request_id' => $requestId, 'error' => $e->getMessage()]);
+        }
+
+        if ($userId !== null) {
+            $this->connectionManager->rememberFinishedRequest($requestId, $userId, $confirmed);
+            // Only a reliable bridge may be sent a stream_ack (PROTOCOL.md, "Short drops").
+            if ($this->connectionManager->bridgeSupports($userId, 'reliable_delivery')) {
+                $this->sendClosedAck($userId, $requestId, $confirmed);
+            }
+        }
     }
 
     /**
@@ -2038,6 +2280,15 @@ class MessageHandler
         // BridgeStream recorded its own with the pending request.
         $carry = $this->requestCarry[$requestId] ?? $this->connectionManager->getPendingRequestCarry($requestId);
         $payload = $this->buildFreshAiRequest($conversation, $requestId, $carry);
+
+        // A numbered error frame from a bridge that numbers a re-issue on (`continued_seq`):
+        // the re-issued run starts at the next seq, so a re-send of the old run's frames is a
+        // duplicate, never mistaken for the new run's first frame. Kept until the new run's
+        // first frame is stored, to send it again should the connection drop with it.
+        if ($this->routingSeq !== null && $this->connectionManager->bridgeSupports($userId, 'continued_seq')) {
+            $payload['first_seq'] = $this->routingSeq + 1;
+            $this->connectionManager->noteReissue($requestId, $payload, $this->routingSeq);
+        }
 
         BridgeLog::info('session_lost — wiped cli_session_id, re-issuing as a fresh session', [
             'request_id' => $requestId,

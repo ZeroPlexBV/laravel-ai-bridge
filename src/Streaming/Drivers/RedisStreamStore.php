@@ -6,6 +6,7 @@ namespace Tetrix\AiBridge\Streaming\Drivers;
 
 use Illuminate\Contracts\Redis\Factory as RedisFactory;
 use Illuminate\Redis\Connections\Connection;
+use Illuminate\Support\Facades\Log;
 use Tetrix\AiBridge\Contracts\MergesStreamMetadata;
 use Tetrix\AiBridge\Contracts\StoresStreamValues;
 use Tetrix\AiBridge\Contracts\StreamStoreContract;
@@ -126,18 +127,29 @@ final class RedisStreamStore implements StreamStoreContract, MergesStreamMetadat
             ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
         );
 
-        $conn->expire($eventsKey, $this->streamingTtl);
+        // The event is in the log once RPUSH answered: from here nothing may throw. A caller
+        // keeps a write that throws and does it again (BufferingSink), which would append the
+        // same event a second time at a new index. A renewal that fails is logged instead;
+        // the next event renews again.
+        try {
+            $conn->expire($eventsKey, $this->streamingTtl);
 
-        // A live turn's status and metadata last as long as its log does. Only the log was
-        // renewed here, so the other two expired $streamingTtl after the turn STARTED,
-        // however busy it was: past that a long turn read as not_found while it still
-        // wrote events, and inputOpen() refused every message for it. Only while it
-        // streams, so an event after the end cannot stretch a finished turn's short life.
-        $statusKey = $this->key($requestId, 'status');
-        if ($conn->get($statusKey) === 'streaming') {
-            $conn->expire($statusKey, $this->streamingTtl);
-            $conn->expire($this->key($requestId, 'meta'), $this->streamingTtl);
-            $conn->expire($this->key($requestId, 'values'), $this->streamingTtl);
+            // A live turn's status and metadata last as long as its log does. Only the log was
+            // renewed here, so the other two expired $streamingTtl after the turn STARTED,
+            // however busy it was: past that a long turn read as not_found while it still
+            // wrote events, and inputOpen() refused every message for it. Only while it
+            // streams, so an event after the end cannot stretch a finished turn's short life.
+            $statusKey = $this->key($requestId, 'status');
+            if ($conn->get($statusKey) === 'streaming') {
+                $conn->expire($statusKey, $this->streamingTtl);
+                $conn->expire($this->key($requestId, 'meta'), $this->streamingTtl);
+                $conn->expire($this->key($requestId, 'values'), $this->streamingTtl);
+            }
+        } catch (\Throwable $e) {
+            Log::warning('AI Bridge: stream event appended, but renewing its lifetime failed', [
+                'request_id' => $requestId,
+                'error' => $e->getMessage(),
+            ]);
         }
 
         return $newLength - 1;

@@ -319,9 +319,12 @@ function droppedServeRig(float $timeout): object
     return $rig;
 }
 
-function serveReconnect(object $rig): void
+/** The same bridge comes back: a new socket and its hello, then the held frames go out. */
+function serveReconnect(object $rig, array $hello = ['capabilities' => ['reliable_delivery' => true],
+    'mcp_apps' => ['spec' => '2026-01-26', 'revision' => 1], 'mcp_upstream_auth' => ['revision' => 1]]): void
 {
     $rig->manager->addConnection('key-1', 'conn-1b', 'socket-1b');
+    $rig->manager->setBridgeInfo('key-1', MessageHandler::bridgeInfoFromHello($hello));
     $rig->manager->reattachRunningTurns('key-1', []);
     $rig->manager->flushHeldFrames('key-1');
 }
@@ -373,4 +376,18 @@ describe('an exchange held through a short drop', function () {
             ->and($b->responses[0]['body']['code'])->toBe('discovery_failed')
             ->and($a->responses)->toHaveCount(1);
     });
+});
+
+// --- D09710 review follow-up: held work is re-checked against the bridge that comes back ---
+
+it('does not send a held exchange to a reconnecting bridge without mcp_upstream_auth, and answers 409 at once (review point 5)', function () {
+    $rig = droppedServeRig(5.0);
+    $out = servePost($rig, '/api/upstream/auth-start', ['server' => 'kaizen']);
+
+    serveReconnect($rig, ['capabilities' => ['reliable_delivery' => true]]);
+
+    expect($rig->sent)->toBe([])
+        ->and($out->responses)->toHaveCount(1)
+        ->and($out->responses[0]['status'])->toBe(409)
+        ->and($out->responses[0]['body']['code'])->toBe('mcp_upstream_auth_unsupported');
 });

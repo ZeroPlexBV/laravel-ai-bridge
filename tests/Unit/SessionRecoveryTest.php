@@ -384,3 +384,133 @@ test('after a numbered session_lost error, the re-issued turn\'s frames from seq
     expect($deltas)->toBe(['a', 'b', 'c'])
         ->and($acks)->toBe([1, 2, 1, 1, 2]);
 });
+
+// --- D09710 review follow-up: a re-sent session_lost of the old run is told apart (point 3) ---
+
+/**
+ * A reliable bridge's numbered turn req-1 on a conversation with a dead session, and what the
+ * server sent. `$continued`: the bridge announces `continued_seq` (numbers a re-issue on).
+ */
+function reissueRig(bool $continued): object
+{
+    config(['ai-bridge.websocket.stream_ack_interval' => 0]);
+    $rig = new stdClass();
+    $rig->conversation = Conversation::create(['mode' => 'bridge', 'provider' => 'claude', 'cli_session_id' => 'dead-sess']);
+    $rig->conversation->appendMessage(Message::ROLE_USER, 'I enter the cave');
+    $rig->sent = [];
+    $rig->manager = new BridgeConnectionManager();
+    $rig->manager->setSendCallback(function ($connection, $payload) use ($rig) {
+        $rig->sent[] = $payload;
+
+        return true;
+    });
+    $rig->hello = ['type' => 'hello', 'version' => '0.1', 'bridge_version' => '0.40.0', 'providers' => [],
+        'reliable_delivery' => true] + ($continued ? ['continued_seq' => true] : []);
+    $rig->mh = recoveryMessageHandler($rig->manager);
+    $rig->manager->addConnection('user-1', 'conn-1');
+    $rig->mh->handleMessage('conn-1', null, json_encode($rig->hello));
+    $rig->handler = recoveryHandler((string) $rig->conversation->id);
+    $rig->deltas = [];
+    $rig->errors = [];
+    $rig->handler->onBlockDelta(function ($event) use ($rig) {
+        $rig->deltas[] = $event->data['content'];
+    });
+    $rig->handler->onError(function (string $code) use ($rig) {
+        $rig->errors[] = $code;
+    });
+    $rig->manager->registerPendingRequest('req-1', $rig->handler, 'user-1');
+    $rig->frame = fn (int $seq, string $event, array $data) => json_encode([
+        'type' => MessageTypes::STREAM, 'request_id' => 'req-1', 'seq' => $seq, 'event' => $event, 'data' => $data,
+    ]);
+    $rig->lost = fn (int $seq) => ($rig->frame)($seq, MessageTypes::ERROR, ['code' => 'session_lost', 'message' => 'cannot resume']);
+    $rig->delta = fn (int $seq, string $c) => ($rig->frame)($seq, MessageTypes::BLOCK_DELTA, ['block_type' => 'text', 'block_index' => 0, 'content' => $c]);
+    $rig->requests = fn () => array_values(array_filter($rig->sent, fn ($p) => $p['type'] === MessageTypes::AI_REQUEST));
+
+    return $rig;
+}
+
+test('the re-issue tells a continued_seq bridge to number on from the error frame (first_seq)', function () {
+    $rig = reissueRig(true);
+
+    $rig->mh->handleMessage('conn-1', null, ($rig->lost)(1));
+
+    expect(($rig->requests)())->toHaveCount(1)
+        ->and(($rig->requests)()[0]['first_seq'])->toBe(2);
+
+    // Its frames number on: 2, 3. A re-send of them is a duplicate as usual.
+    $rig->mh->handleMessage('conn-1', null, ($rig->delta)(2, 'a'));
+    $rig->mh->handleMessage('conn-1', null, ($rig->delta)(2, 'a'));
+    $rig->mh->handleMessage('conn-1', null, ($rig->delta)(3, 'b'));
+
+    expect($rig->deltas)->toBe(['a', 'b'])
+        ->and($rig->errors)->toBe([]);
+});
+
+test('a bridge without continued_seq is not sent first_seq, and its re-issue numbered from 1 is stored as before', function () {
+    $rig = reissueRig(false);
+
+    $rig->mh->handleMessage('conn-1', null, ($rig->lost)(1));
+    expect(($rig->requests)()[0])->not->toHaveKey('first_seq');
+
+    $rig->mh->handleMessage('conn-1', null, ($rig->delta)(1, 'a'));
+    $rig->mh->handleMessage('conn-1', null, ($rig->delta)(2, 'b'));
+
+    expect($rig->deltas)->toBe(['a', 'b']);
+});
+
+test('a re-sent seq-1 session_lost of the old run does not end the re-issued turn (review point 3)', function () {
+    $rig = reissueRig(true);
+
+    $rig->mh->handleMessage('conn-1', null, ($rig->lost)(1));
+    // The ack for it is lost in a drop; the bridge sends it again on the new connection.
+    $rig->manager->removeConnectionByConnectionId('conn-1', 'websocket_closed');
+    $rig->manager->addConnection('user-1', 'conn-2');
+    $rig->mh->handleMessage('conn-2', null, json_encode($rig->hello + ['running_turns' => [['request_id' => 'req-1', 'last_acked_seq' => 1]]]));
+    $rig->sent = [];
+    $rig->mh->handleMessage('conn-2', null, ($rig->lost)(1));
+
+    // A duplicate: confirmed again, not a second session_lost.
+    expect($rig->errors)->toBe([])
+        ->and($rig->manager->getPendingRequest('req-1'))->not->toBeNull()
+        ->and(($rig->requests)())->toBe([])
+        ->and($rig->sent)->toBe([['type' => 'stream_ack', 'request_id' => 'req-1', 'seq' => 1]]);
+
+    // The re-issued run's frames are stored, not answered closed.
+    $rig->mh->handleMessage('conn-2', null, ($rig->delta)(2, 'a'));
+    $rig->mh->handleMessage('conn-2', null, ($rig->frame)(3, MessageTypes::DONE, []));
+
+    expect($rig->deltas)->toBe(['a'])
+        ->and(collect($rig->sent)->where('closed', true))->toHaveCount(0)
+        ->and($rig->manager->getPendingRequest('req-1'))->toBeNull()
+        ->and($rig->errors)->toBe([]);
+});
+
+test('a re-issue lost in the drop is sent again after the hello of a bridge that never confirmed the error frame (review point 3)', function () {
+    $rig = reissueRig(true);
+
+    $rig->mh->handleMessage('conn-1', null, ($rig->lost)(1));
+    $reissue = ($rig->requests)()[0];
+    // Neither the re-issue nor the ack reached the bridge: it lists the turn with nothing confirmed.
+    $rig->manager->removeConnectionByConnectionId('conn-1', 'websocket_closed');
+    $rig->manager->addConnection('user-1', 'conn-2');
+    $rig->sent = [];
+    $rig->mh->handleMessage('conn-2', null, json_encode($rig->hello + ['running_turns' => [['request_id' => 'req-1', 'last_acked_seq' => 0]]]));
+    $rig->manager->flushHeldFrames('user-1');
+
+    expect(($rig->requests)())->toBe([$reissue]);
+
+    // It re-sends the error frame: a duplicate, confirmed; then the re-issued run.
+    $rig->mh->handleMessage('conn-2', null, ($rig->lost)(1));
+    $rig->mh->handleMessage('conn-2', null, ($rig->delta)(2, 'a'));
+
+    expect($rig->errors)->toBe([])
+        ->and($rig->deltas)->toBe(['a']);
+
+    // Once the re-issued run has said something, a later hello does not send it again.
+    $rig->manager->removeConnectionByConnectionId('conn-2', 'websocket_closed');
+    $rig->manager->addConnection('user-1', 'conn-3');
+    $rig->sent = [];
+    $rig->mh->handleMessage('conn-3', null, json_encode($rig->hello + ['running_turns' => [['request_id' => 'req-1', 'last_acked_seq' => 0]]]));
+    $rig->manager->flushHeldFrames('user-1');
+    expect(($rig->requests)())->toBe([]);
+});

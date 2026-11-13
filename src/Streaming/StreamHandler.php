@@ -219,6 +219,36 @@ class StreamHandler
      */
     private array $seenToolResults = [];
 
+    /**
+     * Store writes that failed, oldest first, to be tried again (see deferStore()), with
+     * their size and whether they end the turn (the final event, the status).
+     *
+     * @var list<array{write: Closure(): mixed, bytes: int, terminal: bool}>
+     */
+    private array $unstored = [];
+
+    /** The payload bytes $unstored keeps (see deferStore()). */
+    private int $unstoredBytes = 0;
+
+    /**
+     * Whether a write was dropped because the kept writes reached their bound: what is in
+     * the store now has a hole, so the turn must end (storeBacklogFull()).
+     */
+    private bool $storeBacklogFull = false;
+
+    /**
+     * Whether a store write that fails is kept to be tried again (deferStore()); null keeps it.
+     * Says no for a turn on a bridge without `reliable_delivery` (BridgeConnectionManager::registerPendingRequest()):
+     * such a turn is never ended for its kept writes, so a failed write is logged and dropped
+     * and the turn keeps streaming, as before writes were kept.
+     *
+     * @var (Closure(): bool)|null
+     */
+    private ?Closure $keepsFailedStoreWrites = null;
+
+    /** @var list<Closure(self): void> run each time a write is kept (whenStoreDeferred()) */
+    private array $storeDeferredCallbacks = [];
+
     public readonly string $requestId;
 
     public function __construct(
@@ -1353,6 +1383,182 @@ class StreamHandler
         return BlockType::tryFrom($event->data['block_type'] ?? '')
             ?? $this->blockTypes[$blockIndex]
             ?? BlockType::Text;
+    }
+
+    /**
+     * Keep a store write that failed, to try it again later (retryStore()).
+     *
+     * Used by a sink such as BufferingSink: a write the stream store refused is not lost
+     * but kept, in order, and a later write waits behind it. Whether anything is kept
+     * (hasUnstored()) is what decides that a numbered frame may not be confirmed to a
+     * `reliable_delivery` bridge yet (PROTOCOL.md, "Short drops"): the bridge keeps its
+     * copy until the frame is in the store.
+     *
+     * What is kept is bounded, by payload bytes (`ai-bridge.websocket.stream_store_backlog_bytes`,
+     * default 8 MiB) and by count (`stream_store_backlog_writes`, default 2000): one turn's
+     * output kept through a store outage must not exhaust the serve process every other user
+     * shares. A write past the bound is dropped, and so is every later one: the turn is then
+     * marked full (storeBacklogFull()) and its owner ends it (MessageHandler::tickUnconfirmedFrames()).
+     * A `$terminal` write (the final event, the status) is kept regardless, so the turn
+     * can still be marked finished (forceTerminalStore()).
+     *
+     * @param  Closure(): mixed  $write  Throws when it fails again.
+     * @param  int  $bytes  The size of what it writes, for the bound.
+     */
+    public function deferStore(Closure $write, int $bytes = 0, bool $terminal = false): void
+    {
+        if (! $terminal) {
+            $maxBytes = max(1, (int) config('ai-bridge.websocket.stream_store_backlog_bytes', 8 * 1024 * 1024));
+            $maxWrites = max(1, (int) config('ai-bridge.websocket.stream_store_backlog_writes', 2000));
+
+            if ($this->storeBacklogFull || $this->unstoredBytes + $bytes > $maxBytes || count($this->unstored) >= $maxWrites) {
+                if (! $this->storeBacklogFull) {
+                    Log::error('AI Bridge: too much of a turn\'s output is waiting for the stream store; the turn will be ended', [
+                        'request_id' => $this->requestId,
+                        'kept' => count($this->unstored),
+                        'kept_bytes' => $this->unstoredBytes,
+                    ]);
+                }
+                $this->storeBacklogFull = true;
+
+                return;
+            }
+        }
+
+        $this->unstored[] = ['write' => $write, 'bytes' => $bytes, 'terminal' => $terminal];
+        $this->unstoredBytes += $bytes;
+
+        foreach ($this->storeDeferredCallbacks as $callback) {
+            try {
+                $callback($this);
+            } catch (\Throwable $e) {
+                Log::warning('AI Bridge: a store-deferred callback failed', ['request_id' => $this->requestId, 'error' => $e->getMessage()]);
+            }
+        }
+    }
+
+    /** Whether a store write that fails now is kept to be tried again; see $keepsFailedStoreWrites. */
+    public function keepsFailedStoreWrites(): bool
+    {
+        return $this->keepsFailedStoreWrites === null || ($this->keepsFailedStoreWrites)();
+    }
+
+    /**
+     * Decide, at each failed store write, whether it is kept; see $keepsFailedStoreWrites.
+     *
+     * @param  Closure(): bool  $keep
+     */
+    public function keepFailedStoreWritesWhen(Closure $keep): void
+    {
+        $this->keepsFailedStoreWrites = $keep;
+    }
+
+    /**
+     * Run a callback each time a store write of this turn is kept (deferStore()).
+     *
+     * The serve process takes ownership of such a turn this way (BridgeConnectionManager):
+     * its kept writes are tried again on the tick after the turn has ended on any path (an
+     * unnumbered `done`, a stall, a cancel, a drop), so its buffer does not stay `streaming`
+     * once the store is back.
+     *
+     * @param  Closure(self): void  $callback
+     */
+    public function whenStoreDeferred(Closure $callback): void
+    {
+        $this->storeDeferredCallbacks[] = $callback;
+    }
+
+    /**
+     * Whether a store write of this turn failed and has not been written since, or was
+     * dropped for the bound (storeBacklogFull()): either way, not all of it is in the store.
+     */
+    public function hasUnstored(): bool
+    {
+        return $this->unstored !== [] || $this->storeBacklogFull;
+    }
+
+    /** Whether writes are still kept to be tried again (unlike hasUnstored(), not a dropped one). */
+    public function hasKeptWrites(): bool
+    {
+        return $this->unstored !== [];
+    }
+
+    /** Whether a write was dropped because the kept writes reached their bound (deferStore()). */
+    public function storeBacklogFull(): bool
+    {
+        return $this->storeBacklogFull;
+    }
+
+    /**
+     * Try the kept store writes again, oldest first, stopping at the first that fails.
+     *
+     * @return bool  True when nothing is kept any more and nothing was dropped (hasUnstored()).
+     */
+    public function retryStore(): bool
+    {
+        while ($this->unstored !== []) {
+            try {
+                ($this->unstored[0]['write'])();
+            } catch (\Throwable $e) {
+                Log::warning('AI Bridge: stream store still failing; the write is kept for the next try', [
+                    'request_id' => $this->requestId,
+                    'kept' => count($this->unstored),
+                    'error' => $e->getMessage(),
+                ]);
+
+                return false;
+            }
+
+            $this->unstoredBytes -= $this->unstored[0]['bytes'];
+            array_shift($this->unstored);
+        }
+
+        $this->unstoredBytes = 0;
+
+        return ! $this->storeBacklogFull;
+    }
+
+    /**
+     * Give up on the kept writes, except the ones that end the turn, which are each tried
+     * once more, on their own: the buffer may miss output, but its status is set, so a
+     * reader is not left waiting on a turn that reads as `streaming` for ever.
+     *
+     * @return bool  True when every terminal write succeeded.
+     */
+    public function forceTerminalStore(): bool
+    {
+        $ok = true;
+        $dropped = 0;
+
+        foreach ($this->unstored as $kept) {
+            if (! $kept['terminal']) {
+                $dropped++;
+
+                continue;
+            }
+
+            try {
+                ($kept['write'])();
+            } catch (\Throwable $e) {
+                $ok = false;
+                Log::error('AI Bridge: could not mark a turn finished in the stream store; giving up', [
+                    'request_id' => $this->requestId,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        if ($dropped > 0) {
+            Log::error('AI Bridge: giving up on stream store writes of an ended turn', [
+                'request_id' => $this->requestId,
+                'dropped' => $dropped,
+            ]);
+        }
+
+        $this->unstored = [];
+        $this->unstoredBytes = 0;
+
+        return $ok;
     }
 
     /**

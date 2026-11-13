@@ -40,6 +40,10 @@ interface StreamStoreContract
      * the new event's index — clients use it as the SSE `id:` for
      * Last-Event-ID resumption.
      *
+     * Throws only when the event was NOT appended: a caller keeps a write that throws and
+     * does it again (BufferingSink), so a failure after the append (renewing a lifetime, say)
+     * must be swallowed, or the event is appended twice.
+     *
      * @param  array<string, mixed>  $data
      */
     public function appendEvent(string $requestId, string $eventName, array $data): int;

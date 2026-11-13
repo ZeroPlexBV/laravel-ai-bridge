@@ -266,3 +266,64 @@ test('a value kept for a finished turn does not outlive it', function () {
 
     expect($store->getValue('req-late', 'k'))->toBeNull();
 });
+
+/** A ClockedRedis whose EXPIRE fails, as a connection that drops right after a command. */
+final class ExpireFailingRedis
+{
+    public bool $failExpire = true;
+
+    public function __construct(public ClockedRedis $inner) {}
+
+    public function expire(string $key, int $ttl): int
+    {
+        if ($this->failExpire) {
+            throw new RuntimeException('connection reset after RPUSH');
+        }
+
+        return $this->inner->expire($key, $ttl);
+    }
+
+    public function __call(string $method, array $args): mixed
+    {
+        return $this->inner->{$method}(...$args);
+    }
+}
+
+test('an event whose append succeeded is not appended again when a later command of the append fails (CodeRabbit 4537573131)', function () {
+    $redis = new ExpireFailingRedis(new ClockedRedis);
+    $connection = new class($redis) extends Connection
+    {
+        public function __construct(ExpireFailingRedis $client)
+        {
+            $this->client = $client;
+        }
+
+        public function createSubscription($channels, Closure $callback, $method = 'subscribe')
+        {
+        }
+    };
+    $factory = new class($connection) implements RedisFactory
+    {
+        public function __construct(private Connection $connection) {}
+
+        public function connection($name = null)
+        {
+            return $this->connection;
+        }
+    };
+    $store = new RedisStreamStore($factory, null, 'ai-bridge:stream', 3600, 1800);
+
+    $provider = Mockery::mock(\Tetrix\AiBridge\Contracts\StreamableProvider::class);
+    $provider->shouldReceive('start', 'cancel', 'markCompleted')->byDefault();
+    $handler = new \Tetrix\AiBridge\Streaming\StreamHandler($provider, 'req-dup');
+    \Tetrix\AiBridge\Streaming\BufferingSink::attach($handler, $store);
+
+    $delta = fn (string $content) => new \Tetrix\AiBridge\Protocol\StreamEvent('req-dup', 'block_delta', ['block_type' => 'text', 'block_index' => 0, 'content' => $content]);
+    $handler->dispatchEvent($delta('a'));
+    $redis->failExpire = false;
+    $handler->dispatchEvent($delta('b'));
+
+    // MUTATION: let appendEvent() throw after RPUSH and 'a' is kept, written again, and doubled.
+    expect(array_map(fn (array $e) => $e['data']['content'], $store->range('req-dup')))->toBe(['a', 'b'])
+        ->and($handler->hasUnstored())->toBeFalse();
+});

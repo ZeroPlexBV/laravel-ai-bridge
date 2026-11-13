@@ -133,6 +133,7 @@ class BridgeWebSocketServer
     public function tickReliableDelivery(): void
     {
         try {
+            $this->messageHandler->tickUnconfirmedFrames();
             $this->messageHandler->flushStreamAcks();
             $this->connectionManager->expireDetachedRequests();
             $this->connectionManager->flushAllHeldFrames();
@@ -882,7 +883,10 @@ class BridgeWebSocketServer
             $markWritten,
         );
 
-        $sent = $this->connectionManager->sendOrHold($userId, $frame, $markWritten, BridgeConnectionManager::turnInputHoldKey($requestId, $messageId));
+        // Held through a short drop and the bridge that comes back cannot take input (an
+        // older one in its place): never written, so `send_failed`, as when its clock ends.
+        $refused = fn () => $this->connectionManager->resolvePendingTurnInput($requestId, $messageId, $userId, ['status' => 'rejected', 'reason' => 'send_failed']);
+        $sent = $this->connectionManager->sendOrHold($userId, $frame, $markWritten, BridgeConnectionManager::turnInputHoldKey($requestId, $messageId), 'turn_input', $refused);
 
         if (! $sent) {
             $this->loop->cancelTimer($timer);
@@ -1208,7 +1212,7 @@ class BridgeWebSocketServer
             'ok' => false,
             'code' => 'timeout',
             'error' => 'The bridge did not answer in time.',
-        ]);
+        ], 'mcp_apps');
     }
 
     /**
@@ -1236,7 +1240,7 @@ class BridgeWebSocketServer
             'ok' => false,
             'code' => 'no_answer',
             'error' => 'The bridge did not answer in time.',
-        ]);
+        ], 'mcp_upstream_auth');
     }
 
     /**
@@ -1281,7 +1285,7 @@ class BridgeWebSocketServer
             'ok' => false,
             'code' => 'timeout',
             'error' => 'The bridge did not report the result in time. The sign-in may still complete.',
-        ]);
+        ], 'mcp_upstream_auth');
     }
 
     /**
@@ -1372,10 +1376,14 @@ class BridgeWebSocketServer
      * Registered BEFORE sending, as apiRequestInput() does: a bridge on the same host can
      * answer before sendToUser() has returned.
      *
+     * `$needs` is the hello field the exchange needs (see bridgeFor()): a frame held through
+     * a short drop is not sent to a bridge that comes back without it, and every waiter is
+     * answered 409 `<needs>_unsupported` at once instead.
+     *
      * @param  array<string, mixed>  $frame
      * @param  array<string, mixed>  $timeoutAnswer
      */
-    private function awaitBridge(ConnectionInterface $tcpConnection, string $userId, string $key, array $frame, float $timeout, array $timeoutAnswer): void
+    private function awaitBridge(ConnectionInterface $tcpConnection, string $userId, string $key, array $frame, float $timeout, array $timeoutAnswer, ?string $needs = null): void
     {
         $answered = false;
         $respond = function (array $answer) use (&$answered, $tcpConnection): void {
@@ -1422,7 +1430,14 @@ class BridgeWebSocketServer
             return;
         }
 
-        if (! $this->connectionManager->sendOrHold($userId, $frame, null, $holdKey)) {
+        $refused = $needs === null ? null : fn () => $this->connectionManager->resolvePendingExchange($key, $userId, [
+            'ok' => false,
+            'code' => $needs.'_unsupported',
+            'error' => 'The bridge that reconnected does not announce '.$needs.'; it needs updating.',
+            '_status' => 409,
+        ]);
+
+        if (! $this->connectionManager->sendOrHold($userId, $frame, null, $holdKey, $needs, $refused)) {
             $this->connectionManager->forgetPendingExchange($key, $respond);
             $respond(['ok' => false, 'code' => 'send_failed', 'error' => 'Could not write to the bridge.', '_status' => 502]);
         }

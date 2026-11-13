@@ -213,7 +213,7 @@ final class TransferHub
             'name' => $name,
             'mime_type' => $mime !== '' ? $mime : null,
             'size' => $size,
-        ], static fn ($v) => $v !== null), $armPickup);
+        ], static fn ($v) => $v !== null), $armPickup, self::offerHoldKey($id), 'file_uploads', $this->refusedBy('upload', $id));
 
         if (! $sent) {
             $this->failUpload($id, 502, 'not_connected', 'The machine could not be told about the file.', false);
@@ -303,7 +303,7 @@ final class TransferHub
             'id' => $id,
             'size' => $u['passed'],
             'sha256' => $sha256,
-        ], $armConfirm, self::uploadSentHoldKey($id));
+        ], $armConfirm, self::uploadSentHoldKey($id), 'file_uploads', $this->refusedBy('upload', $id));
 
         if (! $sent) {
             $armConfirm();
@@ -314,6 +314,36 @@ final class TransferHub
     private static function uploadSentHoldKey(string $id): string
     {
         return 'upload_sent:'.$id;
+    }
+
+    /** The key an upload_offer is held under while its machine is away (see sendOrHold()). */
+    private static function offerHoldKey(string $id): string
+    {
+        return 'upload_offer:'.$id;
+    }
+
+    /** The key a file_read is held under while its machine is away (see sendOrHold()). */
+    private static function fileReadHoldKey(string $id): string
+    {
+        return 'file_read:'.$id;
+    }
+
+    /**
+     * What runs when a transfer's held frame is not sent because the bridge that came back
+     * after a short drop does not do transfers of this kind (an older one in its place): the
+     * transfer fails at once, as it would have been refused had that bridge been there.
+     */
+    private function refusedBy(string $kind, string $id): \Closure
+    {
+        return function () use ($kind, $id): void {
+            $this->guard(function () use ($kind, $id): void {
+                if ($kind === 'upload') {
+                    $this->failUpload($id, 409, 'unsupported', 'The bridge on this machine is too old to receive files directly. Update it there, then add the file again.', false);
+                } else {
+                    $this->failDownload($id, 409, 'unsupported', 'The bridge on this machine is too old to hand files back. Update it there, then try again.', false);
+                }
+            });
+        };
     }
 
     /** The machine came for the bytes. */
@@ -436,12 +466,14 @@ final class TransferHub
             return;
         }
         $this->forgetUpload($id);
-        // Never written later for an upload that has already failed.
+        // Never written later for an upload that has already failed. An offer still held was
+        // never seen by the machine, which then has nothing to clean up.
         $this->connections->dropHeldFrame($u['user_id'], self::uploadSentHoldKey($id));
+        $offerHeld = $this->connections->dropHeldFrame($u['user_id'], self::offerHoldKey($id));
 
         BridgeLog::info('upload not completed', ['id' => $id, 'code' => $code, 'passed' => $u['passed'], 'size' => $u['size']]);
 
-        if ($tellMachine) {
+        if ($tellMachine && ! $offerHeld) {
             // So the partial file goes now rather than when the machine's own clock notices.
             $this->connections->sendToUser($u['user_id'], ['type' => MessageTypes::UPLOAD_ABORT, 'id' => $id, 'reason' => $error]);
         }
@@ -540,7 +572,7 @@ final class TransferHub
             'url' => self::transferUrl($id),
             'range' => is_string($range) && $range !== '' ? $range : null,
             'head' => $head ? true : null,
-        ], static fn ($v) => $v !== null), $armAnswer);
+        ], static fn ($v) => $v !== null), $armAnswer, self::fileReadHoldKey($id), 'file_downloads', $this->refusedBy('download', $id));
 
         if (! $sent) {
             $this->failDownload($id, 502, 'not_connected', 'The machine could not be asked for the file.', false);
@@ -729,10 +761,12 @@ final class TransferHub
             return;
         }
         $this->forgetDownload($id);
+        // Never written later for a download that has already failed (the machine never saw it).
+        $askHeld = $this->connections->dropHeldFrame($d['user_id'], self::fileReadHoldKey($id));
 
         BridgeLog::info('download not completed', ['id' => $id, 'code' => $code, 'passed' => $d['passed']]);
 
-        if ($tellMachine) {
+        if ($tellMachine && ! $askHeld) {
             $this->connections->sendToUser($d['user_id'], ['type' => MessageTypes::FILE_READ_CANCEL, 'id' => $id]);
         }
 

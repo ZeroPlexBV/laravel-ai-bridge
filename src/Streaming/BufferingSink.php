@@ -18,10 +18,13 @@ use Tetrix\AiBridge\Protocol\StreamEvent;
  * and in `RelayStream`) match those of the recorder — the buffer is populated
  * in whichever process actually sees the events.
  *
- * Failures appending to the store are logged and swallowed. A broken buffer
- * must not break the stream itself; the worst case for a transient store
- * failure is that the browser cannot resume after a refresh — the assistant
- * row is still persisted by the recorder at terminal.
+ * Failures appending to the store are logged and do not break the stream
+ * itself: the write is kept on the handler (StreamHandler::deferStore()) and
+ * tried again, in order, before the next one, so a transient store failure
+ * leaves no hole in the buffer once the store is back. While a write is kept,
+ * a numbered frame of a `reliable_delivery` bridge is not confirmed
+ * (MessageHandler), so the bridge keeps its copy. The assistant row is
+ * persisted by the recorder at terminal either way.
  */
 final class BufferingSink
 {
@@ -69,16 +72,13 @@ final class BufferingSink
         $suppressThinking = (bool) config('ai-bridge.streaming.suppress_thinking_blocks', true);
         $currentBlockSuppressed = false;
 
-        $append = static function (string $event, array $data) use ($store, $rid): void {
-            try {
-                $store->appendEvent($rid, $event, $data);
-            } catch (\Throwable $e) {
-                Log::error('AI Bridge: failed to buffer stream event', [
-                    'request_id' => $rid,
-                    'event' => $event,
-                    'error' => $e->getMessage(),
-                ]);
-            }
+        // `$terminal` for the turn's final event: kept past the bound on kept writes, and
+        // tried once more when the rest is given up (StreamHandler::forceTerminalStore()).
+        $append = static function (string $event, array $data, bool $terminal = false) use ($handler, $store, $rid): void {
+            self::write($handler, static fn () => $store->appendEvent($rid, $event, $data), [
+                'request_id' => $rid,
+                'event' => $event,
+            ], $data, $terminal);
         };
 
         $handler->onBlockStart(function (StreamEvent $event) use ($append, $suppressThinking, &$currentBlockSuppressed): void {
@@ -179,40 +179,84 @@ final class BufferingSink
 
         // Terminal events both write the event AND flip the buffer status, so
         // the SSE tail and the status endpoint can tell the turn is finished.
-        $handler->onDone(function (?array $usage, array $meta = []) use ($append, $store, $rid): void {
-            $append(MessageTypes::DONE, ['usage' => $usage] + self::publicDoneMeta($meta));
-            self::completeQuietly($store, $rid, 'completed');
+        $handler->onDone(function (?array $usage, array $meta = []) use ($append, $handler, $store, $rid): void {
+            $append(MessageTypes::DONE, ['usage' => $usage] + self::publicDoneMeta($meta), true);
+            self::completeQuietly($handler, $store, $rid, 'completed');
         });
 
-        $handler->onError(function (string $code, string $errorMessage, array $meta = []) use ($append, $store, $rid): void {
-            $append(MessageTypes::ERROR, ['code' => $code, 'message' => $errorMessage] + self::publicCancelledMeta($meta));
-            self::completeQuietly($store, $rid, 'failed');
+        $handler->onError(function (string $code, string $errorMessage, array $meta = []) use ($append, $handler, $store, $rid): void {
+            $append(MessageTypes::ERROR, ['code' => $code, 'message' => $errorMessage] + self::publicCancelledMeta($meta), true);
+            self::completeQuietly($handler, $store, $rid, 'failed');
         });
 
-        $handler->onCancelled(function (string $reason, array $meta = []) use ($append, $store, $rid): void {
-            $append(MessageTypes::CANCELLED, ['reason' => $reason] + self::publicCancelledMeta($meta));
-            self::completeQuietly($store, $rid, 'cancelled');
+        $handler->onCancelled(function (string $reason, array $meta = []) use ($append, $handler, $store, $rid): void {
+            $append(MessageTypes::CANCELLED, ['reason' => $reason] + self::publicCancelledMeta($meta), true);
+            self::completeQuietly($handler, $store, $rid, 'cancelled');
         });
     }
 
     /**
-     * Mark a stream finished, swallowing a store failure.
+     * Mark a stream finished, never throwing: a store failure is kept for a retry (write()).
      *
      * Called from terminal paths where throwing would replace a finished turn
      * with an unhandled exception and leave the reader with neither.
      */
-    private static function completeQuietly(StreamStoreContract $store, string $rid, string $status): void
+    private static function completeQuietly(StreamHandler $handler, StreamStoreContract $store, string $rid, string $status): void
     {
+        self::write($handler, static fn () => $store->complete($rid, $status), [
+            'request_id' => $rid,
+            'status' => $status,
+        ], null, true);
+    }
+
+    /**
+     * One write to the store, in order: behind any earlier write that failed and is kept,
+     * which is tried again first; kept itself when it fails (StreamHandler::deferStore()).
+     *
+     * @param  \Closure(): mixed  $write
+     * @param  array<string, mixed>  $context  For the log line.
+     * @param  array<string, mixed>|null  $payload  What it writes, sized for the bound on kept writes.
+     * @param  bool  $terminal  Whether it ends the turn (StreamHandler::deferStore()).
+     */
+    private static function write(StreamHandler $handler, \Closure $write, array $context, ?array $payload = null, bool $terminal = false): void
+    {
+        if ($handler->hasUnstored() && ! $handler->retryStore()) {
+            $handler->deferStore($write, self::sizeOf($payload), $terminal);
+
+            return;
+        }
+
         try {
-            $store->complete($rid, $status);
+            $write();
         } catch (\Throwable $e) {
-            Log::error('AI Bridge: failed to mark stream buffer complete', [
-                'request_id' => $rid,
-                'status' => $status,
+            // A turn on a bridge without `reliable_delivery` drops the write, as before writes were kept.
+            if (! $handler->keepsFailedStoreWrites()) {
+                Log::error('AI Bridge: failed to buffer stream event', $context + [
+                    'error' => $e->getMessage(),
+                ]);
+
+                return;
+            }
+
+            Log::error('AI Bridge: failed to buffer stream event; kept to write again', $context + [
                 'error' => $e->getMessage(),
             ]);
+            $handler->deferStore($write, self::sizeOf($payload), $terminal);
         }
     }
+
+    /** Roughly what a kept write holds on to: its payload, encoded. Only computed for a write that is kept. */
+    private static function sizeOf(?array $payload): int
+    {
+        if ($payload === null) {
+            return 0;
+        }
+
+        $encoded = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+
+        return is_string($encoded) ? strlen($encoded) : 0;
+    }
+
     /**
      * What a browser is told beside a cancellation.
      *

@@ -1873,3 +1873,434 @@ test('an unnumbered cancelled without pending_inputs for a turn the server close
     Log::shouldNotHaveReceived('warning');
     Log::shouldNotHaveReceived('error');
 });
+
+// --- D09710 review follow-up: a frame is confirmed only once it is in the stream store ---
+
+/** The real store, failing the appends (or completions) it is told to; a BufferingSink writes into it. */
+final class FlakyStreamStore implements StreamStoreContract
+{
+    public ArrayStreamStore $inner;
+
+    /** Fail this many appends from now on, then work again. */
+    public int $failAppends = 0;
+
+    /** Fail every write until set back. */
+    public bool $down = false;
+
+    public function __construct()
+    {
+        $this->inner = new ArrayStreamStore();
+    }
+
+    public function start(string $requestId, array $metadata = []): void
+    {
+        $this->inner->start($requestId, $metadata);
+    }
+
+    public function appendEvent(string $requestId, string $eventName, array $data): int
+    {
+        if ($this->down || $this->failAppends > 0) {
+            $this->failAppends = max(0, $this->failAppends - 1);
+            throw new RuntimeException('redis went away');
+        }
+
+        return $this->inner->appendEvent($requestId, $eventName, $data);
+    }
+
+    public function range(string $requestId, int $fromIndex = -1): array
+    {
+        return $this->inner->range($requestId, $fromIndex);
+    }
+
+    public function status(string $requestId): array
+    {
+        return $this->inner->status($requestId);
+    }
+
+    public function setAbort(string $requestId): void
+    {
+        $this->inner->setAbort($requestId);
+    }
+
+    public function isAborted(string $requestId): bool
+    {
+        return $this->inner->isAborted($requestId);
+    }
+
+    public function complete(string $requestId, string $status): void
+    {
+        if ($this->down) {
+            throw new RuntimeException('redis went away');
+        }
+        $this->inner->complete($requestId, $status);
+    }
+
+    public function cleanup(string $requestId): void
+    {
+        $this->inner->cleanup($requestId);
+    }
+
+    /** @return list<string|null> the buffered deltas, in order */
+    public function deltas(string $requestId): array
+    {
+        return array_values(array_map(
+            fn (array $e) => $e['data']['content'] ?? null,
+            array_filter($this->inner->range($requestId), fn (array $e) => $e['event'] === MessageTypes::BLOCK_DELTA),
+        ));
+    }
+}
+
+/** reliableRig() whose turn's handler writes, through a real BufferingSink, into a FlakyStreamStore. */
+function bufferedRig(object $test): object
+{
+    $rig = reliableRig($test);
+    $rig->store = new FlakyStreamStore();
+    app()->instance(StreamStoreContract::class, $rig->store);
+    \Tetrix\AiBridge\Streaming\BufferingSink::attach($rig->handler, $rig->store);
+    // The buffer is keyed by the handler's own id (the rig registers it as req-1).
+    $rig->rid = $rig->handler->requestId;
+    $test->manager->setBridgeInfo('user-1', ['capabilities' => ['reliable_delivery']]);
+
+    return $rig;
+}
+
+test('a frame whose store write failed is not confirmed, and is written, in order, before the next (review point 1)', function () {
+    config(['ai-bridge.websocket.stream_ack_interval' => 0]);
+    $rig = bufferedRig($this);
+
+    $this->messageHandler->handleMessage('conn-1', null, numberedDelta(1, 'a'));
+    $rig->store->failAppends = 1;
+    $this->messageHandler->handleMessage('conn-1', null, numberedDelta(2, 'b'));
+
+    // Not in the store: not confirmed, so the bridge keeps its copy.
+    expect(($rig->acks)())->toBe([1])
+        ->and($rig->store->deltas($rig->rid))->toBe(['a']);
+
+    $this->messageHandler->handleMessage('conn-1', null, numberedDelta(3, 'c'));
+    $this->messageHandler->handleMessage('conn-1', null, numberedDone(4));
+
+    expect($rig->store->deltas($rig->rid))->toBe(['a', 'b', 'c'])
+        ->and(($rig->acks)())->toBe([1, 3, 4])
+        // Processed once: the stream's own listeners saw each delta once.
+        ->and($rig->deltas)->toBe(['a', 'b', 'c'])
+        ->and($rig->store->status($rig->rid)['status'])->toBe('completed');
+});
+
+test('an unstored frame is written and confirmed on the tick, or on the bridge\'s re-send, without being processed again (review point 1)', function (bool $onResend) {
+    config(['ai-bridge.websocket.stream_ack_interval' => 0]);
+    $rig = bufferedRig($this);
+
+    $this->messageHandler->handleMessage('conn-1', null, numberedDelta(1, 'a'));
+    $rig->store->down = true;
+    $this->messageHandler->handleMessage('conn-1', null, numberedDelta(2, 'b'));
+    $this->messageHandler->tickUnconfirmedFrames();
+    expect(($rig->acks)())->toBe([1]);
+
+    $rig->store->down = false;
+    if ($onResend) {
+        $this->messageHandler->handleMessage('conn-1', null, numberedDelta(2, 'b'));
+    } else {
+        $this->messageHandler->tickUnconfirmedFrames();
+    }
+
+    expect($rig->store->deltas($rig->rid))->toBe(['a', 'b'])
+        ->and(($rig->acks)())->toBe([1, 2])
+        ->and($rig->deltas)->toBe(['a', 'b']);
+})->with(['on the tick' => false, 'on the re-send' => true]);
+
+test('a final frame whose store write failed is confirmed only once it is written (review point 1)', function () {
+    config(['ai-bridge.websocket.stream_ack_interval' => 0]);
+    $rig = bufferedRig($this);
+
+    $this->messageHandler->handleMessage('conn-1', null, numberedDelta(1, 'a'));
+    $rig->store->down = true;
+    $this->messageHandler->handleMessage('conn-1', null, numberedDone(2));
+
+    expect($rig->done)->toBe(1)
+        ->and(($rig->acks)())->toBe([1]);
+
+    // Re-sent while the store is still down: still not confirmed.
+    $this->messageHandler->handleMessage('conn-1', null, numberedDone(2));
+    expect(($rig->acks)())->toBe([1]);
+
+    $rig->store->down = false;
+    $this->messageHandler->tickUnconfirmedFrames();
+
+    expect(($rig->acks)())->toBe([1, 2])
+        ->and($rig->done)->toBe(1)
+        ->and($rig->store->status($rig->rid)['status'])->toBe('completed');
+});
+
+test('a turn whose output cannot be stored ends with a visible error after the stall bound, and the bridge is told it is closed (review points 1, 2)', function () {
+    config(['ai-bridge.websocket.stream_ack_interval' => 0, 'ai-bridge.websocket.stream_stall_seconds' => 60]);
+    $rig = bufferedRig($this);
+    $errors = [];
+    $rig->handler->onError(function (string $code, string $message) use (&$errors) {
+        $errors[] = $code;
+    });
+
+    $this->messageHandler->handleMessage('conn-1', null, numberedDelta(1, 'a'));
+    $rig->store->down = true;
+    $this->messageHandler->handleMessage('conn-1', null, numberedDelta(2, 'b'));
+
+    $this->messageHandler->tickUnconfirmedFrames(time() + 30);
+    expect($errors)->toBe([])
+        ->and($this->manager->getPendingRequest('req-1'))->not->toBeNull();
+
+    $this->messageHandler->tickUnconfirmedFrames(time() + 61);
+
+    expect($errors)->toBe(['stream_stalled'])
+        ->and($this->manager->getPendingRequest('req-1'))->toBeNull()
+        ->and(end($rig->sent))->toBe(['type' => 'stream_ack', 'request_id' => 'req-1', 'seq' => 1, 'closed' => true]);
+});
+
+// --- D09710 review follow-up: a gap on a live connection does not hang the turn ---
+
+/** A pending turn req-2 of user-1 whose handler throws on the frames it is told to. */
+function throwingTurn(object $test): object
+{
+    $provider = Mockery::mock(StreamableProvider::class);
+    $provider->shouldReceive('start', 'cancel', 'markCompleted')->byDefault();
+    $turn = new class($provider, 'req-2') extends StreamHandler
+    {
+        /** @var list<string> */
+        public array $throwOn = [];
+
+        public array $stored = [];
+
+        public array $errors = [];
+
+        public function dispatchEvent(StreamEvent $event): void
+        {
+            $content = $event->data['content'] ?? null;
+            if (in_array($content, $this->throwOn, true)) {
+                throw new RuntimeException('store hiccup');
+            }
+            if ($event->event === MessageTypes::BLOCK_DELTA) {
+                $this->stored[] = $content;
+            }
+            parent::dispatchEvent($event);
+        }
+    };
+    $turn->setMode(ProviderMode::Bridge);
+    $turn->onError(function (string $code) use ($turn) {
+        $turn->errors[] = $code;
+    });
+    $test->manager->registerPendingRequest('req-2', $turn, 'user-1');
+
+    return $turn;
+}
+
+test('a gap on a live connection is filled by the bridge\'s re-send, without a reconnect (review point 2)', function () {
+    config(['ai-bridge.websocket.stream_ack_interval' => 0]);
+    $rig = reliableRig($this);
+    $turn = throwingTurn($this);
+    $turn->throwOn = ['b'];
+
+    $this->messageHandler->handleMessage('conn-1', null, numberedDelta(1, 'a', 'req-2'));
+    expect(fn () => $this->messageHandler->handleMessage('conn-1', null, numberedDelta(2, 'b', 'req-2')))->toThrow(RuntimeException::class);
+    $this->messageHandler->handleMessage('conn-1', null, numberedDelta(3, 'c', 'req-2'));
+    $this->messageHandler->handleMessage('conn-1', null, numberedDone(4, 'req-2'));
+    expect($turn->stored)->toBe(['a'])->and(($rig->acks)())->toBe([1]);
+
+    // Still connected: the bridge re-sends what was not confirmed (ai-bridge, live re-send).
+    $turn->throwOn = [];
+    foreach ([numberedDelta(2, 'b', 'req-2'), numberedDelta(3, 'c', 'req-2'), numberedDone(4, 'req-2')] as $frame) {
+        $this->messageHandler->handleMessage('conn-1', null, $frame);
+    }
+
+    expect($turn->stored)->toBe(['a', 'b', 'c'])
+        ->and(($rig->acks)())->toBe([1, 2, 3, 4])
+        ->and($this->manager->getPendingRequest('req-2'))->toBeNull()
+        ->and($turn->errors)->toBe([]);
+});
+
+test('a gap that is never filled ends the turn with a visible error after the stall bound, instead of hanging (review point 2)', function () {
+    config(['ai-bridge.websocket.stream_ack_interval' => 0, 'ai-bridge.websocket.stream_stall_seconds' => 60]);
+    $rig = reliableRig($this);
+    $this->manager->setBridgeInfo('user-1', ['capabilities' => ['reliable_delivery']]);
+    $turn = throwingTurn($this);
+    $turn->throwOn = ['b'];
+
+    $this->messageHandler->handleMessage('conn-1', null, numberedDelta(1, 'a', 'req-2'));
+    // The frame keeps failing, however often it is re-sent.
+    foreach ([1, 2] as $attempt) {
+        expect(fn () => $this->messageHandler->handleMessage('conn-1', null, numberedDelta(2, 'b', 'req-2')))->toThrow(RuntimeException::class);
+        $this->messageHandler->handleMessage('conn-1', null, numberedDone(3, 'req-2'));
+    }
+
+    $this->messageHandler->tickUnconfirmedFrames(time() + 30);
+    expect($turn->errors)->toBe([]);
+
+    $this->messageHandler->tickUnconfirmedFrames(time() + 61);
+
+    expect($turn->errors)->toBe(['stream_stalled'])
+        ->and($this->manager->getPendingRequest('req-2'))->toBeNull()
+        ->and(end($rig->sent))->toBe(['type' => 'stream_ack', 'request_id' => 'req-2', 'seq' => 1, 'closed' => true]);
+});
+
+test('a detached turn is not ended for a stall: the grace period bounds it (review point 2)', function () {
+    config(['ai-bridge.websocket.stream_ack_interval' => 0, 'ai-bridge.websocket.stream_stall_seconds' => 60]);
+    $rig = reliableRig($this);
+    $this->manager->setBridgeInfo('user-1', ['capabilities' => ['reliable_delivery']]);
+    $turn = throwingTurn($this);
+    $turn->throwOn = ['b'];
+    $this->messageHandler->handleMessage('conn-1', null, numberedDelta(1, 'a', 'req-2'));
+    expect(fn () => $this->messageHandler->handleMessage('conn-1', null, numberedDelta(2, 'b', 'req-2')))->toThrow(RuntimeException::class);
+
+    $this->manager->removeConnection('user-1', 'websocket_closed');
+    $this->messageHandler->tickUnconfirmedFrames(time() + 61);
+
+    expect($turn->errors)->toBe([])
+        ->and($this->manager->isDetached('req-2'))->toBeTrue();
+});
+
+// --- D09710 CodeRabbit: a deferred terminal write is owned on every cleanup path ---
+
+test('a turn that ends while its store writes are kept is finished in the store once it is back, on every ending path (CodeRabbit 4537573143)', function (string $frame, string $status) {
+    $rig = bufferedRig($this);
+
+    $this->messageHandler->handleMessage('conn-1', null, json_encode([
+        'type' => MessageTypes::STREAM, 'request_id' => 'req-1', 'event' => MessageTypes::BLOCK_DELTA,
+        'data' => ['block_type' => 'text', 'block_index' => 0, 'content' => 'a'],
+    ]));
+    $rig->store->down = true;
+    $this->messageHandler->handleMessage('conn-1', null, $frame);
+
+    expect($this->manager->getPendingRequest('req-1'))->toBeNull()
+        ->and($rig->store->status($rig->rid)['status'])->toBe('streaming');
+
+    $this->messageHandler->tickUnconfirmedFrames();
+    expect($rig->store->status($rig->rid)['status'])->toBe('streaming');
+
+    $rig->store->down = false;
+    $this->messageHandler->tickUnconfirmedFrames();
+
+    // MUTATION: drop the ended-turn sweep in tickUnconfirmedFrames() and this stays streaming.
+    expect($rig->store->status($rig->rid)['status'])->toBe($status)
+        ->and(array_column($rig->store->inner->range($rig->rid), 'event'))->toBe([MessageTypes::BLOCK_DELTA, json_decode($frame, true)['event'] ?? MessageTypes::CANCELLED])
+        ->and($this->manager->unstoredHandlers())->toBe([]);
+})->with([
+    'an unnumbered done' => [json_encode(['type' => MessageTypes::STREAM, 'request_id' => 'req-1', 'event' => MessageTypes::DONE, 'data' => []]), 'completed'],
+    'an unnumbered error' => [json_encode(['type' => MessageTypes::STREAM, 'request_id' => 'req-1', 'event' => MessageTypes::ERROR, 'data' => ['code' => 'x', 'message' => 'y']]), 'failed'],
+    'a top-level cancelled' => [json_encode(['type' => MessageTypes::CANCELLED, 'request_id' => 'req-1']), 'cancelled'],
+]);
+
+test('a stalled turn ended while the store is down is marked failed once the store is back (CodeRabbit 4537573143)', function () {
+    config(['ai-bridge.websocket.stream_ack_interval' => 0, 'ai-bridge.websocket.stream_stall_seconds' => 60]);
+    $rig = bufferedRig($this);
+
+    $this->messageHandler->handleMessage('conn-1', null, numberedDelta(1, 'a'));
+    $rig->store->down = true;
+    $this->messageHandler->handleMessage('conn-1', null, numberedDelta(2, 'b'));
+    $this->messageHandler->tickUnconfirmedFrames(time() + 61);
+
+    expect($this->manager->getPendingRequest('req-1'))->toBeNull()
+        ->and($rig->store->status($rig->rid)['status'])->toBe('streaming');
+
+    $rig->store->down = false;
+    $this->messageHandler->tickUnconfirmedFrames(time() + 62);
+
+    expect($rig->store->status($rig->rid)['status'])->toBe('failed')
+        ->and($rig->store->deltas($rig->rid))->toBe(['a', 'b'])
+        ->and(collect($rig->store->inner->range($rig->rid))->last()['data']['code'] ?? null)->toBe('stream_stalled');
+});
+
+test('when the store keeps refusing an ended turn\'s output, the rest is given up after the stall bound but the turn is still marked finished (CodeRabbit 4537573143)', function () {
+    config(['ai-bridge.websocket.stream_stall_seconds' => 60]);
+    $rig = bufferedRig($this);
+
+    // Appends keep failing; the status write works.
+    $rig->store->start($rig->rid);
+    $rig->store->failAppends = PHP_INT_MAX;
+    $this->messageHandler->handleMessage('conn-1', null, json_encode([
+        'type' => MessageTypes::STREAM, 'request_id' => 'req-1', 'event' => MessageTypes::BLOCK_DELTA,
+        'data' => ['block_type' => 'text', 'block_index' => 0, 'content' => 'a'],
+    ]));
+    $this->messageHandler->handleMessage('conn-1', null, json_encode(['type' => MessageTypes::STREAM, 'request_id' => 'req-1', 'event' => MessageTypes::DONE, 'data' => []]));
+
+    $this->messageHandler->tickUnconfirmedFrames(time());
+    $this->messageHandler->tickUnconfirmedFrames(time() + 30);
+    expect($rig->store->status($rig->rid)['status'])->toBe('streaming');
+
+    $this->messageHandler->tickUnconfirmedFrames(time() + 61);
+
+    expect($rig->store->status($rig->rid)['status'])->toBe('completed')
+        ->and($this->manager->unstoredHandlers())->toBe([]);
+});
+
+// --- D09710 CodeRabbit: the kept store writes of a turn are bounded ---
+
+test('a turn whose kept store writes reach their bound stops keeping more and is ended at once, not after the stall bound (CodeRabbit 4537573154)', function () {
+    config([
+        'ai-bridge.websocket.stream_ack_interval' => 0,
+        'ai-bridge.websocket.stream_stall_seconds' => 60,
+        'ai-bridge.websocket.stream_store_backlog_bytes' => 2000,
+    ]);
+    $rig = bufferedRig($this);
+    $errors = [];
+    $rig->handler->onError(function (string $code) use (&$errors) {
+        $errors[] = $code;
+    });
+
+    $this->messageHandler->handleMessage('conn-1', null, numberedDelta(1, 'a'));
+    $rig->store->down = true;
+    for ($seq = 2; $seq <= 10; $seq++) {
+        $this->messageHandler->handleMessage('conn-1', null, numberedDelta($seq, str_repeat('x', 500)));
+    }
+
+    // MUTATION: drop the bound in StreamHandler::deferStore() and nothing ends before the stall bound.
+    $this->messageHandler->tickUnconfirmedFrames(time());
+
+    expect($errors)->toBe(['stream_stalled'])
+        ->and($this->manager->getPendingRequest('req-1'))->toBeNull()
+        ->and(end($rig->sent))->toBe(['type' => 'stream_ack', 'request_id' => 'req-1', 'seq' => 1, 'closed' => true]);
+
+    // Its end is still written once the store is back.
+    $rig->store->down = false;
+    $this->messageHandler->tickUnconfirmedFrames(time() + 1);
+    expect($rig->store->status($rig->rid)['status'])->toBe('failed');
+});
+
+test('a turn on a bridge without reliable_delivery drops a failed store write as before: it is not ended, sent no stream_ack, and later writes land once the store is back (D09710 review)', function () {
+    config([
+        'ai-bridge.websocket.stream_ack_interval' => 0,
+        'ai-bridge.websocket.stream_stall_seconds' => 60,
+        'ai-bridge.websocket.stream_store_backlog_writes' => 3,
+    ]);
+    $rig = bufferedRig($this);
+    $this->manager->setBridgeInfo('user-1', ['capabilities' => []]);
+    $errors = [];
+    $rig->handler->onError(function (string $code) use (&$errors) {
+        $errors[] = $code;
+    });
+    $unnumbered = fn (string $content): string => json_encode([
+        'type' => MessageTypes::STREAM, 'request_id' => 'req-1', 'event' => MessageTypes::BLOCK_DELTA,
+        'data' => ['block_type' => 'text', 'block_index' => 0, 'content' => $content],
+    ]);
+
+    $this->messageHandler->handleMessage('conn-1', null, $unnumbered('a'));
+    $rig->store->down = true;
+    for ($i = 1; $i <= 10; $i++) {
+        $this->messageHandler->handleMessage('conn-1', null, $unnumbered("lost{$i}"));
+    }
+
+    // MUTATION: drop the reliable_delivery check in tickUnconfirmedFrames() / BufferingSink and the turn is ended.
+    $this->messageHandler->tickUnconfirmedFrames(time());
+    $this->messageHandler->tickUnconfirmedFrames(time() + 61);
+
+    expect($errors)->toBe([])
+        ->and($this->manager->getPendingRequest('req-1'))->toBe($rig->handler)
+        ->and($rig->handler->hasUnstored())->toBeFalse()
+        ->and(array_filter($rig->sent, fn (array $p) => $p['type'] === MessageTypes::STREAM_ACK))->toBe([]);
+
+    // The store is back: what comes next is stored, and the turn finishes.
+    $rig->store->down = false;
+    $this->messageHandler->handleMessage('conn-1', null, $unnumbered('b'));
+    $this->messageHandler->handleMessage('conn-1', null, json_encode(['type' => MessageTypes::STREAM, 'request_id' => 'req-1', 'event' => MessageTypes::DONE, 'data' => []]));
+
+    expect($rig->store->deltas($rig->rid))->toBe(['a', 'b'])
+        ->and($rig->store->status($rig->rid)['status'])->toBe('completed')
+        ->and($rig->done)->toBe(1)
+        ->and(array_filter($rig->sent, fn (array $p) => $p['type'] === MessageTypes::STREAM_ACK))->toBe([]);
+});

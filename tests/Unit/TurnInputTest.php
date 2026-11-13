@@ -582,3 +582,32 @@ it('the one-second tick sends owed receipts, and fails detached turns past the g
     expect($code)->toBe('bridge_disconnected')
         ->and($rig->manager->isAwaitingReconnect('user-1'))->toBeFalse();
 });
+
+// --- D09710 review follow-up: held work is re-checked against the bridge that comes back ---
+
+it('does not send a held message to a reconnecting bridge without turn_input, and answers it at once (review point 5)', function (bool $outBeforeDrop, string $reason) {
+    $rig = reliableInputRig();
+    if ($outBeforeDrop) {
+        $out = postInput($rig, INPUT_BODY);
+        $rig->manager->removeConnection('user-1', 'websocket_closed');
+    } else {
+        $rig->manager->removeConnection('user-1', 'websocket_closed');
+        $out = postInput($rig, INPUT_BODY);
+    }
+    $rig->sent = [];
+
+    // An older bridge takes the machine's place: it lists the turn, but cannot take input.
+    $rig->manager->addConnection('user-1', 'conn-1b', 'socket-1b');
+    $rig->manager->setBridgeInfo('user-1', ['capabilities' => ['reliable_delivery']]);
+    $rig->manager->reattachRunningTurns('user-1', ['req-1']);
+    $rig->manager->flushHeldFrames('user-1');
+
+    expect($rig->sent)->toBe([])
+        ->and($out->responses)->toBe([['status' => 200, 'body' => ['status' => 'rejected', 'reason' => $reason]]])
+        ->and($rig->manager->hasPendingTurnInput('req-1', 'msg-1'))->toBeFalse();
+})->with([
+    // Never written: the caller may send it again.
+    'held during the drop' => [false, 'send_failed'],
+    // Written before the drop: whether the old bridge read it is unknown.
+    'out before the drop' => [true, 'no_answer'],
+]);

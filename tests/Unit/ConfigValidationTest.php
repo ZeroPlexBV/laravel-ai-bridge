@@ -131,6 +131,8 @@ test('websocket config defaults', function () {
     // Short drops (reliable_delivery): two minutes of grace, an ack at least every second.
     expect(config('ai-bridge.websocket.reconnect_grace_seconds'))->toBe(120);
     expect(config('ai-bridge.websocket.stream_ack_interval'))->toBe(1);
+    // A connected turn that makes no progress for a minute ends instead of hanging.
+    expect(config('ai-bridge.websocket.stream_stall_seconds'))->toBe(60);
 });
 
 test('chat_completions config defaults', function () {

@@ -712,7 +712,9 @@ test('a usage question and a mid-turn message already out are put again after th
     $this->manager->removeConnection('user-1', 'websocket_closed');
     expect($answers)->toBe([]);
 
+    // The bridge that comes back takes input, as the one that dropped did.
     connectReliable($this->manager, 'conn-2');
+    $this->manager->setBridgeInfo('user-1', ['capabilities' => ['reliable_delivery', 'turn_input']]);
     $this->manager->reattachRunningTurns('user-1', []);
     $this->manager->flushHeldFrames('user-1');
 
@@ -788,4 +790,41 @@ test('an old bridge dropping still fails a mid-turn message with no_answer at on
 
     expect($answer)->toBe(['status' => 'rejected', 'reason' => 'no_answer'])
         ->and($this->manager->canReach('user-1'))->toBeFalse();
+});
+
+test('a mid-turn message held through a drop keeps its own refusal when its write after the hello fails and the machine drops again (CodeRabbit 4537573159)', function () {
+    $rig = heldRig($this);
+    $this->manager->removeConnection('user-1', 'websocket_closed');
+
+    // Typed during the drop: held, never written, so a bridge that cannot take it means send_failed.
+    $answer = null;
+    $frame = ['type' => 'turn_input', 'request_id' => 'req-1', 'message_id' => 'm-1', 'content' => 'hi'];
+    $this->manager->registerPendingTurnInput('req-1', 'm-1', 'user-1', function (array $a) use (&$answer) {
+        $answer = $a;
+    }, $frame);
+    $key = BridgeConnectionManager::turnInputHoldKey('req-1', 'm-1');
+    $this->manager->sendOrHold('user-1', $frame, null, $key, 'turn_input', fn () => $this->manager->resolvePendingTurnInput('req-1', 'm-1', 'user-1', ['status' => 'rejected', 'reason' => 'send_failed']));
+
+    // The bridge comes back, but the held write fails: still held, still never written.
+    $this->manager->setSendCallback(fn () => false);
+    connectReliable($this->manager, 'conn-2');
+    $this->manager->setBridgeInfo('user-1', ['capabilities' => ['reliable_delivery', 'turn_input']]);
+    $this->manager->reattachRunningTurns('user-1', []);
+    $this->manager->flushHeldFrames('user-1');
+    expect($this->manager->isHeldFrame('user-1', $key))->toBeTrue();
+
+    // It drops again, and an older bridge without turn_input takes its place.
+    $this->manager->removeConnection('user-1', 'websocket_closed');
+    $this->manager->setSendCallback(function ($c, array $payload) use ($rig): bool {
+        $rig->sent[] = $payload;
+
+        return true;
+    });
+    connectReliable($this->manager, 'conn-3');
+    $this->manager->reattachRunningTurns('user-1', []);
+    $this->manager->flushHeldFrames('user-1');
+
+    // MUTATION: overwrite the held entry on the second drop and this reads no_answer.
+    expect($answer)->toBe(['status' => 'rejected', 'reason' => 'send_failed'])
+        ->and($rig->sent)->toBe([]);
 });
