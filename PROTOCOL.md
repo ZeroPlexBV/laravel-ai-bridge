@@ -2052,6 +2052,60 @@ button means stay with the host.
 
 ---
 
+## Secrets on the machine
+
+A person can put a secret (an API key, a password) on the machine their assistant runs on from the
+app, without the value passing through the chat, the assistant or the app's database. The machine
+keeps its secrets in its own store (`~/.secrets`, managed by a `secret` command); the bridge only
+carries the request.
+
+### Handshake
+
+A bridge that can do this sends `"machine_secrets": {"revision": 1}` in its `hello`. The server
+sends none of the frames below to a bridge without it: the serve process answers the app 409
+`machine_secrets_unsupported`, so the app can say the bridge needs updating.
+
+### Server → Bridge: `secret_list`, `secret_put`, `secret_describe`, `secret_remove`
+
+```json
+{"type": "secret_list", "id": "sec-4f1c…"}
+{"type": "secret_put", "id": "sec-…", "name": "mailtrap", "description": "SMTP password", "value": "…"}
+{"type": "secret_describe", "id": "sec-…", "name": "mailtrap", "description": "SMTP password, Iris dev"}
+{"type": "secret_remove", "id": "sec-…", "name": "mailtrap"}
+```
+
+- `name` is 1 to 64 characters `[A-Za-z0-9._-]`, starting with a letter or digit, never `..`; the
+  bridge checks it again before it touches a file.
+- `description` is text of at most 1000 characters (optional on `secret_put`).
+- `value` (only on `secret_put`) is at most 64 KiB. The bridge writes it to a new file only its
+  owner can read and moves it into the store; it never logs it, never echoes it in an error, and
+  never keeps it after the request.
+
+### Bridge → Server: `secret_result`
+
+Exactly one per request, with the request's `id`:
+
+```json
+{"type": "secret_result", "id": "sec-4f1c…", "ok": true, "secrets": [{"name": "mailtrap", "description": "SMTP password", "updated_at": "2026-11-21T10:12:00Z"}]}
+{"type": "secret_result", "id": "sec-…", "ok": false, "code": "no_secret_tool", "error": "The secret command is not installed on this machine."}
+```
+
+`secrets` only answers `secret_list`. Codes: `no_secret_tool`, `not_found`, `invalid_name`,
+`invalid_request`, `exists`, `failed` (anything else is read as `failed`). A row in `secrets` is
+reduced to `name`, `description` and `updated_at`; anything else in it is dropped. A result is only
+matched to a request of the same machine.
+
+### The serve process's internal API
+
+`POST /api/secrets` with body `{op: list|put|describe|remove, name?, description?, value?}`, an
+internal relay token for the connection, holds the response open until `secret_result`, 404
+`not_connected`, or 504 `timeout` after `ai-bridge.machine_secrets.timeout` seconds (default 15).
+From PHP: `AiBridge::secrets()->list($connection)`, `->put($connection, $name, $value, $description)`,
+`->describe(...)`, `->remove(...)`; each answers `{ok, secrets?, code?, error?}` and never throws for
+a machine that is off. There is deliberately no way to read a value back.
+
+---
+
 ## Heartbeat
 
 Keeps the WebSocket alive and detects dead connections.
@@ -2258,6 +2312,7 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `upstream_status` | The complete list of upstream MCP servers, on every change |
 | `upstream_auth_required` | An upstream needs the person to sign in |
 | `upstream_auth_result` | How a sign-in ended, or why one could not start |
+| `secret_result` | Answering a `secret_*` request (never carries a value) |
 | `error` | Request-level error (non-streaming) |
 
 ### Server → Bridge
@@ -2277,6 +2332,7 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `file_read` / `file_read_cancel` | Asking for a file the machine recorded |
 | `mcp_request` | A view's `resources/read` or `tools/call` for an upstream (needs `hello.mcp_apps`) |
 | `upstream_auth_start` / `upstream_auth_code` / `upstream_auth_forget` | Upstream OAuth sign-in (needs `hello.mcp_upstream_auth`) |
+| `secret_list` / `secret_put` / `secret_describe` / `secret_remove` | Manage the machine's secret store (needs `hello.machine_secrets`) |
 
 ---
 

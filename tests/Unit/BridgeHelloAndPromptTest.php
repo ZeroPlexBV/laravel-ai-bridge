@@ -68,6 +68,7 @@ it('records bridge_version, attachment_limits and capabilities from a pre-authen
             'effort_levels' => [],
             'mcp_apps' => null,
             'mcp_upstream_auth' => null,
+            'machine_secrets' => null,
         ])
         ->and($rig->manager->bridgeSupports('user-1', 'file_uploads'))->toBeTrue();
 });
@@ -103,6 +104,7 @@ it('reads an old bridge hello as no capabilities, and drops fields of the wrong 
         'effort_levels' => [],
         'mcp_apps' => null,
         'mcp_upstream_auth' => null,
+        'machine_secrets' => null,
     ]);
 });
 

@@ -443,6 +443,7 @@ class BridgeWebSocketServer
     //   POST /api/upstream/auth-start  — Ask the bridge to start an upstream OAuth sign-in
     //   POST /api/upstream/auth-code   — Pass an OAuth redirect's code on, await the result
     //   POST /api/upstream/auth-forget — Have the bridge forget an upstream's tokens
+    //   POST /api/secrets    — Manage the secret store on the user's machine, await secret_result
     //   GET  /api/status     — Check connected users
     //   GET  /api/health     — Health check
     // -------------------------------------------------------------------------
@@ -609,6 +610,7 @@ class BridgeWebSocketServer
             $method === 'POST' && $path === '/api/upstream/auth-start' => $this->apiUpstreamAuthStart($tcpConnection, $request, $decoded),
             $method === 'POST' && $path === '/api/upstream/auth-code' => $this->apiUpstreamAuthCode($tcpConnection, $request, $decoded),
             $method === 'POST' && $path === '/api/upstream/auth-forget' => $this->apiUpstreamAuthForget($tcpConnection, $request, $decoded),
+            $method === 'POST' && $path === '/api/secrets' => $this->apiSecrets($tcpConnection, $request, $decoded),
             default => $this->httpResponse($tcpConnection, 404, [
                 'error' => 'not_found',
                 'message' => "Unknown endpoint: {$method} {$path}",
@@ -1311,6 +1313,43 @@ class BridgeWebSocketServer
         $this->httpResponse($tcpConnection, $sent ? 200 : 502, $sent
             ? ['sent' => true]
             : ['sent' => false, 'code' => 'send_failed', 'error' => 'Could not write to the bridge.']);
+    }
+
+    /**
+     * POST /api/secrets — Manage the secret store on the user's machine.
+     *
+     * Body `{op: list|put|describe|remove, name?, description?, value?}`. Sends the matching
+     * `secret_*` frame with a fresh id and answers with the bridge's `secret_result`
+     * (`{ok, secrets?, code?, error?}`), 409 `machine_secrets_unsupported` for a bridge that
+     * did not announce it, or 504 `timeout` after `ai-bridge.machine_secrets.timeout` seconds.
+     *
+     * The value of a `put` is checked for size and type only. It is never logged, never part
+     * of an answer, and lives only in this request and the frame written to the bridge.
+     */
+    private function apiSecrets(ConnectionInterface $tcpConnection, RequestInterface $request, object $decoded): void
+    {
+        $body = json_decode((string) $request->getBody(), true);
+        $frame = \Tetrix\AiBridge\Secrets\MachineSecrets::frameOf(is_array($body) ? $body : []);
+
+        if (is_string($frame)) {
+            $this->httpResponse($tcpConnection, 400, ['ok' => false, 'code' => 'invalid_request', 'error' => $frame]);
+
+            return;
+        }
+
+        $userId = $this->bridgeFor($tcpConnection, $decoded, 'machine_secrets');
+        if ($userId === null) {
+            return;
+        }
+
+        $id = 'sec-'.bin2hex(random_bytes(8));
+        $frame['id'] = $id;
+
+        $this->awaitBridge($tcpConnection, $userId, \Tetrix\AiBridge\Secrets\SecretFrames::exchangeKey($userId, $id), $frame, (float) config('ai-bridge.machine_secrets.timeout', 15), [
+            'ok' => false,
+            'code' => 'timeout',
+            'error' => 'The machine did not answer in time.',
+        ], 'machine_secrets');
     }
 
     /**

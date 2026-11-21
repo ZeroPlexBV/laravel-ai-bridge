@@ -70,6 +70,8 @@ class ConnectionController extends Controller
                 // upstreams are (see GET /ai-bridge/connections/{id}/upstreams).
                 $data['mcp_upstream_auth'] = $status['mcp_upstream_auth'] ?? false;
                 $data['upstream_status'] = $status['upstream_status'] ?? [];
+                // Whether the app can manage the machine's secret store through it.
+                $data['machine_secrets'] = $status['machine_secrets'] ?? false;
                 $data['connected'] = $status['connected'];
             }
 

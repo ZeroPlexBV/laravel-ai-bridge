@@ -302,6 +302,27 @@ final class MessageTypes
     /** Server → bridge: forget this upstream's tokens on this bridge. */
     public const UPSTREAM_AUTH_FORGET = 'upstream_auth_forget';
 
+    // ── Secrets on the machine ──────────────────────────────────────────
+    // A bridge that announces `machine_secrets` at hello manages the machine's
+    // secret store for the app (PROTOCOL.md, "Secrets on the machine"). Each
+    // request carries an `id` and is answered exactly once by `secret_result`.
+    // The value only ever travels server → bridge, inside `secret_put`.
+
+    /** Server → bridge: list the secrets (names, descriptions, dates; never a value). */
+    public const SECRET_LIST = 'secret_list';
+
+    /** Server → bridge: add or replace one secret `{id, name, description?, value}`. */
+    public const SECRET_PUT = 'secret_put';
+
+    /** Server → bridge: change one secret's description `{id, name, description}`. */
+    public const SECRET_DESCRIBE = 'secret_describe';
+
+    /** Server → bridge: remove one secret `{id, name}`. */
+    public const SECRET_REMOVE = 'secret_remove';
+
+    /** Bridge → server: the answer to one secret_* request `{id, ok, secrets?, code?, error?}`. */
+    public const SECRET_RESULT = 'secret_result';
+
     /** Stream event: the entire AI response is complete. */
     public const DONE = 'done';
 
@@ -376,6 +397,11 @@ final class MessageTypes
             self::UPSTREAM_AUTH_CODE,
             self::UPSTREAM_AUTH_RESULT,
             self::UPSTREAM_AUTH_FORGET,
+            self::SECRET_LIST,
+            self::SECRET_PUT,
+            self::SECRET_DESCRIBE,
+            self::SECRET_REMOVE,
+            self::SECRET_RESULT,
             self::DONE,
             self::ERROR,
             self::CANCEL,
@@ -422,6 +448,7 @@ final class MessageTypes
             self::UPSTREAM_STATUS,
             self::UPSTREAM_AUTH_REQUIRED,
             self::UPSTREAM_AUTH_RESULT,
+            self::SECRET_RESULT,
             self::STREAM,
             self::TOOL_CALL,
             self::ERROR,
@@ -467,6 +494,10 @@ final class MessageTypes
             self::UPSTREAM_AUTH_START,
             self::UPSTREAM_AUTH_CODE,
             self::UPSTREAM_AUTH_FORGET,
+            self::SECRET_LIST,
+            self::SECRET_PUT,
+            self::SECRET_DESCRIBE,
+            self::SECRET_REMOVE,
             self::CANCEL,
         ];
     }

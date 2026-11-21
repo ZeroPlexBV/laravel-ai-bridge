@@ -306,6 +306,24 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Secrets on the machine
+    |--------------------------------------------------------------------------
+    |
+    | AiBridge::secrets() manages the secret store on a person's machine through
+    | its bridge (PROTOCOL.md, "Secrets on the machine"). Only a bridge that
+    | announced `machine_secrets` at hello is asked.
+    |
+    | - 'timeout': how long the serve process waits for the bridge's
+    |   `secret_result` (seconds). The web request waits 3 seconds longer.
+    |
+    */
+
+    'machine_secrets' => [
+        'timeout' => env('AI_BRIDGE_MACHINE_SECRETS_TIMEOUT', 15), // seconds
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Stream Event Buffer
     |--------------------------------------------------------------------------
     |

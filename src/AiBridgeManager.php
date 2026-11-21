@@ -171,6 +171,15 @@ class AiBridgeManager
     }
 
     /**
+     * The secret store on a person's machine, through its bridge: list, put, describe and
+     * remove. A value goes in and never comes out. See Secrets\MachineSecrets.
+     */
+    public function secrets(): \Tetrix\AiBridge\Secrets\MachineSecrets
+    {
+        return app(\Tetrix\AiBridge\Secrets\MachineSecrets::class);
+    }
+
+    /**
      * Relay a view's request to an upstream MCP server through a connection's bridge and
      * return the upstream's result. Only `resources/read` (a `ui://` uri) and `tools/call`.
      *

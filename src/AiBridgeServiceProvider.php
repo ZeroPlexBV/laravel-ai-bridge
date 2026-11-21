@@ -97,6 +97,7 @@ class AiBridgeServiceProvider extends ServiceProvider
         // and web processes) and the PHP API that reaches the serve process for them.
         $this->app->singleton(\Tetrix\AiBridge\Upstreams\PendingSignIns::class);
         $this->app->singleton(\Tetrix\AiBridge\Upstreams\UpstreamClient::class);
+        $this->app->singleton(\Tetrix\AiBridge\Secrets\MachineSecrets::class);
 
         // StreamStore — driver-based per-turn event buffer. Bound by the
         // manager so apps may register additional drivers via

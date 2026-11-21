@@ -164,6 +164,7 @@ class ConnectionStatus
             'effort_levels' => is_array($effortLevels) ? array_values(array_filter($effortLevels, 'is_string')) : [],
             'mcp_apps' => is_array($bridge['mcp_apps'] ?? null) && is_string($bridge['mcp_apps']['spec'] ?? null) && $bridge['mcp_apps']['spec'] !== '',
             'mcp_upstream_auth' => is_array($bridge['mcp_upstream_auth'] ?? null),
+            'machine_secrets' => is_array($bridge['machine_secrets'] ?? null),
             'upstream_status' => is_array($bridge['upstream_status'] ?? null) ? array_values(array_filter($bridge['upstream_status'], 'is_array')) : [],
         ];
     }

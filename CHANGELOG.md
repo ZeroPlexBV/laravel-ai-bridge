@@ -3,6 +3,18 @@
 Release notes for earlier versions are on the GitHub releases page of
 tetrixdev/laravel-ai-bridge. This file starts with 0.16.0-RC1.
 
+## [Unreleased]
+
+### Added
+
+- **Secrets on the machine (ZeroPlex Studio D10065).** The app can list, add or replace, describe and
+  remove secrets in the store on a person's machine through its bridge, without the value passing
+  through the chat or the database: `AiBridge::secrets()`, the serve process's `POST /api/secrets`,
+  and the frames `secret_list`, `secret_put`, `secret_describe`, `secret_remove` / `secret_result`
+  for a bridge that announces `hello.machine_secrets` (PROTOCOL.md, "Secrets on the machine").
+  A list answer is reduced to name, description and date; a value is never logged or answered.
+  Connection status gains `machine_secrets`. Additive; protocol stays 0.1.
+
 ## [0.26.1] — 2026-11-19
 
 ### Fixed
