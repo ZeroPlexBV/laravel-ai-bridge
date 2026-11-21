@@ -25,8 +25,17 @@ final class AiRequestPayload
     /** The `bridge_prompt.mode` values the bridge accepts (0.12.0+). */
     public const BRIDGE_PROMPT_MODES = ['default', 'off', 'append', 'replace'];
 
-    /** The bridge's cap on `bridge_prompt.text`, in bytes (MAX_BRIDGE_PROMPT_BYTES). */
-    public const MAX_BRIDGE_PROMPT_BYTES = 8192;
+    /**
+     * The cap on `bridge_prompt.text`, in bytes (ai-bridge MAX_BRIDGE_PROMPT_BYTES).
+     *
+     * 16 KB since the bridge that announces `machine_secrets` (D10065); an older machine bridge
+     * still refuses anything over LEGACY_BRIDGE_PROMPT_BYTES, so a caller that may reach an older
+     * machine keeps its text under that.
+     */
+    public const MAX_BRIDGE_PROMPT_BYTES = 16384;
+
+    /** The cap an older machine bridge (without `machine_secrets`) applies. */
+    public const LEGACY_BRIDGE_PROMPT_BYTES = 8192;
 
     /** The longest `options.effort` sent; a level is a short word (`low` … `max`). */
     public const MAX_EFFORT_LENGTH = 32;

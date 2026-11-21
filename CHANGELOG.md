@@ -14,6 +14,9 @@ tetrixdev/laravel-ai-bridge. This file starts with 0.16.0-RC1.
   for a bridge that announces `hello.machine_secrets` (PROTOCOL.md, "Secrets on the machine").
   A list answer is reduced to name, description and date; a value is never logged or answered.
   Connection status gains `machine_secrets`. Additive; protocol stays 0.1.
+- **`bridge_prompt.text` may be up to 16 KB** (`AiRequestPayload::MAX_BRIDGE_PROMPT_BYTES`), matching a
+  machine bridge that announces `machine_secrets`. An older machine bridge still refuses more than 8 KB
+  (`AiRequestPayload::LEGACY_BRIDGE_PROMPT_BYTES`), so check `hello.machine_secrets` before sending more.
 
 ## [0.26.1] — 2026-11-19
 
